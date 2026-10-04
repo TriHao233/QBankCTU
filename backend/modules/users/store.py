@@ -8,7 +8,8 @@ from modules.users.postgres_repository import PostgresUserRepository, _user
 
 
 REVIEWER_CANDIDATE_FILTER = [
-    {"role": {"$in": ["Reviewer", "Admin"]}},
+    # Admin không còn là ứng viên duyệt; chỉ Teacher/Reviewer (cũ) có reviews.manage.
+    {"role": "Reviewer"},
     {"permission_grants": "reviews.manage"},
     {"permissions": "reviews.manage"},
 ]
@@ -43,9 +44,10 @@ def users_by_ids(database, user_ids: list[ObjectId], *, active_only: bool = Fals
 def review_candidate_users(database, *, include_ids: list[ObjectId] | None = None) -> list[dict]:
     include_ids = include_ids or []
     if settings.user_store == "postgres":
-        where = """(is_active AND (role IN ('Reviewer','Admin')
+        where = """(is_active AND (role = 'Reviewer'
                    OR permission_grants ? 'reviews.manage'
-                   OR permissions ? 'reviews.manage'))"""
+                   OR permissions ? 'reviews.manage'
+                   OR (role = 'Teacher' AND NOT permission_revokes ? 'reviews.manage')))"""
         params = []
         if include_ids:
             where = f"({where} OR id=ANY(%s))"

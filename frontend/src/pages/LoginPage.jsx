@@ -307,7 +307,7 @@ function LoginPage() {
                       Mật khẩu
                     </label>
                     <Link
-                      to="/quen-mat-khau"
+                      to="/lien-he"
                       className="form-link form-link--small"
                     >
                       Quên mật khẩu?

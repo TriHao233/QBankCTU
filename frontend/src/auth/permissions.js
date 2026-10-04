@@ -18,7 +18,7 @@ export const ROLE_DEFAULT_PERMISSIONS = Object.freeze({
     "documents.manage_all",
     "questions.manage_all",
     "questions.use_shared_bank",
-    "reviews.manage",
+    // Admin không duyệt câu hỏi — khớp thuyết minh.
   ]),
   Teacher: Object.freeze([
     "documents.manage_own",
@@ -28,7 +28,10 @@ export const ROLE_DEFAULT_PERMISSIONS = Object.freeze({
     "questions.use_shared_bank",
     "exams.manage_own",
     "catalog.subjects.manage_own",
+    "reviews.manage",
+    "questions.export_moodle",
   ]),
+  // Role cũ; UI không cho tạo mới.
   Reviewer: Object.freeze([
     "reviews.manage",
     "questions.export_moodle",
@@ -39,6 +42,7 @@ export const ROLE_DEFAULT_PERMISSIONS = Object.freeze({
 export const TEACHER_ASSIGNABLE_PERMISSIONS = Object.freeze([
   'questions.generate', 'questions.manage_own', 'documents.manage_own', 'exams.manage_own',
   'catalog.subjects.manage_own', 'questions.share_bank', 'questions.use_shared_bank',
+  'reviews.manage', 'questions.export_moodle',
 ]);
 export const REVIEW_ASSIGNABLE_PERMISSIONS = Object.freeze(['reviews.manage', 'questions.export_moodle']);
 export const ASSIGNABLE_PERMISSIONS = Object.freeze([
@@ -60,7 +64,11 @@ export function assignablePermissions(list) {
 }
 export function hasEffectivePermission(user, permission) {
   if (!user) return false;
-  if (user.role === 'Admin') return true;
+  if (user.role === 'Admin') {
+    // Admin có mọi quyền quản trị trừ duyệt câu hỏi.
+    if (permission === 'reviews.manage') return false;
+    return true;
+  }
   return (Array.isArray(user.permissions) ? user.permissions : ROLE_DEFAULT_PERMISSIONS[user.role] || []).includes(permission);
 }
 
@@ -88,7 +96,8 @@ export const PROTECTED_ROUTE_ROLES = Object.freeze({
   "/lam-de-thi/:examId": PERMISSIONS.teacherAdminWorkspace,
   "/quan-ly-hoc-phan": PERMISSIONS.teacherWorkspace,
   "/quan-ly-tai-lieu": PERMISSIONS.teacherAdminWorkspace,
-  "/kiem-duyet": PERMISSIONS.reviewerWorkspace,
+  // Kiểm duyệt theo reviews.manage (Teacher mặc định có; Admin không duyệt).
+  "/kiem-duyet": PERMISSIONS.teacherWorkspace,
   "/duyet-ai": PERMISSIONS.adminWorkspace,
   "/tong-quan": PERMISSIONS.adminWorkspace,
   "/danh-muc": PERMISSIONS.adminWorkspace,
@@ -96,7 +105,7 @@ export const PROTECTED_ROUTE_ROLES = Object.freeze({
   "/nhat-ky-he-thong": PERMISSIONS.adminWorkspace,
   "/quan-ly-job": PERMISSIONS.adminWorkspace,
   "/quan-ly-moodle": PERMISSIONS.adminWorkspace,
-  "/lich-cong-viec": PERMISSIONS.reviewerWorkspace,
+  "/lich-cong-viec": PERMISSIONS.teacherAdminWorkspace,
   "/ho-so": PERMISSIONS.authenticated,
 });
 
@@ -139,15 +148,40 @@ export function permissionsForPath(pathname) {
   return entry?.[1] || null;
 }
 
+function toAccessUser(userOrRole) {
+  if (!userOrRole) return null;
+  if (typeof userOrRole === "string") {
+    return {
+      role: userOrRole,
+      permissions: [...(ROLE_DEFAULT_PERMISSIONS[userOrRole] || [])],
+    };
+  }
+  return userOrRole;
+}
+
 export function canAccessPath(userOrRole, pathname) {
   const roles = rolesForPath(pathname);
   if (!roles) return true;
-  const role = typeof userOrRole === "string" ? userOrRole : userOrRole?.role;
-  if (roles.includes(role)) return true;
+  const user = toAccessUser(userOrRole);
+  if (!user?.role) return false;
+
   const requiredPermissions = permissionsForPath(pathname);
-  if (!requiredPermissions?.length) return false;
-  const permissions = permissionsForUser(userOrRole);
-  return requiredPermissions.every((permission) => permissions.includes(permission));
+  if (requiredPermissions?.length) {
+    const hasPerms = requiredPermissions.every((permission) => (
+      hasEffectivePermission(user, permission)
+    ));
+    if (!hasPerms) return false;
+    // Admin has broad effective permissions, but teacher-only surfaces stay closed
+    // unless the route role map explicitly includes Admin.
+    if (user.role === "Admin") {
+      return roles.includes("Admin")
+        || requiredPermissions.every((permission) => permission.startsWith("admin."));
+    }
+    // Teacher/Reviewer may open a route via explicit grants outside the base role list.
+    return true;
+  }
+
+  return roles.includes(user.role);
 }
 
 export function landingPathForRole(role, requestedPath) {

@@ -5,7 +5,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faChevronDown, faLayerGroup, faUpload, faWandMagicSparkles, faMicrochip, faRobot, faRotateRight, faBookOpen, faArrowRight, faPlus, faPen, faPaperPlane, faTrashCan, faFloppyDisk, faXmark } from '@fortawesome/free-solid-svg-icons';
 import { chunkDocument } from '../api/chunk';
 import { listAvailableAiModels, listSubjects } from '../api/catalog';
-import { listDocuments } from '../api/documents';
+import { getDocument, listDocuments } from '../api/documents';
 import { enqueueGenerateQuestions, getGenerateStatus, streamGenerateStatus, cancelGenerateJob } from '../api/generate';
 import { getOcrStatus, uploadSourceDocument } from '../api/ocr';
 import { createQuestion, deleteQuestion, submitQuestionForReview, updateQuestion } from '../api/questions';
@@ -22,6 +22,10 @@ import {
   toBackendBloomLevel,
   toBackendQuestionType,
 } from '../constants/generationEnums';
+import {
+  isDocumentPipelineFailed,
+  isDocumentPipelineReady,
+} from '../constants/lifecycleStatus';
 import { pollJob, watchJob } from '../hooks/useJobPoll';
 import { buildGenerationRequest } from '../utils/generationRequest';
 import { modelPresentation } from '../utils/modelPresentation';
@@ -290,6 +294,7 @@ function GeneratePage() {
   const [subjectsLoading, setSubjectsLoading] = useState(false);
   const [subjectsError, setSubjectsError] = useState('');
   const [selectedSubjectId, setSelectedSubjectId] = useState('');
+  const [selectedCloIds, setSelectedCloIds] = useState([]);
   const [planItems, setPlanItems] = useState(createInitialPlan);
   const [presets, setPresets] = useState(loadStoredPresets);
   const [selectedPresetId, setSelectedPresetId] = useState('');
@@ -333,6 +338,12 @@ function GeneratePage() {
   const reusableDocuments = documents.filter(isDocumentOcrReady);
   const selectedDocument = reusableDocuments.find((item) => item.id === selectedDocumentId);
   const activeSubjects = subjects.filter((item) => item.is_active !== false);
+  const selectedSubject = activeSubjects.find(
+    (item) => String(item.id || item._id) === String(selectedSubjectId),
+  ) || null;
+  const availableClos = (selectedSubject?.learning_outcomes || []).filter(
+    (clo) => clo.is_active !== false,
+  );
   const selectedDocumentSubjectName = selectedDocument
     ? subjects.find((item) => (item.id || item._id) === selectedDocument.subject_id)?.subject_name
     : null;
@@ -360,6 +371,7 @@ function GeneratePage() {
     ? (generationAcceptedNothing ? 'warning' : 'done')
     : 'running';
   const submittableDraftCount = drafts.filter(canSubmitDraft).length;
+  const bankLinkQuestionId = drafts.find((item) => item.persistedId)?.persistedId;
   const serverMetrics = generationInfo?.metrics?.server || {};
   const hasServerMetrics = Number.isFinite(serverMetrics.processing_ms);
   const hasTimings = Object.values(timings).some((value) => (
@@ -1067,13 +1079,97 @@ function GeneratePage() {
     return docId;
   };
 
-  const runChunk = async (docId) => {
+  const sleepWithSignal = (ms, signal) => new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    if (!signal) return;
+    if (signal.aborted) {
+      clearTimeout(timer);
+      reject(new DOMException('Theo dõi pipeline đã bị hủy', 'AbortError'));
+      return;
+    }
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('Theo dõi pipeline đã bị hủy', 'AbortError'));
+    }, { once: true });
+  });
+
+  const isTransientNetworkError = (err) => {
+    const message = String(err?.message || err || '');
+    return err?.name === 'TypeError'
+      || err?.status === 502
+      || err?.status === 503
+      || err?.status === 504
+      || /Failed to fetch|NetworkError|ECONNREFUSED|timeout|Không thể kết nối máy chủ/i.test(message);
+  };
+
+  const getDocumentResilient = async (docId, signal) => {
+    let lastError;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        return await getDocument(docId);
+      } catch (err) {
+        lastError = err;
+        if (!isTransientNetworkError(err) || signal?.aborted) throw err;
+        setStatusDetail(`Máy chủ đang bận xử lý tài liệu, đang thử lại (${attempt + 1}/8)...`);
+        await sleepWithSignal(2500 * (attempt + 1), signal);
+      }
+    }
+    throw lastError;
+  };
+
+  const waitForDocumentReady = async (docId, signal, { allowManualChunk = false } = {}) => {
     setPhase('chunking');
     setStatusDetail('Đang chunk và lưu vector...');
     const chunkStartedAt = nowMs();
-    await chunkDocument(docId);
-    markTiming('chunkMs', chunkStartedAt);
-    setChunkReady(true);
+    let manualChunkStarted = false;
+    const startedAt = Date.now();
+    const timeoutMs = 45 * 60 * 1000;
+    const manualChunkGraceMs = 12000;
+
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException('Theo dõi pipeline đã bị hủy', 'AbortError');
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error('Hết thời gian chờ xử lý tài liệu');
+      }
+
+      const document = await getDocumentResilient(docId, signal);
+      if (isDocumentPipelineReady(document)) {
+        markTiming('chunkMs', chunkStartedAt);
+        setChunkReady(true);
+        return;
+      }
+      if (isDocumentPipelineFailed(document)) {
+        throw new Error('Xử lý tài liệu (chunk/index) thất bại');
+      }
+
+      const chunkStatus = String(document?.pipeline_summary?.chunk_status || 'NOT_STARTED').toUpperCase();
+      const indexStatus = String(document?.pipeline_summary?.index_status || 'NOT_STARTED').toUpperCase();
+      const ocrStatus = String(document?.pipeline_summary?.ocr_status || '').toUpperCase();
+      const waitedLongEnough = Date.now() - startedAt >= manualChunkGraceMs;
+
+      // Upload path: chờ auto-chain; nếu quá lâu vẫn NOT_STARTED thì kích hoạt chunk thủ công.
+      if (
+        (allowManualChunk || waitedLongEnough)
+        && !manualChunkStarted
+        && chunkStatus === 'NOT_STARTED'
+        && (ocrStatus === 'COMPLETED' || ocrStatus === '')
+      ) {
+        setStatusDetail('Đang bắt đầu chunk và index...');
+        try {
+          await chunkDocument(docId);
+          manualChunkStarted = true;
+          continue;
+        } catch (err) {
+          if (!isTransientNetworkError(err)) throw err;
+          setStatusDetail('Chưa gọi được chunk (máy chủ bận), sẽ thử lại...');
+        }
+      }
+
+      setStatusDetail(`Đang xử lý pipeline: chunk=${chunkStatus}, index=${indexStatus}`);
+      await sleepWithSignal(2000, signal);
+    }
   };
 
   const runGenerate = async (docId, signal, pipelineStartedAt) => {
@@ -1091,6 +1187,7 @@ function GeneratePage() {
       timings: timingRef.current,
       pipelineStartedAt,
       now: nowMs,
+      cloIds: selectedCloIds,
     });
 
     const idempotencyKey = globalThis.crypto?.randomUUID?.()
@@ -1211,7 +1308,8 @@ function GeneratePage() {
         }
       } else if (sourceMode === 'upload') {
         docId = await runOcrPipeline(file, signal);
-        await runChunk(docId);
+        // OCR hoàn tất đã kích hoạt auto chunk/index trên BE — FE chỉ chờ READY.
+        await waitForDocumentReady(docId, signal, { allowManualChunk: false });
         await fetchReusableDocuments();
       } else {
         if (!selectedDocument) {
@@ -1224,7 +1322,7 @@ function GeneratePage() {
           setTimingValues({ documentMs: 'reused' });
           setStatusDetail('Sử dụng tài liệu đã xử lý và index trước đó');
         } else {
-          await runChunk(docId);
+          await waitForDocumentReady(docId, signal, { allowManualChunk: true });
           await fetchReusableDocuments();
         }
       }
@@ -1240,7 +1338,12 @@ function GeneratePage() {
     } catch (err) {
       if (err.name === 'AbortError') return;
       setPhase('failed');
-      setError(err.message || 'Đã xảy ra lỗi');
+      const message = String(err.message || '');
+      setError(
+        /Failed to fetch|NetworkError|ECONNREFUSED/i.test(message)
+          ? 'Mất kết nối máy chủ trong lúc xử lý tài liệu (OCR/chunk đang chạy nặng). Đợi backend sẵn sàng rồi bấm Thử lại.'
+          : (message || 'Đã xảy ra lỗi'),
+      );
       setStatusDetail('');
     } finally {
       pipelineBusyRef.current = false;
@@ -1515,7 +1618,10 @@ function GeneratePage() {
                     className="field-select"
                     value={selectedSubjectId}
                     disabled={isBusy || subjectsLoading}
-                    onChange={(e) => setSelectedSubjectId(e.target.value)}
+                    onChange={(e) => {
+                      setSelectedSubjectId(e.target.value);
+                      setSelectedCloIds([]);
+                    }}
                   >
                     <option value="">
                       {subjectsLoading ? 'Đang tải học phần...' : 'Chọn học phần'}
@@ -1541,6 +1647,51 @@ function GeneratePage() {
                 </p>
               )}
             </div>
+
+            {sourceMode === 'upload' && selectedSubjectId && (
+              <div className="field-group">
+                <label className="field-label">Chuẩn đầu ra CLO (do GV chọn)</label>
+                <p className="source-note">
+                  Chọn CLO mục tiêu để sinh câu hỏi. Bỏ trống để dùng toàn bộ CLO đang hoạt động của học phần.
+                </p>
+                {availableClos.length === 0 ? (
+                  <p className="source-note">Học phần này chưa có CLO. Hãy bổ sung trong Quản lý học phần.</p>
+                ) : (
+                  <div className="clo-option-list">
+                    {availableClos.map((clo) => {
+                      const cloId = String(clo.id || clo._id || '');
+                      const typeLabel = {
+                        kien_thuc: 'Kiến thức',
+                        ky_nang: 'Kỹ năng',
+                        thai_do: 'Thái độ',
+                      }[clo.outcome_type] || 'Kiến thức';
+                      return (
+                        <label className="clo-option" key={cloId}>
+                          <input
+                            type="checkbox"
+                            disabled={isBusy}
+                            checked={selectedCloIds.includes(cloId)}
+                            onChange={() => {
+                              setSelectedCloIds((current) => (
+                                current.includes(cloId)
+                                  ? current.filter((id) => id !== cloId)
+                                  : [...current, cloId]
+                              ));
+                            }}
+                          />
+                          <span>
+                            <b>{clo.clo_code || clo.code}</b>
+                            {' '}
+                            <small>({typeLabel})</small>
+                            {clo.description ? ` — ${clo.description}` : ''}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="field-group document-action-row">
               <button
@@ -1844,7 +1995,12 @@ function GeneratePage() {
                 <h2 className="gen-card-title">Bảng nháp câu hỏi</h2>
               </div>
               <div className="gen-preview-actions">
-                <Link to="/quan-ly" className="gen-bank-link">Quản lý câu hỏi <FontAwesomeIcon icon={faArrowRight} aria-hidden="true" /></Link>
+                <Link
+                  to={bankLinkQuestionId ? `/quan-ly?questionId=${bankLinkQuestionId}` : '/quan-ly'}
+                  className="gen-bank-link"
+                >
+                  Quản lý câu hỏi <FontAwesomeIcon icon={faArrowRight} aria-hidden="true" />
+                </Link>
                 <span className="gen-preview-count">{drafts.length} câu hỏi</span>
                 {submittableDraftCount > 0 && (
                   <button

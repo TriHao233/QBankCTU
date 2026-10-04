@@ -47,16 +47,16 @@ import { overrideRequired, isAiRunning, selfReviewReasonRequired } from '../util
 import { shouldRenewLock, renewIntervalMs } from '../utils/reviewLock';
 import { scoreToPercent, percentToScore } from '../utils/reviewPolicy';
 import { assignmentReasonLabel, reviewerFlagLabel } from '../utils/reviewAssignment';
+import {
+  ASSIGNMENT_FILTER_LABEL as ASSIGNMENT_STATUS_LABEL,
+  EVALUATION_STATUS_LABEL,
+  PUBLICATION_STATUS_LABEL,
+  QUALITY_COLOR_LABEL,
+  REVIEW_FILTER_LABEL as REVIEW_STATUS_LABEL,
+  SECONDARY_REVIEW_STATUS_LABEL,
+  isBusyEvaluationStatus,
+} from '../constants/lifecycleStatus';
 import '../css/ReviewQueuePage.css';
-
-const REVIEW_STATUS_LABEL = {
-  all: 'Tất cả',
-  PENDING: 'Chờ duyệt',
-  PROCESSED: 'Đã xử lý',
-  APPROVED: 'Đã duyệt',
-  NEEDS_REVISION: 'Cần sửa',
-  REJECTED: 'Từ chối',
-};
 
 const QUESTION_ID_PATTERN = /^[a-f\d]{24}$/i;
 
@@ -66,37 +66,7 @@ function isValidQuestionId(value) {
 
 const COLOR_LABEL = {
   all: 'Mọi mức chất lượng',
-  GREEN: 'Đạt tốt',
-  YELLOW: 'Cần xem lại',
-  RED: 'Rủi ro cao',
-};
-
-const EVALUATION_STATUS_LABEL = {
-  NOT_STARTED: 'Chưa đánh giá',
-  QUEUED: 'Đang chờ AI đánh giá',
-  PROCESSING: 'Đang được AI đánh giá',
-  RUNNING: 'Đang được AI đánh giá',
-  PASSED: 'AI đề xuất đạt',
-  FAILED: 'AI đề xuất xem lại',
-  ERROR: 'Chưa đánh giá được',
-  STALE: 'Cần đánh giá lại',
-  INSUFFICIENT_EVIDENCE: 'Không đủ bằng chứng',
-  EVIDENCE_VALIDATION_FAILED: 'Minh chứng AI không hợp lệ',
-};
-
-const PUBLICATION_STATUS_LABEL = {
-  NOT_PUBLISHED: 'Chưa đưa lên Moodle',
-  PENDING: 'Đang đưa lên Moodle',
-  PUBLISHED: 'Đã đưa lên Moodle',
-  FAILED: 'Chưa đưa lên được',
-};
-
-const ASSIGNMENT_STATUS_LABEL = {
-  all: 'Mọi phân công',
-  mine: 'Của tôi',
-  UNASSIGNED: 'Chưa nhận',
-  ASSIGNED: 'Đã gán',
-  IN_REVIEW: 'Đang xử lý',
+  ...QUALITY_COLOR_LABEL,
 };
 
 const PAGE_SIZE = 20;
@@ -140,12 +110,6 @@ const CRITERION_RATING_LABEL = {
   REVIEW: 'Cần xem lại',
   FAIL: 'Không đạt',
   NO_DATA: 'Không đủ dữ liệu',
-};
-
-const SECONDARY_REVIEW_STATUS_LABEL = {
-  NOT_REQUIRED: 'Không yêu cầu',
-  AWAITING_SECONDARY: 'Đang chờ duyệt lần hai',
-  COMPLETED: 'Đã duyệt lần hai',
 };
 
 const ISSUE_SEVERITY_LABEL = {
@@ -363,7 +327,7 @@ function evaluationStatusLabel(value) {
 }
 
 function isEvaluationBusy(question) {
-  return ['QUEUED', 'PROCESSING', 'RUNNING'].includes(question?.evaluation_status);
+  return isBusyEvaluationStatus(question?.evaluation_status);
 }
 
 function canQueueEvaluation(question) {

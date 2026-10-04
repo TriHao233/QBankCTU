@@ -3,11 +3,17 @@ services:
     volumes:
       - ./backend/main.py:/app/main.py:ro
       - ./backend/core/email_service.py:/app/core/email_service.py:ro
+      - ./backend/core/dependencies.py:/app/core/dependencies.py:ro
+      - ./backend/core/status_enums.py:/app/core/status_enums.py:ro
+      - ./backend/modules/ocr/ocr.py:/app/modules/ocr/ocr.py:ro
+      - ./backend/modules/ocr/mongodb.py:/app/modules/ocr/mongodb.py:ro
       - ./backend/modules/contact:/app/modules/contact:ro
       - ./backend/modules/users/schemas.py:/app/modules/users/schemas.py:ro
+      - ./backend/modules/users/store.py:/app/modules/users/store.py:ro
       - ./backend/db/migrations/0018_contact_requests.sql:/app/db/migrations/0018_contact_requests.sql:ro
       - ./backend/db/migrations/0019_contact_categories.sql:/app/db/migrations/0019_contact_categories.sql:ro
       - ./backend/db/migrations/0020_contact_lifecycle.sql:/app/db/migrations/0020_contact_lifecycle.sql:ro
+      - ./backend/db/migrations/0021_clo_type_and_policy_reason.sql:/app/db/migrations/0021_clo_type_and_policy_reason.sql:ro
       - ./backend/modules/dictionary/dictionary.py:/app/modules/dictionary/dictionary.py:ro
       - ./backend/core/config.py:/app/core/config.py:ro
       - ./backend/core/bootstrap.py:/app/core/bootstrap.py:ro
@@ -20,12 +26,19 @@ services:
       - ./backend/modules/generation/question.py:/app/modules/generation/question.py:ro
       - ./backend/modules/generation/prompt_builder.py:/app/modules/generation/prompt_builder.py:ro
       - ./backend/modules/questions/workflow_service.py:/app/modules/questions/workflow_service.py:ro
+      - ./backend/modules/questions/postgres_repository.py:/app/modules/questions/postgres_repository.py:ro
+      - ./backend/modules/admin/overview_service.py:/app/modules/admin/overview_service.py:ro
       - ./backend/modules/catalog/service.py:/app/modules/catalog/service.py:ro
+      - ./backend/modules/catalog/schemas.py:/app/modules/catalog/schemas.py:ro
+      - ./backend/modules/catalog/ctdl_clos.py:/app/modules/catalog/ctdl_clos.py:ro
+      - ./backend/modules/catalog/postgres_subject_repository.py:/app/modules/catalog/postgres_subject_repository.py:ro
+      - ./backend/modules/catalog/postgres_ai_repository.py:/app/modules/catalog/postgres_ai_repository.py:ro
 
   worker:
     volumes:
       - ./backend/core/config.py:/app/core/config.py:ro
       - ./backend/core/bootstrap.py:/app/core/bootstrap.py:ro
+      - ./backend/core/dependencies.py:/app/core/dependencies.py:ro
       - ./backend/core/job_recovery.py:/app/core/job_recovery.py:ro
       - ./backend/modules/generation/llm:/app/modules/generation/llm:ro
       - ./backend/modules/generation/generate.py:/app/modules/generation/generate.py:ro
@@ -35,7 +48,12 @@ services:
       - ./backend/modules/generation/question.py:/app/modules/generation/question.py:ro
       - ./backend/modules/generation/prompt_builder.py:/app/modules/generation/prompt_builder.py:ro
       - ./backend/modules/questions/workflow_service.py:/app/modules/questions/workflow_service.py:ro
+      - ./backend/modules/questions/postgres_repository.py:/app/modules/questions/postgres_repository.py:ro
       - ./backend/modules/catalog/service.py:/app/modules/catalog/service.py:ro
+      - ./backend/modules/catalog/schemas.py:/app/modules/catalog/schemas.py:ro
+      - ./backend/modules/catalog/ctdl_clos.py:/app/modules/catalog/ctdl_clos.py:ro
+      - ./backend/modules/catalog/postgres_subject_repository.py:/app/modules/catalog/postgres_subject_repository.py:ro
+      - ./backend/modules/catalog/postgres_ai_repository.py:/app/modules/catalog/postgres_ai_repository.py:ro
 
   frontend-dev:
     image: node:20-alpine

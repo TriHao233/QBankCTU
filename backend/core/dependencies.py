@@ -33,6 +33,9 @@ TEACHER_PERMISSIONS = frozenset(
         "questions.use_shared_bank",
         "exams.manage_own",
         "catalog.subjects.manage_own",
+        # Theo thuyết minh: giảng viên là người duyệt human-in-the-loop.
+        "reviews.manage",
+        "questions.export_moodle",
     }
 )
 REVIEW_PERMISSIONS = frozenset({"reviews.manage", "questions.export_moodle"})
@@ -48,13 +51,16 @@ ADMIN_ONLY_PERMISSIONS = frozenset(
         "questions.manage_all",
     }
 )
-# Quyền có thể thêm/bỏ riêng cho Giảng viên và Người duyệt.
+# Quyền có thể thêm/bỏ riêng cho Giảng viên (role Reviewer đã ngừng dùng).
 ASSIGNABLE_PERMISSIONS = TEACHER_PERMISSIONS | REVIEW_PERMISSIONS
 ALL_PERMISSIONS = ASSIGNABLE_PERMISSIONS | ADMIN_ONLY_PERMISSIONS
+# Admin quản trị hệ thống; không duyệt câu hỏi (khớp thuyết minh).
+ADMIN_PERMISSIONS = frozenset(ALL_PERMISSIONS - {"reviews.manage"})
 
 DEFAULT_ROLE_PERMISSIONS = {
-    "Admin": set(ALL_PERMISSIONS),
+    "Admin": set(ADMIN_PERMISSIONS),
     "Teacher": set(TEACHER_PERMISSIONS),
+    # Giữ để tương thích dữ liệu cũ; UI không cho tạo mới.
     "Reviewer": set(REVIEW_PERMISSIONS),
 }
 
@@ -91,7 +97,7 @@ def _permission_set(values) -> set[str]:
 def effective_permissions(user: dict) -> tuple[str, ...]:
     role = user.get("role")
     if role == "Admin":
-        return tuple(sorted(ALL_PERMISSIONS))
+        return tuple(sorted(ADMIN_PERMISSIONS))
     permissions = set(DEFAULT_ROLE_PERMISSIONS.get(role, set()))
     # `permissions` là dữ liệu cũ (chỉ cộng thêm); ghi mới dùng grants/revokes.
     grants = _permission_set(user.get("permission_grants")) | _permission_set(user.get("permissions"))
@@ -238,7 +244,7 @@ def require_any_permission(*permissions: str) -> Callable:
 require_admin = require_roles("Admin")
 require_authenticated = require_roles("Admin", "Teacher", "Reviewer")
 require_teacher_reviewer_or_admin = require_authenticated
-# Kiểm duyệt: theo quyền reviews.manage (Admin luôn có) để thêm/bỏ quyền có hiệu lực thật.
+# Kiểm duyệt: theo quyền reviews.manage (Teacher mặc định có; Admin không duyệt HITL).
 require_reviewer_or_admin = require_permissions("reviews.manage")
 # Không gian giảng viên: theo từng quyền nghiệp vụ.
 require_teacher_or_admin = require_roles("Admin", "Teacher")

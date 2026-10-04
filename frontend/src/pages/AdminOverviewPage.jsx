@@ -274,6 +274,50 @@ function AdminOverviewPage() {
           </div>
         </section>
 
+        <section className="overview-panel overview-panel--wide">
+          <div className="overview-panel-heading">
+            <div>
+              <span>Sở hữu câu hỏi</span>
+              <h2>Tổng quan theo giảng viên</h2>
+            </div>
+            <FontAwesomeIcon icon={faUsers} />
+          </div>
+          <div className="overview-table-wrap">
+            <table className="overview-table">
+              <thead>
+                <tr>
+                  <th>Giảng viên</th>
+                  <th>Tổng</th>
+                  <th>Nháp</th>
+                  <th>Chờ duyệt</th>
+                  <th>Đã duyệt</th>
+                  <th>Cần sửa</th>
+                  <th>Từ chối</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(overview?.question_ownership || []).map((row) => (
+                  <tr key={row.user_id || row.email}>
+                    <td>
+                      <strong>{row.display_name || row.email || 'Chưa rõ'}</strong>
+                      <small>{row.email}{row.role ? ` · ${row.role}` : ''}</small>
+                    </td>
+                    <td>{formatNumber(row.total)}</td>
+                    <td>{formatNumber(row.draft)}</td>
+                    <td>{formatNumber(row.pending)}</td>
+                    <td>{formatNumber(row.approved)}</td>
+                    <td>{formatNumber(row.needs_revision)}</td>
+                    <td>{formatNumber(row.rejected)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {!overview?.question_ownership?.length && (
+              <p className="overview-empty">Chưa có câu hỏi theo người dùng.</p>
+            )}
+          </div>
+        </section>
+
         <section className="overview-panel">
           <div className="overview-panel-heading">
             <div>

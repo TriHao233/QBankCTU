@@ -217,7 +217,7 @@ class AdminOverviewService:
                 "label": "Câu hỏi chờ duyệt",
                 "count": pending_review,
                 "severity": "warning" if pending_review else "neutral",
-                "path": "/kiem-duyet?status=PENDING",
+                "path": "/quan-ly?status=PENDING",
             },
             {
                 "key": "retryable_jobs",
@@ -302,6 +302,7 @@ class AdminOverviewService:
                 "generated_at": utc_now(),
                 "users": self._user_summary(),
                 "questions": question_summary,
+                "question_ownership": self._question_ownership(),
                 "documents": {
                     "total": self._document_count({}),
                     "uploaded": self._document_count({"status": "UPLOADED"}),
@@ -363,6 +364,53 @@ class AdminOverviewService:
             "published": self._question_count({"publication_status": "PUBLISHED"}),
             "quality": self._quality_summary(),
         }
+
+    def _question_ownership(self) -> list[dict]:
+        if settings.question_store == "postgres":
+            from modules.questions.postgres_repository import PostgresQuestionRepository
+            return PostgresQuestionRepository.ownership_overview()
+        pipeline = [
+            {"$match": {"lifecycle_status": "ACTIVE"}},
+            {
+                "$group": {
+                    "_id": "$created_by_user_id",
+                    "total": {"$sum": 1},
+                    "draft": {"$sum": {"$cond": [{"$eq": ["$review_status", "DRAFT"]}, 1, 0]}},
+                    "pending": {"$sum": {"$cond": [{"$eq": ["$review_status", "PENDING"]}, 1, 0]}},
+                    "approved": {"$sum": {"$cond": [{"$eq": ["$review_status", "APPROVED"]}, 1, 0]}},
+                    "needs_revision": {
+                        "$sum": {"$cond": [{"$eq": ["$review_status", "NEEDS_REVISION"]}, 1, 0]}
+                    },
+                    "rejected": {"$sum": {"$cond": [{"$eq": ["$review_status", "REJECTED"]}, 1, 0]}},
+                }
+            },
+            {"$sort": {"total": -1}},
+            {"$limit": 50},
+        ]
+        rows = list(self.db.questions.aggregate(pipeline))
+        user_ids = [row["_id"] for row in rows if row.get("_id")]
+        users = {
+            str(user["_id"]): user
+            for user in users_by_ids(self.db, user_ids)
+        } if user_ids else {}
+        items = []
+        for row in rows:
+            user = users.get(str(row.get("_id")), {})
+            items.append(
+                {
+                    "user_id": str(row.get("_id") or ""),
+                    "display_name": user.get("display_name") or "",
+                    "email": user.get("email") or "",
+                    "role": user.get("role") or "",
+                    "total": row.get("total") or 0,
+                    "draft": row.get("draft") or 0,
+                    "pending": row.get("pending") or 0,
+                    "approved": row.get("approved") or 0,
+                    "needs_revision": row.get("needs_revision") or 0,
+                    "rejected": row.get("rejected") or 0,
+                }
+            )
+        return items
 
     def _question_count(self, query: dict) -> int:
         return self._count(

@@ -103,7 +103,9 @@ class PostgresAiRepository:
         code = values["model_code"]
         config = values["config"]
         # A model config may name a runtime endpoint but never carry credentials.
-        if any(any(part in key.lower() for part in ("key", "token", "password", "secret")) for key in config):
+        # Match whole secret-ish key names, not substrings (e.g. max_output_tokens).
+        secret_keys = {"key", "api_key", "apikey", "token", "access_token", "password", "secret", "secret_key"}
+        if any(key.lower() in secret_keys or key.lower().endswith(("_key", "_token", "_password", "_secret")) for key in config):
             raise ValueError("Cấu hình model không được chứa secret; hãy dùng biến môi trường")
         if config.get("endpoint") and config["endpoint"] != settings.ollama_generate_url:
             raise ValueError("Endpoint model phải dùng OLLAMA_GENERATE_URL của môi trường")
@@ -296,15 +298,16 @@ class PostgresAiRepository:
                     target_id = latest["id"]
                 else:
                     target_id = str(ObjectId())
+                    change_reason = getattr(payload, "change_reason", "") or ""
                     conn.execute("""
                         INSERT INTO evaluation_policies
                         (id, policy_name, version, weights, thresholds, weights_hash,
-                         is_active, created_by_user_id, created_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,false,%s,%s)
+                         change_reason, is_active, created_by_user_id, created_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,false,%s,%s)
                     """, (
                         target_id, name, (latest["version"] + 1 if latest else 1),
                         Jsonb(payload.weights), Jsonb(payload.thresholds), digest,
-                        str(actor_id) if actor_id else None, now,
+                        change_reason, str(actor_id) if actor_id else None, now,
                     ))
                 if payload.is_active:
                     conn.execute("UPDATE evaluation_policies SET is_active=false WHERE is_active")
@@ -312,10 +315,12 @@ class PostgresAiRepository:
                 row = conn.execute("SELECT * FROM evaluation_policies WHERE id=%s", (target_id,)).fetchone()
                 _audit(conn, actor_id, "evaluation_policy.save", "evaluation_policy", target_id,
                        {}, {"policy_name": name, "version": row["version"],
-                            "weights_hash": digest, "is_active": row["is_active"]})
+                            "weights_hash": digest, "change_reason": row.get("change_reason") or "",
+                            "is_active": row["is_active"]})
         return _api(row)
 
-    def activate_policy(self, name: str, version: int, active: bool, *, actor_id=None) -> dict:
+    def activate_policy(self, name: str, version: int, active: bool, *, actor_id=None,
+                        change_reason: str = "") -> dict:
         with postgres_connection() as conn:
             with conn.transaction():
                 conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('policy:global', 0))")
@@ -327,9 +332,16 @@ class PostgresAiRepository:
                     raise LookupError("Không tìm thấy policy version")
                 if active:
                     conn.execute("UPDATE evaluation_policies SET is_active=false WHERE is_active")
-                row = conn.execute("""
-                    UPDATE evaluation_policies SET is_active=%s WHERE id=%s RETURNING *
-                """, (active, row["id"])).fetchone()
+                if change_reason:
+                    row = conn.execute("""
+                        UPDATE evaluation_policies
+                        SET is_active=%s, change_reason=%s WHERE id=%s RETURNING *
+                    """, (active, change_reason, row["id"])).fetchone()
+                else:
+                    row = conn.execute("""
+                        UPDATE evaluation_policies SET is_active=%s WHERE id=%s RETURNING *
+                    """, (active, row["id"])).fetchone()
                 _audit(conn, actor_id, "evaluation_policy.activate", "evaluation_policy", row["id"],
-                       {}, {"policy_name": name, "version": version, "is_active": active})
+                       {}, {"policy_name": name, "version": version, "is_active": active,
+                            "change_reason": change_reason or row.get("change_reason") or ""})
         return _api(row)

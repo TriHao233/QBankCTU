@@ -1,30 +1,28 @@
-import { API_BASE_URL, apiFetch, authHeaders, parseError } from './client';
+import { apiRawRequest, apiRequest } from '../services/apiClient';
+import { TERMINAL_GENERATION_JOB_STATUSES } from '../constants/lifecycleStatus';
 import { parseGenerateStatusSseFrame } from '../utils/generateSse';
 
 export function enqueueGenerateQuestions(payload, idempotencyKey) {
-  return apiFetch('/generate/questions', {
+  return apiRequest('/generate/questions', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
-    },
-    body: JSON.stringify(payload),
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {},
+    body: payload,
   });
 }
 
 export function getGenerateStatus(jobId, options = {}) {
-  return apiFetch(`/generate/status/${jobId}`, options);
+  return apiRequest(`/generate/status/${jobId}`, { signal: options.signal });
 }
 
 export function cancelGenerateJob(jobId) {
-  return apiFetch(`/generate/status/${jobId}/cancel`, { method: 'POST' });
+  return apiRequest(`/generate/status/${jobId}/cancel`, { method: 'POST' });
 }
 
 export async function streamGenerateStatus(jobId, options = {}) {
   const {
     signal,
     timeoutMs = 20 * 60 * 1000,
-    terminal = ['completed', 'failed', 'cancelled'],
+    terminal = TERMINAL_GENERATION_JOB_STATUSES,
     onUpdate,
   } = options;
   const controller = new AbortController();
@@ -33,11 +31,10 @@ export async function streamGenerateStatus(jobId, options = {}) {
   const timeout = setTimeout(() => controller.abort('timeout'), timeoutMs);
 
   try {
-    const response = await fetch(`${API_BASE_URL}/generate/status/${jobId}/events`, {
-      headers: { ...(await authHeaders()), Accept: 'text/event-stream' },
+    const response = await apiRawRequest(`/generate/status/${jobId}/events`, {
+      accept: 'text/event-stream',
       signal: controller.signal,
     });
-    if (!response.ok) await parseError(response);
     if (!response.body) throw new Error('Trình duyệt không hỗ trợ đọc luồng tiến độ');
 
     const reader = response.body.getReader();

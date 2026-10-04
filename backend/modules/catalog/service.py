@@ -47,13 +47,13 @@ logger = logging.getLogger(__name__)
 
 SUBJECT_AUDIT_FIELDS = ("subject_code", "subject_name", "description", "is_active")
 CHAPTER_AUDIT_FIELDS = ("chapter_code", "chapter_name", "sequence_no", "is_active")
-CLO_AUDIT_FIELDS = ("clo_code", "description", "target_weight", "is_active")
+CLO_AUDIT_FIELDS = ("clo_code", "description", "outcome_type", "target_weight", "is_active")
 MODEL_AUDIT_FIELDS = (
     "model_code", "model_name", "display_name", "description", "runtime", "kind",
     "revision", "capabilities", "priority", "is_local", "is_active",
 )
 PROMPT_AUDIT_FIELDS = ("template_key", "version", "kind", "name", "content_hash", "is_active")
-POLICY_AUDIT_FIELDS = ("policy_name", "version", "weights", "thresholds", "is_active")
+POLICY_AUDIT_FIELDS = ("policy_name", "version", "weights", "thresholds", "change_reason", "is_active")
 
 
 def _audit_snapshot(record: dict | None, fields: tuple[str, ...]) -> dict:
@@ -381,6 +381,10 @@ class CatalogService:
                 raise CatalogConflictError("Mã môn học đã tồn tại") from exc
             self._audit("catalog.subject_create", "subject", record, viewer, SUBJECT_AUDIT_FIELDS,
                         label=record["subject_code"])
+        subject_id = str(record["_id"])
+        for outcome_payload in payload.learning_outcomes or []:
+            self.add_learning_outcome(subject_id, outcome_payload, viewer)
+        record = self._subject_or_404(subject_id)
         return _subject_response(record, self._usage_counts(record), viewer)
 
     def deactivate_subject(self, subject_id: str, viewer: Any = None) -> dict:
@@ -550,6 +554,7 @@ class CatalogService:
             "_id": ObjectId(),
             "clo_code": clo_code,
             "description": payload.description,
+            "outcome_type": payload.outcome_type,
             "target_weight": payload.target_weight,
             "is_active": payload.is_active,
             "created_at": now,
@@ -1067,6 +1072,7 @@ class CatalogService:
                     "weights": payload.weights,
                     "weights_hash": weights_hash,
                     "thresholds": payload.thresholds,
+                    "change_reason": payload.change_reason,
                     "is_active": payload.is_active,
                     "updated_at": now,
                 },
@@ -1088,6 +1094,7 @@ class CatalogService:
             return json_safe(self.ai_repo.activate_policy(
                 payload.policy_name, payload.version, payload.is_active,
                 actor_id=getattr(viewer, "id", None),
+                change_reason=payload.change_reason,
             ))
         now = utc_now()
         query = {"policy_name": payload.policy_name, "version": payload.version}
@@ -1104,9 +1111,12 @@ class CatalogService:
                 {"policy_name": payload.policy_name},
                 {"$set": {"is_active": False, "updated_at": now}},
             )
+        update_fields = {"is_active": payload.is_active, "updated_at": now}
+        if payload.change_reason:
+            update_fields["change_reason"] = payload.change_reason
         record = self.db.evaluation_policies.find_one_and_update(
             query,
-            {"$set": {"is_active": payload.is_active, "updated_at": now}},
+            {"$set": update_fields},
             return_document=ReturnDocument.AFTER,
         )
         self._audit_deactivated_versions(old_active, record["_id"], viewer,

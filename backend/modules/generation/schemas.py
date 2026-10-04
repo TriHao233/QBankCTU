@@ -76,6 +76,11 @@ class QuestionGenerateRequest(BaseModel):
         None,
         description="Timing đo ở frontend trước khi enqueue job sinh câu hỏi",
     )
+    clo_ids: Optional[List[str]] = Field(
+        None,
+        max_length=20,
+        description="Danh sách CLO do giảng viên chọn để giới hạn sinh câu hỏi",
+    )
 
     @field_validator("instruction")
     @classmethod
@@ -84,6 +89,21 @@ class QuestionGenerateRequest(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+    @field_validator("clo_ids")
+    @classmethod
+    def normalize_clo_ids(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if not value:
+            return None
+        normalized = []
+        seen = set()
+        for item in value:
+            clo_id = str(item or "").strip()
+            if not clo_id or clo_id in seen:
+                continue
+            seen.add(clo_id)
+            normalized.append(clo_id)
+        return normalized or None
 
     @model_validator(mode="after")
     def validate_total_questions(self):

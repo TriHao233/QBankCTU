@@ -20,6 +20,7 @@ test('buildGenerationRequest uses backend defaults and keeps instruction separat
     timings: { documentMs: 'reused', uploadMs: 10, ocrMs: 20, chunkMs: 30 },
     pipelineStartedAt: 100,
     now: () => 225.4,
+    cloIds: ['clo-1', 'clo-1', ' clo-2 '],
   });
 
   assert.equal(payload.instruction, 'Tập trung vào định nghĩa');
@@ -31,4 +32,5 @@ test('buildGenerationRequest uses backend defaults and keeps instruction separat
   assert.equal(payload.client_telemetry.document_reused, true);
   assert.equal(payload.client_telemetry.elapsed_before_generate_ms, 125);
   assert.deepEqual(payload.question_plan, questionPlan);
+  assert.deepEqual(payload.clo_ids, ['clo-1', 'clo-2']);
 });

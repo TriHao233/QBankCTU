@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -78,6 +79,44 @@ def _ocr_job_cancelled(job_id: str) -> bool:
     return ((status or {}).get("job") or {}).get("status") == "CANCELLED"
 
 
+# Serialize chunk/embed so concurrent OCR completions do not peg the API process.
+_auto_chunk_lock = threading.Lock()
+
+
+def _run_auto_chunk_sync(document_id: str) -> None:
+    """Heavy imports + embedding must stay off the asyncio event loop."""
+    with _auto_chunk_lock:
+        try:
+            # Lazy import inside the worker thread (not on the event loop).
+            from modules.dictionary.dictionary import run_dictionary_auto_learning
+            from modules.rag.chunking import chunk_document_and_store
+
+            result = chunk_document_and_store(
+                document_id=document_id,
+                chunk_size=settings.chunk_size_default,
+                chunk_overlap=settings.chunk_overlap_default,
+            )
+            if result.total_chunks > 0:
+                logger.info("Auto-learning dictionary keywords for document %s", document_id)
+                run_dictionary_auto_learning(
+                    document_id=document_id,
+                    course_id="it_fundamentals",
+                )
+        except Exception:
+            logger.exception("Auto-chunk after OCR failed for document %s", document_id)
+
+
+def _auto_chunk_after_ocr(document_id: str) -> None:
+    """Fire-and-forget chunk/index so OCR completion does not block API requests."""
+    thread = threading.Thread(
+        target=_run_auto_chunk_sync,
+        args=(document_id,),
+        name=f"auto-chunk-{document_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+
+
 async def process_ocr_background(
     document_id: str,
     job_id: str,
@@ -88,6 +127,7 @@ async def process_ocr_background(
     mime_type: str | None = None,
     source_provider: str = "LOCAL",
 ):
+    ocr_completed = False
     try:
         async with gpu_semaphore:
             if _ocr_job_cancelled(job_id):
@@ -143,6 +183,7 @@ async def process_ocr_background(
             if _ocr_job_cancelled(job_id):
                 return
             update_document_status(document_id, job_id, status="completed", stats=stats)
+            ocr_completed = True
     except DocumentQualityError as exc:
         logger.error("OCR job %s failed quality gate: %s", job_id, exc)
         if _ocr_job_cancelled(job_id):
@@ -175,6 +216,10 @@ async def process_ocr_background(
             status="failed",
             error_message=str(exc),
         )
+
+    if ocr_completed and not _ocr_job_cancelled(job_id):
+        # Release GPU first; chunk/index runs in a background thread.
+        _auto_chunk_after_ocr(document_id)
 
 
 def _iter_docx_blocks(document: Document):
@@ -393,11 +438,13 @@ def check_job_status(
             document_service.can_use(document["id"], current_user)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+    from core.status_enums import normalize_job_status
+
     job = result["job"]
     return {
         "job_id": job["_id"],
         "document_id": job["document_id"],
-        "status": job["status"].lower(),
+        "status": normalize_job_status(job["status"]),
         "progress": job.get("progress"),
         "error_message": (job.get("error") or {}).get("message"),
         "stats": job.get("stats"),

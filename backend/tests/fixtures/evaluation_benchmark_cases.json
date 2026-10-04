@@ -5,7 +5,9 @@
     "algorithm": "Một giải thuật có các đặc trưng: tính kết thúc, tính xác định, tính đúng đắn, tính phổ dụng và tính hiệu quả. Tính kết thúc nghĩa là giải thuật phải dừng sau một số hữu hạn bước.",
     "bst": "Cây nhị phân tìm kiếm là cây nhị phân mà khóa của mỗi nút lớn hơn mọi khóa ở cây con trái và nhỏ hơn mọi khóa ở cây con phải. Duyệt cây nhị phân tìm kiếm theo thứ tự giữa (inorder) cho dãy khóa tăng dần.",
     "binary_search": "Tìm kiếm nhị phân chỉ áp dụng trên dãy đã được sắp xếp. Ở mỗi bước, giải thuật so sánh khóa cần tìm với phần tử ở giữa dãy và loại bỏ một nửa dãy. Độ phức tạp trong trường hợp xấu nhất là O(log n).",
-    "linked_list": "Danh sách liên kết đơn gồm các nút, mỗi nút chứa dữ liệu và một con trỏ trỏ đến nút kế tiếp. Muốn truy cập phần tử thứ k phải duyệt tuần tự từ đầu danh sách."
+    "linked_list": "Danh sách liên kết đơn gồm các nút, mỗi nút chứa dữ liệu và một con trỏ trỏ đến nút kế tiếp. Muốn truy cập phần tử thứ k phải duyệt tuần tự từ đầu danh sách.",
+    "hash_table": "Bảng băm (hash table) ánh xạ khóa sang chỉ số bằng hàm băm. Khi hai khóa khác nhau cho cùng chỉ số sẽ xảy ra đụng độ (collision). Hai chiến lược xử lý đụng độ phổ biến là nối kết (chaining) và địa chỉ mở (open addressing).",
+    "graph": "Đồ thị gồm tập đỉnh và tập cạnh. Duyệt theo chiều rộng (BFS) dùng hàng đợi; duyệt theo chiều sâu (DFS) dùng ngăn xếp hoặc đệ quy. Trong đồ thị có trọng số không âm, thuật toán Dijkstra tìm đường đi ngắn nhất từ một đỉnh nguồn."
   },
   "cases": [
     {
@@ -162,6 +164,82 @@
       "options": {"A": "Ở đầu hàng đợi", "B": "Ở cuối hàng đợi", "C": "Ở giữa hàng đợi", "D": "Ở vị trí bất kỳ"},
       "correct_answer": "A",
       "explanation": "Nguồn nêu phần tử được lấy ra ở đầu hàng đợi (dequeue)."
+    },
+    {
+      "name": "matching_hash_collision_correct",
+      "expect": "PASS",
+      "source": "hash_table",
+      "clo": "Giải thích nguyên lý và xử lý đụng độ của bảng băm.",
+      "type": "GHEP_COT",
+      "bloom": 2,
+      "question": "Ghép khái niệm với mô tả đúng về bảng băm.",
+      "options": {
+        "left": ["Hàm băm", "Đụng độ", "Nối kết"],
+        "right": ["Ánh xạ khóa sang chỉ số", "Hai khóa khác nhau cùng chỉ số", "Lưu nhiều khóa vào một bucket"]
+      },
+      "correct_answer": "1-A,2-B,3-C",
+      "explanation": "Nguồn mô tả hàm băm, collision và chaining."
+    },
+    {
+      "name": "matching_hash_collision_hallucinated",
+      "expect": "BLOCK",
+      "source": "hash_table",
+      "clo": "Giải thích nguyên lý và xử lý đụng độ của bảng băm.",
+      "type": "GHEP_COT",
+      "bloom": 2,
+      "question": "Ghép khái niệm với mô tả đúng về bảng băm.",
+      "options": {
+        "left": ["Hàm băm", "Đụng độ", "Nối kết"],
+        "right": ["Sắp xếp khóa tăng dần", "Hai khóa khác nhau cùng chỉ số", "Dùng cây AVL để cân bằng"]
+      },
+      "correct_answer": "1-A,2-B,3-C",
+      "explanation": "Hàm băm dùng để sắp xếp khóa tăng dần."
+    },
+    {
+      "name": "scenario_graph_bfs_correct",
+      "expect": "PASS",
+      "source": "graph",
+      "clo": "Áp dụng cấu trúc dữ liệu để duyệt đồ thị.",
+      "type": "TINH_HUONG",
+      "bloom": 3,
+      "question": "Một sinh viên cần duyệt mọi đỉnh theo từng tầng từ đỉnh nguồn. Cấu trúc hỗ trợ phù hợp nhất là gì và vì sao?",
+      "correct_answer": "Hàng đợi vì BFS dùng hàng đợi để duyệt theo chiều rộng.",
+      "explanation": "Nguồn nêu BFS dùng hàng đợi."
+    },
+    {
+      "name": "scenario_graph_dijkstra_wrong",
+      "expect": "BLOCK",
+      "source": "graph",
+      "clo": "Áp dụng cấu trúc dữ liệu để duyệt đồ thị.",
+      "type": "TINH_HUONG",
+      "bloom": 3,
+      "question": "Với đồ thị có trọng số không âm, thuật toán nào tìm đường đi ngắn nhất từ một nguồn?",
+      "correct_answer": "BFS thuần túy vì luôn cho đường ngắn nhất trên mọi đồ thị.",
+      "explanation": "BFS luôn đúng cho mọi đồ thị có trọng số."
+    },
+    {
+      "name": "order_stack_ops_correct",
+      "expect": "PASS",
+      "source": "stack",
+      "clo": "Thao tác đúng trên ngăn xếp.",
+      "type": "SAP_XEP",
+      "bloom": 2,
+      "question": "Sắp xếp thứ tự thao tác để thêm rồi lấy phần tử ở đỉnh ngăn xếp.",
+      "options": ["push", "pop", "enqueue", "dequeue"],
+      "correct_answer": "push,pop",
+      "explanation": "Theo nguồn, push thêm vào đỉnh và pop lấy ra từ đỉnh."
+    },
+    {
+      "name": "order_stack_ops_wrong",
+      "expect": "BLOCK",
+      "source": "stack",
+      "clo": "Thao tác đúng trên ngăn xếp.",
+      "type": "SAP_XEP",
+      "bloom": 2,
+      "question": "Sắp xếp thứ tự thao tác để thêm rồi lấy phần tử ở đỉnh ngăn xếp.",
+      "options": ["enqueue", "dequeue", "push", "pop"],
+      "correct_answer": "enqueue,dequeue",
+      "explanation": "Ngăn xếp dùng enqueue/dequeue."
     }
   ]
 }

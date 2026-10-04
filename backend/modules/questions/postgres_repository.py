@@ -717,6 +717,31 @@ class PostgresQuestionRepository:
             ).fetchone())
 
     @staticmethod
+    def ownership_overview(limit: int = 50) -> list[dict]:
+        """Tổng quan số câu hỏi theo chủ sở hữu (giảng viên)."""
+        with postgres_connection() as conn:
+            rows = conn.execute(
+                """SELECT q.created_by_user_id AS user_id,
+                          coalesce(u.display_name, '') AS display_name,
+                          coalesce(u.email, '') AS email,
+                          coalesce(u.role, '') AS role,
+                          count(*) FILTER (WHERE q.lifecycle_status='ACTIVE') AS total,
+                          count(*) FILTER (WHERE q.review_status='DRAFT') AS draft,
+                          count(*) FILTER (WHERE q.review_status='PENDING') AS pending,
+                          count(*) FILTER (WHERE q.review_status='APPROVED') AS approved,
+                          count(*) FILTER (WHERE q.review_status='NEEDS_REVISION') AS needs_revision,
+                          count(*) FILTER (WHERE q.review_status='REJECTED') AS rejected
+                   FROM questions q
+                   LEFT JOIN users u ON u.id = q.created_by_user_id
+                   WHERE q.lifecycle_status='ACTIVE'
+                   GROUP BY q.created_by_user_id, u.display_name, u.email, u.role
+                   ORDER BY total DESC, email ASC
+                   LIMIT %s""",
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
     def owned_questions(user_id) -> list[dict]:
         with postgres_connection() as conn:
             rows = conn.execute(

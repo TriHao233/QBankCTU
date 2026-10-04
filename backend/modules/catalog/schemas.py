@@ -11,11 +11,24 @@ class ChapterPayload(BaseModel):
     is_active: bool = True
 
 
+OUTCOME_TYPES = ("kien_thuc", "ky_nang", "thai_do")
+
+
 class LearningOutcomePayload(BaseModel):
     clo_code: str = Field(..., min_length=1, max_length=40)
     description: str = Field(..., min_length=1, max_length=500)
+    # Phân loại CLO theo CTĐT: kiến thức / kỹ năng / thái độ.
+    outcome_type: str = Field("kien_thuc", min_length=1, max_length=40)
     target_weight: float = Field(1.0, ge=0, le=1)
     is_active: bool = True
+
+    @model_validator(mode="after")
+    def normalize_outcome_type(self):
+        value = (self.outcome_type or "kien_thuc").strip().lower()
+        if value not in OUTCOME_TYPES:
+            raise ValueError("Loại CLO phải là kien_thuc, ky_nang hoặc thai_do")
+        self.outcome_type = value
+        return self
 
 
 class SubjectPayload(BaseModel):
@@ -23,6 +36,7 @@ class SubjectPayload(BaseModel):
     subject_name: str = Field(..., min_length=1, max_length=200)
     description: str = ""
     is_active: bool = True
+    learning_outcomes: list[LearningOutcomePayload] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
     def normalize_subject_fields(self):
@@ -55,8 +69,19 @@ class ChapterUpdatePayload(BaseModel):
 class LearningOutcomeUpdatePayload(BaseModel):
     clo_code: str | None = Field(None, min_length=1, max_length=40)
     description: str | None = Field(None, min_length=1, max_length=500)
+    outcome_type: str | None = Field(None, min_length=1, max_length=40)
     target_weight: float | None = Field(None, ge=0, le=1)
     is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def normalize_outcome_type(self):
+        if self.outcome_type is None:
+            return self
+        value = self.outcome_type.strip().lower()
+        if value not in OUTCOME_TYPES:
+            raise ValueError("Loại CLO phải là kien_thuc, ky_nang hoặc thai_do")
+        self.outcome_type = value
+        return self
 
 
 class SubjectResponse(BaseModel):
@@ -174,11 +199,20 @@ class EvaluationPolicyPayload(BaseModel):
     policy_name: str = Field(..., min_length=1, max_length=160)
     weights: dict[str, float]
     thresholds: dict[str, float]
+    change_reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=1000,
+        description="Lý do khoa học/nghiệp vụ để tạo hoặc chuyển phiên bản đánh giá",
+    )
     create_new_version: bool = True
     is_active: bool = True
 
     @model_validator(mode="after")
     def validate_thresholds(self):
+        self.change_reason = self.change_reason.strip()
+        if len(self.change_reason) < 10:
+            raise ValueError("Cần nêu rõ lý do chuyển phiên bản đánh giá (tối thiểu 10 ký tự)")
         keys = ("yellow_min", "pass_min", "green_min")
         values = [self.thresholds.get(key) for key in keys]
         if any(value is None or not math.isfinite(value) or value < 0 or value > 1 for value in values):
@@ -192,3 +226,15 @@ class EvaluationPolicyActivationPayload(BaseModel):
     policy_name: str = Field(..., min_length=1, max_length=160)
     version: int = Field(..., ge=1)
     is_active: bool = True
+    change_reason: str = Field(
+        "",
+        max_length=1000,
+        description="Lý do kích hoạt phiên bản đánh giá này",
+    )
+
+    @model_validator(mode="after")
+    def normalize_reason(self):
+        self.change_reason = (self.change_reason or "").strip()
+        if self.is_active and len(self.change_reason) < 10:
+            raise ValueError("Cần nêu lý do khi kích hoạt phiên bản đánh giá")
+        return self

@@ -18,7 +18,18 @@ import '../css/SubjectManage.css';
 
 const EMPTY_SUBJECT = { subject_code: '', subject_name: '', description: '', is_active: true };
 const EMPTY_CHAPTER = { chapter_code: '', chapter_name: '', sequence_no: 1, is_active: true };
-const EMPTY_CLO = { clo_code: '', description: '', target_weight: 1, is_active: true };
+const OUTCOME_TYPE_OPTIONS = [
+  { value: 'kien_thuc', label: 'Kiến thức (CTĐT)' },
+  { value: 'ky_nang', label: 'Kỹ năng (CTĐT)' },
+  { value: 'thai_do', label: 'Thái độ (CTĐT)' },
+];
+const EMPTY_CLO = {
+  clo_code: '',
+  description: '',
+  outcome_type: 'kien_thuc',
+  target_weight: 1,
+  is_active: true,
+};
 
 const REVIEW_STATUS_LABEL = {
   DRAFT: 'Nháp',
@@ -90,6 +101,7 @@ function SubjectManage() {
   const [subjectModalOpen, setSubjectModalOpen] = useState(false);
   const [editingSubject, setEditingSubject] = useState(null);
   const [subjectForm, setSubjectForm] = useState(EMPTY_SUBJECT);
+  const [createCloDrafts, setCreateCloDrafts] = useState([]);
 
   const [childModal, setChildModal] = useState(null);
   const [chapterForm, setChapterForm] = useState(EMPTY_CHAPTER);
@@ -196,6 +208,7 @@ function SubjectManage() {
   const openCreateSubject = () => {
     setEditingSubject(null);
     setSubjectForm(EMPTY_SUBJECT);
+    setCreateCloDrafts([]);
     setSubjectModalOpen(true);
   };
 
@@ -207,12 +220,14 @@ function SubjectManage() {
       description: subject.description || '',
       is_active: subject.is_active !== false,
     });
+    setCreateCloDrafts([]);
     setSubjectModalOpen(true);
   };
 
   const closeSubjectModal = () => {
     if (saving) return;
     setSubjectModalOpen(false);
+    setCreateCloDrafts([]);
   };
 
   const handleSubmitSubject = async (event) => {
@@ -221,6 +236,15 @@ function SubjectManage() {
       setError('Vui lòng nhập mã và tên học phần.');
       return;
     }
+    const initialClos = createCloDrafts
+      .map((item) => ({
+        clo_code: String(item.clo_code || '').trim(),
+        description: String(item.description || '').trim(),
+        outcome_type: item.outcome_type || 'kien_thuc',
+        target_weight: Number(item.target_weight) || 1,
+        is_active: item.is_active !== false,
+      }))
+      .filter((item) => item.clo_code && item.description);
     setSaving(true);
     setError('');
     try {
@@ -229,6 +253,7 @@ function SubjectManage() {
         subject_name: subjectForm.subject_name.trim(),
         description: subjectForm.description.trim(),
         is_active: subjectForm.is_active,
+        ...(!editingSubject && initialClos.length ? { learning_outcomes: initialClos } : {}),
       };
       const saved = editingSubject
         ? await updateSubject(refId(editingSubject), payload)
@@ -237,6 +262,7 @@ function SubjectManage() {
       if (savedId) setSelectedSubjectId(savedId);
       setNotice(editingSubject ? 'Đã cập nhật học phần.' : 'Đã tạo học phần mới.');
       setSubjectModalOpen(false);
+      setCreateCloDrafts([]);
       await fetchSubjects();
     } catch (err) {
       setError(err.message || 'Lưu học phần thất bại');
@@ -299,6 +325,7 @@ function SubjectManage() {
       setCloForm(item ? {
         clo_code: item.clo_code || '',
         description: item.description || '',
+        outcome_type: item.outcome_type || 'kien_thuc',
         target_weight: item.target_weight ?? 1,
         is_active: item.is_active !== false,
       } : EMPTY_CLO);
@@ -340,6 +367,7 @@ function SubjectManage() {
         const payload = {
           clo_code: cloForm.clo_code.trim(),
           description: cloForm.description.trim(),
+          outcome_type: cloForm.outcome_type || 'kien_thuc',
           target_weight: Number(cloForm.target_weight) || 0,
           is_active: cloForm.is_active,
         };
@@ -717,6 +745,61 @@ function SubjectManage() {
               />
             </div>
 
+            {!editingSubject && (
+              <div className="field-group">
+                <div className="field-label-row">
+                  <label className="field-label">CLO khởi tạo (tuỳ chọn)</label>
+                  <button
+                    type="button"
+                    className="btn btn--ghost"
+                    onClick={() => setCreateCloDrafts((current) => [...current, { ...EMPTY_CLO }])}
+                  >
+                    Thêm dòng CLO
+                  </button>
+                </div>
+                {createCloDrafts.length === 0 ? (
+                  <p className="source-note">Có thể chọn CLO ngay khi tạo học phần, hoặc bổ sung sau.</p>
+                ) : createCloDrafts.map((draft, index) => (
+                  <div className="clo-draft-row" key={`create-clo-${index}`}>
+                    <input
+                      className="field-input"
+                      placeholder="CLO1"
+                      value={draft.clo_code}
+                      onChange={(event) => setCreateCloDrafts((current) => current.map((item, i) => (
+                        i === index ? { ...item, clo_code: event.target.value } : item
+                      )))}
+                    />
+                    <select
+                      className="field-select"
+                      value={draft.outcome_type}
+                      onChange={(event) => setCreateCloDrafts((current) => current.map((item, i) => (
+                        i === index ? { ...item, outcome_type: event.target.value } : item
+                      )))}
+                    >
+                      {OUTCOME_TYPE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                    <input
+                      className="field-input"
+                      placeholder="Mô tả chuẩn đầu ra"
+                      value={draft.description}
+                      onChange={(event) => setCreateCloDrafts((current) => current.map((item, i) => (
+                        i === index ? { ...item, description: event.target.value } : item
+                      )))}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn--ghost"
+                      onClick={() => setCreateCloDrafts((current) => current.filter((_, i) => i !== index))}
+                    >
+                      Xóa
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <label className="subject-switch">
               <input
                 type="checkbox"
@@ -808,6 +891,18 @@ function SubjectManage() {
                     placeholder="Sinh viên có khả năng phân tích độ phức tạp thuật toán..."
                     onChange={(event) => setCloForm({ ...cloForm, description: event.target.value })}
                   />
+                </div>
+                <div className="field-group">
+                  <label className="field-label">Loại CLO theo CTĐT</label>
+                  <select
+                    className="field-select"
+                    value={cloForm.outcome_type || 'kien_thuc'}
+                    onChange={(event) => setCloForm({ ...cloForm, outcome_type: event.target.value })}
+                  >
+                    {OUTCOME_TYPE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
                 </div>
                 <div className="field-group">
                   <label className="field-label">Trọng số mục tiêu (0 - 1)</label>

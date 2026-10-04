@@ -47,7 +47,7 @@ import {
 } from '../api/documents';
 import { listSubjects, saveSubject } from '../api/catalog';
 import { listTeacherOptions } from '../api/users';
-import { permissionsForUser } from '../auth/permissions';
+import { hasEffectivePermission, permissionsForUser } from '../auth/permissions';
 import { BLOOM_LEVELS, DIFFICULTIES, QUESTION_TYPES, difficultyLabel, questionTypeLabel } from '../constants/generationEnums';
 import { AuthContext } from '../context/AuthContext';
 import {
@@ -87,82 +87,27 @@ import {
   questionsToMoodleXml,
   timestampedQuestionBankFilename,
 } from '../utils/questionBankExchange';
+import {
+  ACTIVE_DOCUMENT_JOB_STATUSES,
+  DOC_STATUS_LABEL,
+  EVALUATION_STATUS_LABEL,
+  JOB_STATUS_LABEL,
+  PIPELINE_STEP_LABEL,
+  PUBLICATION_STATUS_LABEL,
+  QUALITY_COLOR_LABEL,
+  RETRYABLE_DOCUMENT_JOB_STATUSES,
+  REVIEW_STATUS_CLASS,
+  REVIEW_STATUS_LABEL,
+  SUBMITTABLE_REVIEW_STATUSES,
+  isBusyEvaluationStatus,
+} from '../constants/lifecycleStatus';
 import '../css/ManagePage.css';
-
-const REVIEW_STATUS_LABEL = {
-  DRAFT: 'Nháp',
-  PENDING: 'Chờ duyệt',
-  APPROVED: 'Đã duyệt',
-  NEEDS_REVISION: 'Cần sửa',
-  REJECTED: 'Từ chối',
-};
-
-const REVIEW_STATUS_CLASS = {
-  DRAFT: 'status--draft',
-  PENDING: 'status--pending',
-  APPROVED: 'status--approved',
-  NEEDS_REVISION: 'status--revise',
-  REJECTED: 'status--revise',
-};
-
-const DOC_STATUS_LABEL = {
-  UPLOADED: 'Đã tải lên',
-  PROCESSING: 'Đang xử lý',
-  READY: 'Đã xử lý',
-  FAILED: 'Thất bại',
-  ARCHIVED: 'Đã lưu trữ',
-};
-
-const JOB_STATUS_LABEL = {
-  NOT_STARTED: 'Chưa chạy',
-  QUEUED: 'Chờ chạy',
-  PROCESSING: 'Đang chạy',
-  COMPLETED: 'Hoàn tất',
-  FAILED: 'Lỗi',
-  CANCELLED: 'Đã hủy',
-};
-
-const PIPELINE_STEP_LABEL = {
-  ocr_status: 'OCR',
-  chunk_status: 'Chunk',
-  index_status: 'Index',
-};
-
-const ACTIVE_DOCUMENT_JOB_STATUSES = new Set(['QUEUED', 'PROCESSING']);
-const RETRYABLE_DOCUMENT_JOB_STATUSES = new Set(['FAILED', 'ERROR', 'STALE']);
-
-const EVALUATION_STATUS_LABEL = {
-  NOT_STARTED: 'Chưa đánh giá',
-  QUEUED: 'Chờ AI đánh giá',
-  PROCESSING: 'Đang đánh giá',
-  PASSED: 'Đạt',
-  FAILED: 'Không đạt',
-  ERROR: 'AI lỗi',
-  STALE: 'Cần đánh giá lại',
-  INSUFFICIENT_EVIDENCE: 'Không đủ bằng chứng',
-  EVIDENCE_VALIDATION_FAILED: 'Minh chứng AI không hợp lệ',
-};
-
-const PUBLICATION_STATUS_LABEL = {
-  NOT_PUBLISHED: 'Chưa ghi mô phỏng',
-  PUBLISHED: 'Đã ghi mô phỏng Moodle',
-  STALE: 'Cần ghi mô phỏng lại',
-  FAILED: 'Mô phỏng lỗi',
-};
 
 const QUALITY_COLOR_CLASS = {
   GREEN: 'quality--green',
   YELLOW: 'quality--yellow',
   RED: 'quality--red',
 };
-
-const QUALITY_COLOR_LABEL = {
-  GREEN: 'Đạt tốt',
-  YELLOW: 'Cần xem lại',
-  RED: 'Rủi ro cao',
-};
-
-const SUBMITTABLE_REVIEW_STATUSES = new Set(['DRAFT', 'NEEDS_REVISION']);
 const QUESTION_BANK_EXPORT_FORMATS = [
   { value: 'csv', label: 'CSV' },
   { value: 'xlsx', label: 'XLSX' },
@@ -260,7 +205,7 @@ function revisionIssueText(issue) {
 }
 
 function isEvaluationBusy(item) {
-  return ['QUEUED', 'PROCESSING', 'RUNNING'].includes(item?.evaluation_status);
+  return isBusyEvaluationStatus(item?.evaluation_status);
 }
 
 function canQueueEvaluation(item) {
@@ -480,7 +425,7 @@ function ManagePage() {
   const { user } = useContext(AuthContext);
   const canEditQuestions = ['Admin', 'Teacher'].includes(user?.role);
   const canManageDocuments = ['Admin', 'Teacher'].includes(user?.role);
-  const canReviewQuestions = ['Admin', 'Reviewer'].includes(user?.role);
+  const canReviewQuestions = hasEffectivePermission(user, 'reviews.manage');
   const permissions = permissionsForUser(user);
   const canCreateSubjects = permissions.includes('catalog.subjects.manage_own');
 
@@ -1062,14 +1007,16 @@ function ManagePage() {
     questions: filtered,
     subject: selectedFilterSubject,
     bloomLevels: BLOOM_LEVELS,
+    questionTypes: QUESTION_TYPES,
   }), [filtered, selectedFilterSubject]);
   const coverageScopeLabel = selectedFilterSubject
     ? `Trang hiện tại · ${selectedFilterSubject.subject_name || selectedFilterSubject.name || selectedFilterSubject.title || refId(selectedFilterSubject)}`
     : 'Trang kết quả hiện tại';
   const coverageSections = [
+    { key: 'types', label: 'Loại', rows: questionCoverage.types, gapCount: questionCoverage.gaps.types },
+    { key: 'clos', label: 'CLO', rows: questionCoverage.clos, gapCount: questionCoverage.gaps.clos },
     { key: 'bloom', label: 'Bloom', rows: questionCoverage.bloom, gapCount: questionCoverage.gaps.bloom },
     { key: 'chapters', label: 'Chương', rows: questionCoverage.chapters, gapCount: questionCoverage.gaps.chapters },
-    { key: 'clos', label: 'CLO', rows: questionCoverage.clos, gapCount: questionCoverage.gaps.clos },
   ];
   const selectedQuestions = useMemo(() => {
     const currentPageById = new Map(questions.map((question) => [question.id, question]));
@@ -1910,7 +1857,7 @@ function ManagePage() {
         expected_version: item.current_version,
         fallback_to_heuristic: false,
       });
-      await refreshAfterWorkflow('Đã đưa câu hỏi vào hàng đợi AI đánh giá. Xem kết quả trong tab Thẩm định AI.', item);
+      await refreshAfterWorkflow('Đã đưa câu hỏi vào hàng đợi AI đánh giá. Xem kết quả trong lịch sử đánh giá của câu hỏi.', item);
     } catch (error) {
       alert('Kiểm tra AI thất bại: ' + error.message);
     } finally {

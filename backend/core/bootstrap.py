@@ -767,6 +767,10 @@ def _seed_reference_data() -> None:
                     "weights": weights,
                     "weights_hash": hashlib.sha256(str(sorted(weights.items())).encode()).hexdigest(),
                     "thresholds": {"yellow_min": 0.50, "green_min": 0.75, "pass_min": 0.65},
+                    "change_reason": (
+                        "v2: cân bằng clo_alignment/bloom_alignment (0.15) và pass_min=0.65 "
+                        "sau benchmark fixture CTDL; xem docs/EVALUATION_POLICY_VERSIONS.md"
+                    ),
                     "is_active": not has_active_policy,
                     "created_at": now,
                 }
@@ -785,7 +789,7 @@ def _seed_reference_data() -> None:
                     "token_env_var": "",
                     "default_course_id": "ctdl-demo",
                     "default_category_id": "qbank-demo",
-                    "allowed_roles": ["Admin", "Reviewer"],
+                    "allowed_roles": ["Admin", "Teacher"],
                     "is_active": True,
                     "last_check": None,
                     "created_by_user_id": None,
@@ -941,6 +945,102 @@ def _seed_prompt_templates(db, now: datetime) -> None:
         )
 
 
+def _seed_ctdl_learning_outcomes() -> None:
+    """Bổ sung CLO tham chiếu CTĐT cho học phần Cấu trúc dữ liệu nếu còn thiếu."""
+    from modules.catalog.ctdl_clos import CTDL_LEARNING_OUTCOMES, is_ctdl_subject
+
+    now = datetime.now(timezone.utc)
+    if settings.catalog_store == "postgres":
+        from bson import ObjectId
+        from modules.catalog.postgres_subject_repository import PostgresSubjectRepository
+
+        repo = PostgresSubjectRepository()
+        subjects = repo.list(active_only=False)
+        if not any(is_ctdl_subject(item) for item in subjects):
+            subjects = [
+                repo.create(
+                    {
+                        "_id": ObjectId(),
+                        "schema_version": SCHEMA_VERSION,
+                        "subject_code": "CTDL",
+                        "subject_name": "Cấu trúc dữ liệu",
+                        "description": "Học phần trọng tâm theo thuyết minh đề tài; CLO tham chiếu CTĐT.",
+                        "chapters": [],
+                        "learning_outcomes": [],
+                        "is_active": True,
+                        "created_at": now,
+                        "updated_at": now,
+                        "owner_id": None,
+                        "owner_email": "",
+                    }
+                )
+            ]
+        for subject in subjects:
+            if not is_ctdl_subject(subject):
+                continue
+            existing = {
+                str(item.get("clo_code") or "").strip().upper()
+                for item in (subject.get("learning_outcomes") or [])
+            }
+            for spec in CTDL_LEARNING_OUTCOMES:
+                code = spec["clo_code"].upper()
+                if code in existing:
+                    continue
+                repo.save_child(
+                    subject["_id"],
+                    "clo",
+                    {
+                        "_id": ObjectId(),
+                        "clo_code": spec["clo_code"],
+                        "description": spec["description"],
+                        "outcome_type": spec["outcome_type"],
+                        "target_weight": spec["target_weight"],
+                        "is_active": True,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                    create=True,
+                )
+        return
+
+    db = get_rag_db()
+    if not mongo_owns("subjects"):
+        return
+    from bson import ObjectId
+
+    for subject in db.subjects.find({}):
+        if not is_ctdl_subject(subject):
+            continue
+        existing = {
+            str(item.get("clo_code") or "").strip().upper()
+            for item in (subject.get("learning_outcomes") or [])
+        }
+        additions = []
+        for spec in CTDL_LEARNING_OUTCOMES:
+            if spec["clo_code"].upper() in existing:
+                continue
+            additions.append(
+                {
+                    "_id": ObjectId(),
+                    "clo_code": spec["clo_code"],
+                    "description": spec["description"],
+                    "outcome_type": spec["outcome_type"],
+                    "target_weight": spec["target_weight"],
+                    "is_active": True,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        if additions:
+            db.subjects.update_one(
+                {"_id": subject["_id"]},
+                {
+                    "$push": {"learning_outcomes": {"$each": additions}},
+                    "$set": {"updated_at": now},
+                },
+            )
+
+
 def bootstrap_database() -> None:
     """Create or align V2 collections without deleting existing data."""
     if settings.auth_db_name == settings.rag_db_name:
@@ -953,6 +1053,11 @@ def bootstrap_database() -> None:
     )
     _ensure_indexes()
     _seed_reference_data()
+    try:
+        _seed_ctdl_learning_outcomes()
+    except Exception:
+        # Seed CLO không được làm hỏng khởi động; migration có thể chưa chạy.
+        pass
     now = datetime.now(timezone.utc)
     get_rag_db().schema_meta.update_one(
         {"_id": "database_schema"},

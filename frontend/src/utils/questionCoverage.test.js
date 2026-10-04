@@ -38,6 +38,26 @@ test('question coverage counts bloom levels and approved questions', () => {
   assert.equal(coverage.bloom[2].percent, 33);
 });
 
+test('question coverage counts question types', () => {
+  const coverage = buildQuestionCoverage({
+    bloomLevels,
+    questionTypes: [
+      { backend: 'trac_nghiem', label: 'MCQ' },
+      { backend: 'dung_sai', label: 'True/False' },
+    ],
+    questions: [
+      { review_status: 'APPROVED', classification: { assessment_type: 'trac_nghiem', bloom: { level: 1 } }, clos: [] },
+      { review_status: 'PENDING', classification: { assessment_type: 'trac_nghiem', bloom: { level: 1 } }, clos: [] },
+      { review_status: 'APPROVED', classification: { assessment_type: 'dung_sai', bloom: { level: 2 } }, clos: [] },
+    ],
+  });
+
+  assert.equal(coverage.types[0].count, 2);
+  assert.equal(coverage.types[0].approved, 1);
+  assert.equal(coverage.types[1].count, 1);
+  assert.equal(coverage.gaps.types, 0);
+});
+
 test('question coverage keeps empty catalog chapters and CLO targets visible', () => {
   const coverage = buildQuestionCoverage({
     bloomLevels,

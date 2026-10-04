@@ -174,6 +174,15 @@ async def generate_questions_rag(
 
     prompt_builder = PromptBuilder()
     learning_outcomes = get_document_learning_outcomes(req.document_id)
+    if req.clo_ids:
+        selected = {str(item).strip() for item in req.clo_ids if str(item).strip()}
+        filtered = [
+            item for item in learning_outcomes
+            if str(item.get("id") or item.get("_id") or "").strip() in selected
+        ]
+        if not filtered:
+            raise ValueError("CLO đã chọn không thuộc học phần của tài liệu này.")
+        learning_outcomes = filtered
     generated_questions: List[GeneratedQuestion] = []
     summaries: List[GenerationPlanSummary] = []
     try:

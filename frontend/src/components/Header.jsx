@@ -40,6 +40,8 @@ const navIcons = {
   'Thống kê': faChartColumn,
   'Moodle': faGraduationCap,
   'Câu hỏi': faCircleQuestion,
+  'Học phần': faLayerGroup,
+  'Tài liệu': faBookOpen,
   'Thẩm định AI': faRobot,
 };
 
@@ -154,7 +156,11 @@ const Header = () => {
       label: 'Giảng viên',
       items: [
         { path: '/sinh-cau-hoi', label: 'Sinh câu hỏi' },
+        { path: '/quan-ly', label: 'Câu hỏi' },
+        { path: '/quan-ly-hoc-phan', label: 'Học phần' },
+        { path: '/quan-ly-tai-lieu', label: 'Tài liệu' },
         { path: '/lam-de-thi', label: 'Làm đề thi' },
+        { path: '/lich-cong-viec', label: 'Tác vụ' },
       ],
     },
     {
@@ -167,8 +173,8 @@ const Header = () => {
       ],
     },
     {
-      id: 'reviewer',
-      label: 'Người duyệt',
+      id: 'review',
+      label: 'Kiểm duyệt',
       items: [
         { path: '/kiem-duyet', label: 'Hàng kiểm duyệt', requires: 'reviews.manage' },
       ],
@@ -191,13 +197,15 @@ const Header = () => {
     label: 'Quản trị',
     items: [
       { path: '/tong-quan', label: 'Tổng quan' },
-      { path: '/kiem-duyet', label: 'Kiểm duyệt' },
       { path: '/quan-ly', label: 'Câu hỏi' },
       { path: '/duyet-ai', label: 'Thẩm định AI' },
       { path: '/lam-de-thi', label: 'Xem đề thi' },
       { path: '/danh-muc', label: 'Danh mục' },
       { path: '/quan-ly-nguoi-dung', label: 'Người dùng' },
+      { path: '/nhat-ky-he-thong', label: 'Nhật ký' },
+      { path: '/quan-ly-job', label: 'Hàng đợi' },
       { path: '/quan-ly-moodle', label: 'Moodle' },
+      { path: '/lich-cong-viec', label: 'Tác vụ' },
     ],
   };
   const roleNavGroups = role === 'Admin' ? [adminNavGroup] : navGroups;

@@ -8,9 +8,11 @@ export function buildGenerationRequest({
   timings,
   pipelineStartedAt,
   now,
+  cloIds,
 }) {
   const firstPlanItem = questionPlan[0];
   const instruction = teacherInstruction.trim() || undefined;
+  const selectedCloIds = [...new Set((cloIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
 
   return {
     document_id: documentId,
@@ -22,6 +24,7 @@ export function buildGenerationRequest({
     instruction,
     ...(targetHeading?.trim() ? { target_heading: targetHeading.trim() } : {}),
     ...(modelProvider ? { model_provider: modelProvider, code_model_provider: modelProvider } : {}),
+    ...(selectedCloIds.length ? { clo_ids: selectedCloIds } : {}),
     client_telemetry: {
       source_mode: sourceMode,
       document_reused: timings.documentMs === 'reused',

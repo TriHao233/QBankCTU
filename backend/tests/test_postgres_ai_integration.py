@@ -76,12 +76,14 @@ def test_versioned_ai_configuration_and_activation():
         policy = repo.save_policy(EvaluationPolicyPayload(
             policy_name=policy_name, weights={"faithfulness": 1.0},
             thresholds={"yellow_min": 0.3, "pass_min": 0.5, "green_min": 0.7},
+            change_reason="Initial evaluator policy for postgres integration test",
             is_active=False,
         ))
         assert policy["version"] == 1
         assert repo.save_policy(EvaluationPolicyPayload(
             policy_name=policy_name, weights={"faithfulness": 0.8},
             thresholds={"yellow_min": 0.3, "pass_min": 0.6, "green_min": 0.8},
+            change_reason="Recalibrate faithfulness weight after benchmark run",
             is_active=False,
         ))["version"] == 2
         with postgres_connection() as conn:

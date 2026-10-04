@@ -10,9 +10,10 @@ from pymongo import ReturnDocument
 
 from core.audit import record_audit_event
 from core.config import settings
+from core.dependencies import CurrentUser
 from core.postgres import postgres_connection
 from core.postgres_audit import write_postgres_audit_event
-from core.dependencies import CurrentUser
+from core.status_enums import ACTIVE_JOB_STATUSES, normalize_job_status
 from modules.admin.job_metrics import collect_job_metrics
 from modules.catalog.postgres_subject_repository import subject_records
 from modules.documents.repository import RETRYABLE_DOCUMENT_JOB_TYPES
@@ -20,6 +21,12 @@ from modules.documents.service import DocumentService
 from modules.documents.store import get_document_repository
 from modules.generation.mongodb import create_generation_job, get_generation_job
 from modules.questions.workflow_service import QuestionWorkflowService
+
+# Keep both casings for mixed generation (lower) + document/evaluation (UPPER) job lists.
+ACTIVE_STATUSES = {status.upper() for status in ACTIVE_JOB_STATUSES} | set(ACTIVE_JOB_STATUSES)
+RETRYABLE_STATUSES = {"FAILED", "ERROR", "STALE", "BLOCKED", "failed"}
+LEGACY_ADMIN_CANCEL_PATTERN = "^Cancelled by admin "
+
 
 def _postgres_generation_store():
     if settings.generation_store != "postgres":
@@ -38,11 +45,6 @@ def _postgres_evaluation_jobs():
         return None
     from modules.questions.postgres_evaluation_jobs import PostgresEvaluationJobs
     return PostgresEvaluationJobs()
-
-
-ACTIVE_STATUSES = {"QUEUED", "PROCESSING", "queued", "processing"}
-RETRYABLE_STATUSES = {"FAILED", "ERROR", "STALE", "BLOCKED", "failed"}
-LEGACY_ADMIN_CANCEL_PATTERN = "^Cancelled by admin "
 
 
 def utc_now() -> datetime:
@@ -117,7 +119,7 @@ def _parse_object_id(value: str | ObjectId, field_name: str = "id") -> ObjectId:
 def _generation_status_filter(status: str | None) -> str | dict | None:
     if not status:
         return None
-    normalized = status.lower()
+    normalized = normalize_job_status(status)
     if normalized == "active":
         return {"$in": ["queued", "processing"]}
     if normalized in {"retryable", "attention"}:
@@ -128,12 +130,12 @@ def _generation_status_filter(status: str | None) -> str | dict | None:
 def _uppercase_status_filter(status: str | None) -> str | dict | None:
     if not status:
         return None
-    normalized = status.lower()
+    normalized = normalize_job_status(status)
     if normalized == "active":
         return {"$in": ["QUEUED", "PROCESSING"]}
     if normalized in {"retryable", "attention"}:
         return {"$in": ["FAILED", "ERROR", "STALE", "BLOCKED"]}
-    return status.upper()
+    return normalized.upper()
 
 
 def _document_statuses(status: str | None) -> list[str] | None:

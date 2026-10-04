@@ -29,7 +29,14 @@ const DEFAULT_WEIGHTS = {
 const DEFAULT_THRESHOLDS = { yellow_min: 0.5, green_min: 0.75, pass_min: 0.65 };
 const EMPTY_SUBJECT_FORM = { id: '', subject_code: '', subject_name: '', description: '', is_active: true };
 const EMPTY_CHAPTER_FORM = { id: '', chapter_code: '', chapter_name: '', sequence_no: 1, is_active: true };
-const EMPTY_CLO_FORM = { id: '', clo_code: '', description: '', target_weight: 1, is_active: true };
+const EMPTY_CLO_FORM = {
+  id: '',
+  clo_code: '',
+  description: '',
+  outcome_type: 'kien_thuc',
+  target_weight: 1,
+  is_active: true,
+};
 
 function compactJson(value) {
   return JSON.stringify(value, null, 2);
@@ -90,6 +97,7 @@ function cloToForm(clo) {
     id: childId(clo),
     clo_code: clo.clo_code || '',
     description: clo.description || '',
+    outcome_type: clo.outcome_type || 'kien_thuc',
     target_weight: clo.target_weight ?? 1,
     is_active: clo.is_active !== false,
   };
@@ -133,6 +141,7 @@ function CatalogAdminPage() {
     policy_name: 'Default question quality policy',
     weights: compactJson(DEFAULT_WEIGHTS),
     thresholds: compactJson(DEFAULT_THRESHOLDS),
+    change_reason: '',
   });
   const [healthCheckingCode, setHealthCheckingCode] = useState('');
   const [modelHealth, setModelHealth] = useState(null);
@@ -410,10 +419,15 @@ function CatalogAdminPage() {
 
   const handleSavePolicy = (event) => {
     event.preventDefault();
+    if (!String(policyForm.change_reason || '').trim()) {
+      setError('Cần nêu lý do khi tạo phiên bản tiêu chí đánh giá mới.');
+      return;
+    }
     runSave(async () => saveEvaluationPolicy({
       policy_name: policyForm.policy_name,
       weights: JSON.parse(policyForm.weights),
       thresholds: JSON.parse(policyForm.thresholds),
+      change_reason: policyForm.change_reason.trim(),
       create_new_version: true,
       is_active: true,
     }));
@@ -424,14 +438,26 @@ function CatalogAdminPage() {
       policy_name: policy.policy_name,
       weights: compactJson(policy.weights || DEFAULT_WEIGHTS),
       thresholds: compactJson(policy.thresholds || DEFAULT_THRESHOLDS),
+      change_reason: policy.change_reason || '',
     });
   };
 
   const handleActivatePolicy = (policy, isActive = true) => {
+    const reason = isActive
+      ? window.prompt(
+        'Lý do kích hoạt phiên bản đánh giá này (tối thiểu 10 ký tự):',
+        policy.change_reason || '',
+      )
+      : '';
+    if (isActive && (!reason || reason.trim().length < 10)) {
+      setError('Cần nêu lý do khi kích hoạt phiên bản đánh giá.');
+      return;
+    }
     runSave(async () => activateEvaluationPolicy({
       policy_name: policy.policy_name,
       version: policy.version,
       is_active: isActive,
+      change_reason: (reason || '').trim(),
     }));
   };
 
@@ -554,6 +580,11 @@ function CatalogAdminPage() {
                     <h4>{cloForm.id ? 'Sửa CLO' : 'Thêm CLO'}</h4>
                     <input placeholder="CLO1" value={cloForm.clo_code} onChange={(e) => setCloForm({ ...cloForm, clo_code: e.target.value })} />
                     <input placeholder="Mô tả chuẩn đầu ra" value={cloForm.description} onChange={(e) => setCloForm({ ...cloForm, description: e.target.value })} />
+                    <select value={cloForm.outcome_type || 'kien_thuc'} onChange={(e) => setCloForm({ ...cloForm, outcome_type: e.target.value })}>
+                      <option value="kien_thuc">Kiến thức (CTĐT)</option>
+                      <option value="ky_nang">Kỹ năng (CTĐT)</option>
+                      <option value="thai_do">Thái độ (CTĐT)</option>
+                    </select>
                     <input type="number" min="0" max="1" step="0.05" value={cloForm.target_weight} onChange={(e) => setCloForm({ ...cloForm, target_weight: e.target.value })} />
                     <label className="catalog-check">
                       <input type="checkbox" checked={cloForm.is_active} onChange={(e) => setCloForm({ ...cloForm, is_active: e.target.checked })} />
@@ -775,6 +806,12 @@ function CatalogAdminPage() {
               <input value={policyForm.policy_name} onChange={(e) => setPolicyForm({ ...policyForm, policy_name: e.target.value })} />
               <textarea rows={7} value={policyForm.weights} onChange={(e) => setPolicyForm({ ...policyForm, weights: e.target.value })} />
               <textarea rows={5} value={policyForm.thresholds} onChange={(e) => setPolicyForm({ ...policyForm, thresholds: e.target.value })} />
+              <textarea
+                rows={3}
+                placeholder="Lý do chuyển phiên bản (kết quả benchmark, thay đổi trọng số, dataset mới...)"
+                value={policyForm.change_reason}
+                onChange={(e) => setPolicyForm({ ...policyForm, change_reason: e.target.value })}
+              />
               <button type="submit" disabled={saving}>Lưu phiên bản tiêu chí</button>
             </form>
             <div className="catalog-list">
@@ -783,6 +820,7 @@ function CatalogAdminPage() {
                   <div>
                     <b>{policy.policy_name}</b>
                     <span>Phiên bản {policy.version} {policy.is_active ? '· đang dùng' : ''}</span>
+                    {policy.change_reason ? <span>{policy.change_reason}</span> : null}
                   </div>
                   <div className="catalog-item-actions">
                     <button type="button" className="catalog-ghost-button" onClick={() => handleEditPolicy(policy)} disabled={saving}>

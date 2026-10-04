@@ -227,16 +227,24 @@ Do not use these source_context excerpts again unless the focused CONTEXT has no
 """
         clo_block = ""
         if learning_outcomes:
+            type_labels = {
+                "kien_thuc": "kiến thức",
+                "ky_nang": "kỹ năng",
+                "thai_do": "thái độ",
+            }
             clo_lines = "\n".join(
-                f"- {item['clo_code']}: {item['description']}"
+                (
+                    f"- {item['clo_code']} [{type_labels.get(str(item.get('outcome_type') or 'kien_thuc'), 'kiến thức')}]"
+                    f": {item['description']}"
+                )
                 for item in learning_outcomes
                 if item.get("clo_code") and item.get("description")
             )
             if clo_lines:
                 clo_block = f"""
-LEARNING OUTCOMES:
+LEARNING OUTCOMES (teacher-selected or subject catalog; classify by CTĐT type):
 {clo_lines}
-Set `clo_codes` to the best matching codes from this list. Do not invent codes.
+Set `clo_codes` to the best matching codes from this list. Prefer covering the selected outcomes. Do not invent codes.
 """
         mode_block = (
             "CONTENT MODE: CODE\nCreate questions that require reading, tracing, debugging, or reasoning about code "

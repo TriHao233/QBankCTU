@@ -20,6 +20,7 @@ from main import app
 from core.bootstrap import SCHEMA_VERSION, VALIDATORS
 from core.config import settings
 from core.dependencies import (
+    ADMIN_PERMISSIONS,
     ALL_PERMISSIONS,
     CurrentUser,
     effective_permissions,
@@ -684,11 +685,13 @@ class SchemaV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Quản trị viên"):
             permission_overrides("Reviewer", ["reviews.manage", "admin.overview"])
 
-        self.assertEqual(set(effective_permissions({"role": "Admin"})), set(ALL_PERMISSIONS))
+        self.assertEqual(set(effective_permissions({"role": "Admin"})), set(ADMIN_PERMISSIONS))
+        self.assertNotIn("reviews.manage", effective_permissions({"role": "Admin"}))
         self.assertEqual(
             set(effective_permissions({"role": "Admin", "permission_revokes": ["admin.users"]})),
-            set(ALL_PERMISSIONS),
+            set(ADMIN_PERMISSIONS),
         )
+        self.assertIn("reviews.manage", effective_permissions({"role": "Teacher"}))
 
     def test_permission_overrides_grant_and_revoke_relative_to_role(self):
         overrides = permission_overrides("Reviewer", ["questions.export_moodle", "exams.manage_own"])
@@ -5897,10 +5900,21 @@ class SchemaV2Tests(unittest.TestCase):
         policy = EvaluationPolicyPayload(
             policy_name="QA", weights={"faithfulness": 1.0},
             thresholds={"yellow_min": 0.5, "pass_min": 0.65, "green_min": 0.75},
+            change_reason="Baseline policy for catalog audit coverage tests",
         )
         service.save_evaluation_policy(policy, admin)
-        service.save_evaluation_policy(policy.model_copy(update={"weights": {"faithfulness": 0.8}}), admin)
-        service.activate_evaluation_policy(EvaluationPolicyActivationPayload(policy_name="QA", version=1), admin)
+        service.save_evaluation_policy(policy.model_copy(update={
+            "weights": {"faithfulness": 0.8},
+            "change_reason": "Lower faithfulness weight after fixture recalibration",
+        }), admin)
+        service.activate_evaluation_policy(
+            EvaluationPolicyActivationPayload(
+                policy_name="QA",
+                version=1,
+                change_reason="Rollback to v1 after regression on false-approve rate",
+            ),
+            admin,
+        )
 
         actions = [item["action"] for item in db.audit_logs.records]
         for action in (
@@ -5947,18 +5961,29 @@ class SchemaV2Tests(unittest.TestCase):
         weights = {"faithfulness": 1.0}
         valid = {"yellow_min": 0.5, "pass_min": 0.65, "green_min": 0.75}
         self.assertEqual(
-            EvaluationPolicyPayload(policy_name="QA", weights=weights, thresholds=valid).thresholds,
+            EvaluationPolicyPayload(
+                policy_name="QA",
+                weights=weights,
+                thresholds=valid,
+                change_reason="Valid threshold order for unit test",
+            ).thresholds,
             valid,
         )
         with self.assertRaises(ValidationError):
             EvaluationPolicyPayload(
                 policy_name="QA", weights=weights,
                 thresholds={"yellow_min": 0.7, "pass_min": 0.65, "green_min": 0.75},
+                change_reason="Invalid yellow/pass order",
             )
         with self.assertRaises(ValidationError):
             EvaluationPolicyPayload(
                 policy_name="QA", weights=weights,
                 thresholds={"yellow_min": 0.5, "pass_min": 0.8, "green_min": 0.75},
+                change_reason="Invalid pass/green order",
+            )
+        with self.assertRaises(ValidationError):
+            EvaluationPolicyPayload(
+                policy_name="QA", weights=weights, thresholds=valid, change_reason="short",
             )
 
     def test_catalog_runtime_controls_prompt_policy_and_model_state(self):
@@ -6052,7 +6077,11 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertFalse(db.prompt_templates.find_one({"template_key": "system", "version": 2})["is_active"])
 
         policy = service.activate_evaluation_policy(
-            EvaluationPolicyActivationPayload(policy_name="Default", version=1)
+            EvaluationPolicyActivationPayload(
+                policy_name="Default",
+                version=1,
+                change_reason="Activate v1 after local evaluator benchmark",
+            )
         )
         self.assertTrue(policy["is_active"])
         self.assertFalse(db.evaluation_policies.find_one({"policy_name": "Default", "version": 2})["is_active"])

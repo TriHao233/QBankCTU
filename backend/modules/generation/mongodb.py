@@ -44,6 +44,7 @@ def get_document_learning_outcomes(document_id: str) -> list[dict]:
             "id": str(item["_id"]),
             "clo_code": str(item.get("clo_code") or "").strip(),
             "description": str(item.get("description") or "").strip(),
+            "outcome_type": str(item.get("outcome_type") or "kien_thuc").strip() or "kien_thuc",
         }
         for item in (subject.get("learning_outcomes") or [])
         if item.get("_id") and item.get("is_active", True)

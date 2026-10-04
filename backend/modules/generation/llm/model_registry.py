@@ -122,7 +122,7 @@ def resolve_direct_model_snapshot(model_code: str, capability: str | None = None
             "temperature": settings.deepseek_temperature,
         }
     elif normalized == "gemini":
-        runtime, model_name, display_name = "GEMINI", settings.gemini_model_name, "Gemini 3.6 Flash"
+        runtime, model_name, display_name = "GEMINI", settings.gemini_model_name, "Gemini 2.5 Flash"
         config = {}
     elif normalized.startswith("ollama:"):
         runtime, model_name, display_name = "OLLAMA", model_code.split(":", 1)[1].strip(), "Ollama"

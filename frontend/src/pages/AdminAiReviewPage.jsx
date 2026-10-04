@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useContext, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   autoEvaluateQuestion,
@@ -6,35 +6,18 @@ import {
   listQuestionEvaluations,
   listQuestions,
 } from '../api/questions';
+import { hasEffectivePermission } from '../auth/permissions';
+import { AuthContext } from '../context/AuthContext';
 import { questionTypeLabel } from '../constants/generationEnums';
+import {
+  EVALUATION_STATUS_LABEL,
+  QUALITY_COLOR_LABEL,
+  REVIEW_STATUS_LABEL,
+  isBusyEvaluationStatus,
+} from '../constants/lifecycleStatus';
 import '../css/AdminAiReviewPage.css';
 
-const EVALUATION_STATUS_LABEL = {
-  NOT_STARTED: 'Chưa đánh giá',
-  QUEUED: 'Chờ AI đánh giá',
-  PROCESSING: 'Đang đánh giá',
-  RUNNING: 'Đang đánh giá',
-  PASSED: 'Đạt AI',
-  FAILED: 'Chưa đạt AI',
-  ERROR: 'AI lỗi',
-  STALE: 'Cần đánh giá lại',
-  INSUFFICIENT_EVIDENCE: 'Không đủ bằng chứng',
-  EVIDENCE_VALIDATION_FAILED: 'Minh chứng AI không hợp lệ',
-};
-
-const REVIEW_STATUS_LABEL = {
-  DRAFT: 'Nháp',
-  PENDING: 'Chờ duyệt',
-  APPROVED: 'Đã duyệt',
-  NEEDS_REVISION: 'Cần sửa',
-  REJECTED: 'Từ chối',
-};
-
-const COLOR_LABEL = {
-  GREEN: 'Đạt tốt',
-  YELLOW: 'Cần xem lại',
-  RED: 'Rủi ro cao',
-};
+const COLOR_LABEL = QUALITY_COLOR_LABEL;
 
 const AI_REVIEW_STATUSES = new Set(['QUEUED', 'PROCESSING', 'RUNNING', 'PASSED', 'FAILED', 'ERROR', 'STALE', 'INSUFFICIENT_EVIDENCE', 'EVIDENCE_VALIDATION_FAILED']);
 
@@ -81,7 +64,7 @@ function evaluatorModelLabel(model = {}, fallback = '') {
 }
 
 function isEvaluationBusy(question) {
-  return ['QUEUED', 'PROCESSING', 'RUNNING'].includes(question?.evaluation_status);
+  return isBusyEvaluationStatus(question?.evaluation_status);
 }
 
 function canQueueEvaluation(question) {
@@ -99,6 +82,8 @@ function questionSummary(question) {
 function AdminAiReviewPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user } = useContext(AuthContext);
+  const canOpenHumanReview = hasEffectivePermission(user, 'reviews.manage');
   const [questions, setQuestions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -426,7 +411,15 @@ function AdminAiReviewPage() {
                 <button type="button" disabled={busyId === selected.id || !canQueueEvaluation(selected)} onClick={() => runEvaluation(selected)}>
                   {['FAILED', 'ERROR', 'STALE', 'INSUFFICIENT_EVIDENCE', 'EVIDENCE_VALIDATION_FAILED'].includes(selected.evaluation_status) ? 'Thử lại AI' : 'Chạy AI'}
                 </button>
-                <button type="button" className="primary" onClick={() => navigate(`/kiem-duyet?questionId=${selected.id}`)}>Mở để kiểm duyệt</button>
+                {canOpenHumanReview ? (
+                  <button type="button" className="primary" onClick={() => navigate(`/kiem-duyet?questionId=${selected.id}`)}>
+                    Mở để kiểm duyệt
+                  </button>
+                ) : (
+                  <button type="button" className="primary" onClick={() => navigate(`/quan-ly?questionId=${selected.id}`)}>
+                    Mở trong ngân hàng
+                  </button>
+                )}
               </div>
 
               {historyLoading ? (

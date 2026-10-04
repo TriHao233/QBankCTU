@@ -116,14 +116,15 @@ NCKH/
 ## 6. Chức năng chính (theo nhóm người dùng)
 
 **Admin:**
-- Quản lý người dùng, phân quyền (Admin / Giảng viên).
-- Quản lý học phần, cấu hình tham số AI (model, prompt, RAG settings).
+- Quản lý người dùng, phân quyền (Admin / Giảng viên) — không còn role Người duyệt.
+- Quản lý học phần/CLO, cấu hình AI; giám sát tài liệu và sở hữu câu hỏi.
+- **Không** duyệt/phê duyệt câu hỏi (khớp human-in-the-loop do giảng viên).
 
 **Giảng viên:**
-- Upload tài liệu nguồn (`GeneratePage`) → kích hoạt pipeline sinh câu hỏi.
+- Upload tài liệu nguồn (`GeneratePage`) → kích hoạt pipeline sinh câu hỏi theo CLO đã chọn.
 - Chỉnh sửa câu hỏi bằng Question Editor.
-- Quản lý ngân hàng câu hỏi cá nhân/môn học (`ManagePage`).
-- Duyệt & xuất bản câu hỏi sang Moodle.
+- Quản lý ngân hàng câu hỏi cá nhân/môn học (`ManagePage`), bảng tổng kết sl/loại/CLO.
+- Duyệt (human-in-the-loop) & xuất bản câu hỏi sang Moodle.
 - Quản lý hồ sơ cá nhân (`UserProfile`).
 
 Các trang frontend hiện có khớp với các chức năng trên: `HomePage`, `LoginPage`/`RegisterPage` (auth), `GeneratePage` (sinh câu hỏi từ tài liệu), `ManagePage` (quản lý ngân hàng câu hỏi), `GuidePage`, `AboutPage`, `ContactPage`.

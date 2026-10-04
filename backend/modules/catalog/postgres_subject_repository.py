@@ -67,8 +67,12 @@ def _child(row: dict, *, chapter: bool) -> dict:
         record.update(chapter_code=row["chapter_code"], chapter_name=row["chapter_name"],
                       sequence_no=row["sequence_no"])
     else:
-        record.update(clo_code=row["clo_code"], description=row["description"],
-                      target_weight=float(row["target_weight"]))
+        record.update(
+            clo_code=row["clo_code"],
+            description=row["description"],
+            target_weight=float(row["target_weight"]),
+            outcome_type=row.get("outcome_type") or record.get("outcome_type") or "kien_thuc",
+        )
     return record
 
 
@@ -92,7 +96,7 @@ def _snapshot(record: dict, fields: tuple[str, ...]) -> dict:
 
 SUBJECT_FIELDS = ("subject_code", "subject_name", "description", "is_active")
 CHAPTER_FIELDS = ("chapter_code", "chapter_name", "sequence_no", "is_active")
-CLO_FIELDS = ("clo_code", "description", "target_weight", "is_active")
+CLO_FIELDS = ("clo_code", "description", "outcome_type", "target_weight", "is_active")
 
 
 class PostgresSubjectRepository:
@@ -227,18 +231,28 @@ class PostgresSubjectRepository:
                                     sequence_no=%s, is_active=%s, payload=%s WHERE id=%s
                             """, (*values, child_id))
                     else:
-                        values = (child["clo_code"], child["description"],
-                                  child["target_weight"], child["is_active"], Jsonb(_json(child)))
+                        outcome_type = child.get("outcome_type") or "kien_thuc"
+                        child["outcome_type"] = outcome_type
+                        values = (
+                            child["clo_code"],
+                            child["description"],
+                            child["target_weight"],
+                            child["is_active"],
+                            outcome_type,
+                            Jsonb(_json(child)),
+                        )
                         if create:
                             conn.execute("""
                                 INSERT INTO learning_outcomes
-                                (id, subject_id, clo_code, description, target_weight, is_active, payload)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                                (id, subject_id, clo_code, description, target_weight,
+                                 is_active, outcome_type, payload)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                             """, (child_id, row_id, *values))
                         else:
                             conn.execute("""
                                 UPDATE learning_outcomes SET clo_code=%s, description=%s,
-                                    target_weight=%s, is_active=%s, payload=%s WHERE id=%s
+                                    target_weight=%s, is_active=%s, outcome_type=%s,
+                                    payload=%s WHERE id=%s
                             """, (*values, child_id))
                     conn.execute("UPDATE subjects SET updated_at=%s WHERE id=%s", (_now(), row_id))
                     _audit(conn, f"catalog.{kind}_{'create' if create else 'update'}", kind,

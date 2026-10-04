@@ -1,9 +1,4 @@
-import { auth } from '../firebase';
-import { apiRequest, ApiError } from '../services/apiClient';
-
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || '/api/v1'
-).replace(/\/$/, '');
+import { apiRawRequest, apiRequest } from '../services/apiClient';
 
 export function listExams({ page = 1, pageSize = 20 } = {}) {
   const params = new URLSearchParams();
@@ -98,30 +93,11 @@ export function getVariantPreview(examId, variantId) {
   return apiRequest(`/exams/${examId}/variants/${variantId}/preview`);
 }
 
-async function downloadVariantExport(examId, variantId, format, type, fallbackMessage) {
-  if (!auth) {
-    throw new ApiError('Firebase web app chưa được cấu hình', 503, null);
-  }
-  await auth.authStateReady();
-  const firebaseUser = auth.currentUser;
-  if (!firebaseUser) {
-    throw new ApiError('Bạn chưa đăng nhập', 401, null);
-  }
-  const token = await firebaseUser.getIdToken();
+async function downloadVariantExport(examId, variantId, format, type) {
   const params = new URLSearchParams({ type });
-  const response = await fetch(
-    `${API_BASE_URL}/exams/${examId}/variants/${variantId}/export/${format}?${params.toString()}`,
-    { headers: { Authorization: `Bearer ${token}` } },
+  const response = await apiRawRequest(
+    `/exams/${examId}/variants/${variantId}/export/${format}?${params.toString()}`,
   );
-  if (!response.ok) {
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch {
-      // ignore parse errors, fall back to generic message below
-    }
-    throw new ApiError(payload?.detail || fallbackMessage, response.status, payload);
-  }
   const blob = await response.blob();
   const url = window.URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -134,9 +110,9 @@ async function downloadVariantExport(examId, variantId, format, type, fallbackMe
 }
 
 export async function downloadVariantPdf(examId, variantId, type = 'de') {
-  return downloadVariantExport(examId, variantId, 'pdf', type, 'Xuất PDF thất bại');
+  return downloadVariantExport(examId, variantId, 'pdf', type);
 }
 
 export async function downloadVariantDocx(examId, variantId, type = 'de') {
-  return downloadVariantExport(examId, variantId, 'docx', type, 'Xuất DOCX thất bại');
+  return downloadVariantExport(examId, variantId, 'docx', type);
 }

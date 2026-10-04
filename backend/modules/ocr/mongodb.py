@@ -85,12 +85,11 @@ def update_document_status(
     stats: dict | None = None,
     error_message: str | None = None,
 ):
-    normalized = {
-        "queued": "QUEUED",
-        "processing": "PROCESSING",
-        "completed": "COMPLETED",
-        "failed": "FAILED",
-    }.get(status.lower(), status.upper())
+    from core.status_enums import canonicalize_document_job_status
+
+    normalized = canonicalize_document_job_status(status)
+    if normalized not in {"QUEUED", "PROCESSING", "COMPLETED", "FAILED", "CANCELLED", "ERROR", "STALE"}:
+        normalized = str(status or "").upper()
     repository = _repository()
     repository.update_job(
         job_id,

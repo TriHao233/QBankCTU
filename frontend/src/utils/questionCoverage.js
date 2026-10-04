@@ -30,6 +30,15 @@ function questionCloIds(question) {
   return (question?.clos || []).map((clo) => refId(clo.id || clo)).filter(Boolean);
 }
 
+function questionTypeKey(question) {
+  return String(
+    question?.classification?.assessment_type
+    || question?.question_type
+    || question?.type
+    || '',
+  ).trim().toLowerCase();
+}
+
 function isApproved(question) {
   return question?.review_status === 'APPROVED';
 }
@@ -73,11 +82,13 @@ export function buildQuestionCoverage({
   questions = [],
   subject = null,
   bloomLevels = [],
+  questionTypes = [],
 } = {}) {
   const total = questions.length;
   const bloomCounts = new Map();
   const chapterCounts = new Map();
   const cloCounts = new Map();
+  const typeCounts = new Map();
   let approvedTotal = 0;
 
   questions.forEach((question) => {
@@ -85,6 +96,7 @@ export function buildQuestionCoverage({
     if (approved) approvedTotal += 1;
     increment(bloomCounts, questionBloomLevel(question), approved);
     increment(chapterCounts, questionChapterId(question), approved);
+    increment(typeCounts, questionTypeKey(question), approved);
     questionCloIds(question).forEach((cloId) => increment(cloCounts, cloId, approved));
   });
 
@@ -117,16 +129,29 @@ export function buildQuestionCoverage({
   const chapters = enrichRows(chapterItems, chapterCounts, total);
   const clos = enrichRows(cloItems, cloCounts, total, cloWeight);
 
+  const typeCatalog = (questionTypes || []).map((item) => ({
+    id: item.backend || item.id,
+    label: item.label || item.backend || item.id,
+    target_weight: 0,
+  })).filter((item) => item.id);
+  const typeFallback = catalogItems([], typeCounts, (item) => item.id || item);
+  const typeItems = typeCatalog.length
+    ? typeCatalog
+    : typeFallback;
+  const types = enrichRows(typeItems, typeCounts, total);
+
   return {
     total,
     approvedTotal,
     bloom,
     chapters,
     clos,
+    types,
     gaps: {
       bloom: bloom.filter((item) => item.count === 0).length,
       chapters: chapters.filter((item) => item.count === 0).length,
       clos: clos.filter((item) => item.count === 0).length,
+      types: types.filter((item) => item.count === 0).length,
     },
   };
 }

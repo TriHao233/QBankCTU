@@ -13,6 +13,7 @@ import {
   faEnvelope,
 } from '@fortawesome/free-solid-svg-icons';
 import { AuthContext } from '../context/AuthContext';
+import { canAccessPath } from '../auth/permissions';
 import { buildFallbackAvatar, normalizeAvatarUrl } from '../utils/avatarUrl';
 import './UserProfileMenu.css';
 
@@ -103,24 +104,26 @@ const UserProfileMenu = () => {
             Hồ sơ cá nhân
           </Link>
 
-          {user.role === 'Teacher' && (
-            <>
-              <Link to="/quan-ly-hoc-phan" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faBook} className="dropdown-icon" />
-                Quản lý học phần
-              </Link>
-              <Link to="/quan-ly-tai-lieu" className="dropdown-item dropdown-item--nested" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faFileLines} className="dropdown-icon" />
-                Quản lý tài liệu
-              </Link>
-              <Link to="/quan-ly" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faListCheck} className="dropdown-icon" />
-                Quản lý câu hỏi
-              </Link>
-            </>
+          {canAccessPath(user, '/quan-ly-hoc-phan') && (
+            <Link to="/quan-ly-hoc-phan" className="dropdown-item" onClick={() => setIsOpen(false)}>
+              <FontAwesomeIcon icon={faBook} className="dropdown-icon" />
+              Quản lý học phần
+            </Link>
+          )}
+          {canAccessPath(user, '/quan-ly-tai-lieu') && (
+            <Link to="/quan-ly-tai-lieu" className="dropdown-item dropdown-item--nested" onClick={() => setIsOpen(false)}>
+              <FontAwesomeIcon icon={faFileLines} className="dropdown-icon" />
+              Quản lý tài liệu
+            </Link>
+          )}
+          {canAccessPath(user, '/quan-ly') && user.role !== 'Admin' && (
+            <Link to="/quan-ly" className="dropdown-item" onClick={() => setIsOpen(false)}>
+              <FontAwesomeIcon icon={faListCheck} className="dropdown-icon" />
+              Quản lý câu hỏi
+            </Link>
           )}
 
-          {['Admin', 'Reviewer'].includes(user.role) && (
+          {canAccessPath(user, '/lich-cong-viec') && (
             <Link to="/lich-cong-viec" className="dropdown-item" onClick={() => setIsOpen(false)}>
               <FontAwesomeIcon icon={faCalendarCheck} className="dropdown-icon" />
               Lịch công việc

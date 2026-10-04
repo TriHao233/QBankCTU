@@ -459,7 +459,7 @@ function UsersAdminPage() {
             <option value="all">Tất cả vai trò</option>
             <option value="Admin">Quản trị viên</option>
             <option value="Teacher">Giảng viên</option>
-            <option value="Reviewer">Người duyệt</option>
+            <option value="Reviewer">Người duyệt (cũ)</option>
           </select>
         </div>
       </section>
@@ -616,7 +616,6 @@ function UsersAdminPage() {
                 })}
               >
                 <option value="Teacher">Giảng viên</option>
-                <option value="Reviewer">Người duyệt</option>
                 <option value="Admin">Quản trị viên</option>
               </select>
             </div>
@@ -741,7 +740,7 @@ function UsersAdminPage() {
                 }}
               >
                 <option value="Teacher">Giảng viên</option>
-                <option value="Reviewer">Người duyệt</option>
+                <option value="Reviewer">Người duyệt (cũ)</option>
                 <option value="Admin">Quản trị viên</option>
               </select>
             </div>
