@@ -105,3 +105,12 @@ test('effective reviewer permissions respect revokes and retain legacy fallback'
   assert.equal(hasEffectivePermission({ role: 'Reviewer' }, 'reviews.manage'), true);
   assert.equal(hasEffectivePermission(null, 'reviews.manage'), false);
 });
+
+test('revoked permissions hide routes and move the landing page', () => {
+  const teacherWithoutGenerate = { role: 'Teacher', permissions: ['questions.manage_own', 'exams.manage_own'] };
+  assert.equal(canAccessPath(teacherWithoutGenerate, '/sinh-cau-hoi'), false);
+  assert.equal(canAccessPath(teacherWithoutGenerate, '/quan-ly'), true);
+  assert.equal(landingPathForRole(teacherWithoutGenerate), '/quan-ly');
+  assert.equal(landingPathForRole({ role: 'Reviewer', permissions: [] }), '/ho-so');
+  assert.equal(landingPathForRole({ role: 'Admin', permissions: [] }), '/tong-quan');
+});

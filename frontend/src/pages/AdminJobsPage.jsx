@@ -22,6 +22,8 @@ import {
 import { useLocation } from 'react-router-dom';
 import { STATUS_OPTIONS, parseJobFilters } from '../utils/adminJobFilters';
 import '../css/AdminJobsPage.css';
+import { notify } from '../utils/notify';
+import { userOptionText, useUserOptions } from '../hooks/useUserOptions';
 
 const PAGE_SIZE = 25;
 const EXPORT_PAGE_SIZE = 100;
@@ -149,6 +151,7 @@ function AdminJobsPage() {
   const [actionKey, setActionKey] = useState('');
   const [exportKey, setExportKey] = useState('');
   const [selectedKey, setSelectedKey] = useState('');
+  const userOptions = useUserOptions();
 
   useEffect(() => {
     const filters = parseJobFilters(location.search);
@@ -274,7 +277,7 @@ function AdminJobsPage() {
       await retryAdminJob(job.kind, job.id);
       await fetchJobs();
     } catch (err) {
-      window.alert(err.message || 'Chạy lại tác vụ thất bại');
+      notify(err.message || 'Chạy lại tác vụ thất bại');
     } finally {
       setActionKey('');
     }
@@ -288,7 +291,7 @@ function AdminJobsPage() {
       await cancelAdminJob(job.kind, job.id);
       await fetchJobs();
     } catch (err) {
-      window.alert(err.message || 'Hủy tác vụ thất bại');
+      notify(err.message || 'Hủy tác vụ thất bại');
     } finally {
       setActionKey('');
     }
@@ -316,7 +319,7 @@ function AdminJobsPage() {
       const csv = rowsToCsv(JOB_EXPORT_COLUMNS, exportRows);
       downloadCsv(timestampedCsvFilename('admin-jobs'), csv);
     } catch (err) {
-      window.alert(err.message || 'Xuất CSV thất bại');
+      notify(err.message || 'Xuất CSV thất bại');
     } finally {
       setExportKey('');
     }
@@ -328,7 +331,7 @@ function AdminJobsPage() {
       const exportRows = await fetchJobsForExport();
       downloadXlsx(timestampedXlsxFilename('admin-jobs'), JOB_EXPORT_COLUMNS, exportRows, 'Admin jobs');
     } catch (err) {
-      window.alert(err.message || 'Xuất XLSX thất bại');
+      notify(err.message || 'Xuất XLSX thất bại');
     } finally {
       setExportKey('');
     }
@@ -424,12 +427,12 @@ function AdminJobsPage() {
         </div>
         <div className="toolbar-field">
           <label htmlFor="job-user">Người tạo</label>
-          <input
-            id="job-user"
-            value={userIdFilter}
-            onChange={(event) => updateUserIdFilter(event.target.value)}
-            placeholder="User ID"
-          />
+          <select id="job-user" value={userIdFilter} onChange={(event) => updateUserIdFilter(event.target.value)}>
+            <option value="">Tất cả người dùng</option>
+            {userOptions.map((option) => (
+              <option key={option.id} value={option.id}>{userOptionText(option)}</option>
+            ))}
+          </select>
         </div>
         <div className="toolbar-field">
           <label htmlFor="job-date-from">Từ ngày</label>

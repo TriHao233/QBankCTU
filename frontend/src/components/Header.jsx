@@ -6,10 +6,10 @@ import {
   faCircleInfo, faHouse, faWandMagicSparkles, faFilePen, faBookOpen,
   faEnvelope, faClipboardCheck, faChartLine, faLayerGroup, faUsers,
   faClockRotateLeft, faListCheck, faGraduationCap, faCircleQuestion,
-  faRobot, faChartColumn,
+  faRobot, faChartColumn, faFileLines, faCalendarCheck,
 } from '@fortawesome/free-solid-svg-icons';
 import { AuthContext } from '../context/AuthContext';
-import { canAccessPath, hasEffectivePermission } from '../auth/permissions';
+import { canAccessPath } from '../auth/permissions';
 import {
   getUnreadNotificationCount,
   listNotifications,
@@ -41,6 +41,8 @@ const navIcons = {
   'Moodle': faGraduationCap,
   'Câu hỏi': faCircleQuestion,
   'Thẩm định AI': faRobot,
+  'Tài liệu': faFileLines,
+  'Lịch công việc': faCalendarCheck,
 };
 
 const Header = () => {
@@ -145,44 +147,34 @@ const Header = () => {
       id: 'public',
       label: 'Chung',
       items: [
-        { path: '/gioi-thieu', label: 'Giới thiệu' },
         { path: '/trang-chu', label: 'Trang chủ' },
+        { path: '/gioi-thieu', label: 'Giới thiệu', guestOnly: true },
       ],
     },
     {
       id: 'teacher',
       label: 'Giảng viên',
       items: [
-        { path: '/sinh-cau-hoi', label: 'Sinh câu hỏi' },
-        { path: '/lam-de-thi', label: 'Làm đề thi' },
-      ],
-    },
-    {
-      id: 'support',
-      label: 'Hỗ trợ',
-      isPublic: true,
-      items: [
-        { path: '/huong-dan', label: 'Hướng dẫn' },
-        { path: '/lien-he', label: 'Liên hệ' },
+        { path: '/sinh-cau-hoi', label: 'Sinh câu hỏi', teaser: true },
+        { path: '/quan-ly', label: 'Câu hỏi' },
+        { path: '/quan-ly-tai-lieu', label: 'Tài liệu' },
+        { path: '/lam-de-thi', label: 'Làm đề thi', teaser: true },
       ],
     },
     {
       id: 'reviewer',
       label: 'Người duyệt',
       items: [
-        { path: '/kiem-duyet', label: 'Hàng kiểm duyệt', requires: 'reviews.manage' },
+        { path: '/kiem-duyet', label: 'Hàng kiểm duyệt' },
+        { path: '/lich-cong-viec', label: 'Lịch công việc' },
       ],
     },
     {
-      id: 'admin',
-      label: 'Quản trị',
+      id: 'support',
+      label: 'Hỗ trợ',
       items: [
-        { path: '/tong-quan', label: 'Tổng quan' },
-        { path: '/danh-muc', label: 'Danh mục' },
-        { path: '/quan-ly-nguoi-dung', label: 'Người dùng' },
-        { path: '/nhat-ky-he-thong', label: 'Nhật ký' },
-        { path: '/quan-ly-job', label: 'Hàng đợi' },
-        { path: '/quan-ly-moodle', label: 'Moodle' },
+        { path: '/huong-dan', label: 'Hướng dẫn' },
+        { path: '/lien-he', label: 'Liên hệ' },
       ],
     },
   ];
@@ -192,25 +184,23 @@ const Header = () => {
     items: [
       { path: '/tong-quan', label: 'Tổng quan' },
       { path: '/kiem-duyet', label: 'Kiểm duyệt' },
-      { path: '/quan-ly', label: 'Câu hỏi' },
       { path: '/duyet-ai', label: 'Thẩm định AI' },
-      { path: '/lam-de-thi', label: 'Xem đề thi' },
+      { path: '/quan-ly', label: 'Câu hỏi' },
+      { path: '/lam-de-thi', label: 'Đề thi' },
       { path: '/danh-muc', label: 'Danh mục' },
       { path: '/quan-ly-nguoi-dung', label: 'Người dùng' },
       { path: '/quan-ly-moodle', label: 'Moodle' },
     ],
   };
   const roleNavGroups = role === 'Admin' ? [adminNavGroup] : navGroups;
+  const isNavItemVisible = (item) => {
+    if (!signedIn) return item.teaser || canAccessPath(null, item.path);
+    if (item.guestOnly) return false;
+    return canAccessPath(user, item.path);
+  };
   const visibleNavGroups = roleNavGroups
-    .map((group) => ({
-      ...group,
-      items: group.items.filter((item) => (!role || canAccessPath(user, item.path)) && (!item.requires || hasEffectivePermission(user, item.requires))),
-    }))
-    .filter((group) => {
-      if (!signedIn) return ['public', 'teacher', 'support'].includes(group.id);
-      if (role === 'Admin' && group.id === 'public') return false;
-      return group.isPublic || group.id === 'public' || (signedIn && group.items.length > 0);
-    });
+    .map((group) => ({ ...group, items: group.items.filter(isNavItemVisible) }))
+    .filter((group) => group.items.length > 0);
   const showSectionLabels = signedIn && visibleNavGroups.length > 1;
 
   useEffect(() => {

@@ -1,9 +1,10 @@
 import { lazy, Suspense, useContext, useEffect } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import Layout from './components/Layout';
+import ToastHost from './components/ToastHost';
 import HomePage from './pages/HomePage';
 import { AuthContext } from './context/AuthContext';
-import { canAccessPath } from './auth/permissions';
+import { canAccessPath, landingPathForRole } from './auth/permissions';
 
 const pageImports = {
     AboutPage: () => import('./pages/AboutPage'),
@@ -74,7 +75,7 @@ function RequireAccess({ path, children }) {
     const location = useLocation();
     if (loading) return <div className="route-loading">Đang kiểm tra phiên đăng nhập...</div>;
     if (!user) return <Navigate to="/dang-nhap" replace state={{ from: `${location.pathname}${location.search}` }} />;
-    if (!canAccessPath(user, path)) return <Navigate to="/trang-chu" replace />;
+    if (!canAccessPath(user, path)) return <Navigate to={landingPathForRole(user)} replace />;
     return children;
 }
 
@@ -90,6 +91,8 @@ function App() {
     useEffect(() => preloadDevPages(), []);
 
     return (
+      <>
+      <ToastHost />
       <Suspense fallback={<div className="route-loading">Đang tải trang...</div>}>
         <Routes>
             <Route element={<Layout />}>
@@ -233,6 +236,7 @@ function App() {
             <Route path="*" element={<Navigate to="/trang-chu" replace />} />
         </Routes>
       </Suspense>
+      </>
     );
 }
 

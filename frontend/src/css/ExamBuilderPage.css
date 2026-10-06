@@ -14,7 +14,7 @@
 
 .exam-builder-page .builder-hero { padding: 32px 0 24px; background: linear-gradient(160deg, #F0F8FF 0%, #E8F4FD 55%, #F5FAFF 100%); }
 .exam-builder-page .page-hero-title { font-family: 'Fraunces', serif; font-size: 1.6rem; font-weight: 700; color: var(--navy, #003a75); margin: 10px 0 4px; }
-.exam-builder-page .page-hero-desc { font-size: 0.9rem; color: var(--text-muted, #5c6f89); }
+.exam-builder-page .page-hero-desc { font-size: 0.9rem; color: var(--text-muted, #5c6f89); margin: 0; max-width: none; }
 
 .exam-builder-page .builder-body { padding: 32px 0 96px; background: #fafcff; }
 .exam-builder-page .builder-grid { display: grid; grid-template-columns: 220px 1fr; gap: 24px; align-items: start; }
@@ -157,3 +157,5 @@
   .exam-builder-page .export-item { grid-template-columns: 1fr; }
   .exam-builder-page .export-actions { grid-template-columns: 1fr; }
 }
+
+.exam-builder-page .field-hint { display: block; margin-top: 6px; color: var(--text-muted, #5c6f89); font-size: 0.78rem; }

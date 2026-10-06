@@ -71,6 +71,19 @@
   color: #dc2626;
   background: #fff0f0;
 }
+.row-actions button.approve-action {
+  border-color: #16a34a;
+  color: #16a34a;
+}
+.row-actions button.approve-action:hover:not(:disabled) {
+  background: #e8fff0;
+}
+
+.users-page .users-summary { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.users-page .summary-tile--attention b { color: #b36500; }
+@media (max-width: 900px) {
+  .users-page .users-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 /* ─── Modals ─────────────────────────────────────────────────── */
 .users-page .btn {

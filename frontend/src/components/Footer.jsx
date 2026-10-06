@@ -7,17 +7,17 @@ import './Footer.css';
 const Footer = () => {
   const currentYear = new Date().getFullYear();
   const { user } = useContext(AuthContext);
-  const role = user?.role;
-
   // Danh sách các liên kết điều hướng nội bộ
   const footerLinks = [
-    { path: '/gioi-thieu', label: 'Giới thiệu' },
     { path: '/trang-chu', label: 'Trang chủ' },
+    { path: '/gioi-thieu', label: 'Giới thiệu' },
+    { path: '/tong-quan', label: 'Tổng quan quản trị' },
     { path: '/sinh-cau-hoi', label: 'Sinh câu hỏi' },
-    { path: '/quan-ly', label: 'Quản lý' },
+    { path: '/quan-ly', label: 'Quản lý câu hỏi' },
+    { path: '/kiem-duyet', label: 'Hàng kiểm duyệt' },
     { path: '/huong-dan', label: 'Hướng dẫn' },
     { path: '/lien-he', label: 'Liên hệ' },
-  ].filter((link) => !role ? canAccessPath(null, link.path) : canAccessPath(user, link.path));
+  ].filter((link) => canAccessPath(user || null, link.path));
 
   return (
     <footer

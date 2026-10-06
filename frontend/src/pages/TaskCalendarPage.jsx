@@ -7,6 +7,7 @@ import {
   updateCalendarTask,
 } from '../api/users';
 import { AuthContext } from '../context/AuthContext';
+import { canAccessPath, hasEffectivePermission } from '../auth/permissions';
 import '../css/TaskCalendarPage.css';
 
 const PRIORITY_LABEL = { low: 'Thấp', medium: 'Trung bình', high: 'Cao' };
@@ -218,6 +219,10 @@ function TaskCalendarPage() {
   const [modalState, setModalState] = useState(null); // null | {} | item
   const [weekAnchor, setWeekAnchor] = useState(() => new Date());
   const [monthAnchor, setMonthAnchor] = useState(() => new Date());
+  const canManageQuestions = ['questions.manage_own', 'questions.manage_all'].some((key) => hasEffectivePermission(user, key));
+  const canManageDocuments = ['documents.manage_own', 'documents.manage_all'].some((key) => hasEffectivePermission(user, key));
+  const isReviewerOnly = hasEffectivePermission(user, 'reviews.manage') && !canManageQuestions;
+  const statCount = 3 + Number(canManageQuestions) + Number(canManageDocuments);
 
   const loadCalendar = () => {
     setIsLoading(true);
@@ -250,15 +255,15 @@ function TaskCalendarPage() {
     if (item.source === 'system') {
       const query = item.related_entity_id ? `?questionId=${item.related_entity_id}` : '';
       if (item.related_entity_type === 'document') {
-        if (user?.role === 'Teacher') {
-          navigate('/quan-ly');
+        if (canAccessPath(user, '/quan-ly-tai-lieu')) {
+          navigate('/quan-ly-tai-lieu');
           return;
         }
       } else if (item.related_entity_type === 'review_queue') {
         navigate('/kiem-duyet');
         return;
       } else if (item.related_entity_type === 'question') {
-        navigate(user?.role === 'Teacher' ? `/quan-ly${query}` : `/kiem-duyet${query}`);
+        navigate(canAccessPath(user, '/kiem-duyet') ? `/kiem-duyet${query}` : `/quan-ly${query}`);
         return;
       }
     }
@@ -337,7 +342,7 @@ function TaskCalendarPage() {
       <section className="calendar-body">
         <div className="container">
           {summary && (
-            <div className="stats-row">
+            <div className="stats-row" style={{ '--calendar-stat-count': statCount }}>
               <div className={`stat-card ${statusFilter === 'todo' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter(statusFilter === 'todo' ? 'all' : 'todo')}>
                 <b>{summary.todo}</b>
                 <span>Việc cần làm</span>
@@ -346,18 +351,22 @@ function TaskCalendarPage() {
                 <b>{summary.overdue}</b>
                 <span>Việc quá hạn</span>
               </div>
-              <div className="stat-card">
-                <b>{summary.questions_need_revision}</b>
-                <span>Câu cần sửa</span>
-              </div>
+              {canManageQuestions && (
+                <div className="stat-card">
+                  <b>{summary.questions_need_revision}</b>
+                  <span>Câu cần sửa</span>
+                </div>
+              )}
               <div className="stat-card">
                 <b>{summary.questions_pending_review}</b>
-                <span>Câu chờ duyệt</span>
+                <span>{isReviewerOnly ? 'Câu được giao / đang duyệt' : 'Câu chờ duyệt'}</span>
               </div>
-              <div className="stat-card">
-                <b>{summary.documents_waiting}</b>
-                <span>Tài liệu cần xử lý</span>
-              </div>
+              {canManageDocuments && (
+                <div className="stat-card">
+                  <b>{summary.documents_waiting}</b>
+                  <span>Tài liệu cần xử lý</span>
+                </div>
+              )}
             </div>
           )}
 

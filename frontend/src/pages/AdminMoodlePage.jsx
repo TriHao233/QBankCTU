@@ -36,6 +36,13 @@ const PUBLISH_ROLES = [
   { value: 'Reviewer', label: 'Người duyệt' },
 ];
 
+const MODE_LABEL = {
+  MOCK: 'Mô phỏng',
+  REST_API: 'REST API thật',
+};
+
+const ROLE_LABEL = Object.fromEntries(PUBLISH_ROLES.map((role) => [role.value, role.label]));
+
 const STATUS_LABEL = {
   all: 'Tất cả trạng thái',
   PUBLISHED: 'Đã ghi nhận',
@@ -81,7 +88,7 @@ function formFromTarget(target = {}) {
 function AdminMoodlePage() {
   const [targets, setTargets] = useState([]);
   const [publications, setPublications] = useState([]);
-  const [publicationSummary, setPublicationSummary] = useState({ total: 0, published: 0, simulated: 0, failed: 0, pending: 0 });
+  const [publicationSummary, setPublicationSummary] = useState(null);
   const [publicationTotal, setPublicationTotal] = useState(0);
   const [form, setForm] = useState(emptyForm);
   const [selectedKey, setSelectedKey] = useState('');
@@ -114,7 +121,7 @@ function AdminMoodlePage() {
         setForm(formFromTarget(items[0]));
       }
     } catch (err) {
-      setError(err.message || 'Không tải được Moodle target');
+      setError(err.message || 'Không tải được danh sách kết nối Moodle');
     } finally {
       setLoading(false);
     }
@@ -134,8 +141,9 @@ function AdminMoodlePage() {
       setPublicationSummary(result.summary || { total: 0, published: 0, simulated: 0, failed: 0, pending: 0 });
       setPublicationTotal(result.total || 0);
     } catch (err) {
-      setError(err.message || 'Không tải được publication Moodle');
+      setError(err.message || 'Không tải được lịch sử đưa câu hỏi lên Moodle');
       setPublications([]);
+      setPublicationSummary(null);
       setPublicationTotal(0);
     } finally {
       setPublicationsLoading(false);
@@ -203,7 +211,7 @@ function AdminMoodlePage() {
       setForm(formFromTarget(saved));
       await loadTargets();
     } catch (err) {
-      setError(err.message || 'Lưu Moodle target thất bại');
+      setError(err.message || 'Lưu kết nối Moodle thất bại');
     } finally {
       setSaving(false);
     }
@@ -219,35 +227,35 @@ function AdminMoodlePage() {
       ));
       await loadTargets();
     } catch (err) {
-      setError(err.message || 'Kiểm tra Moodle target thất bại');
+      setError(err.message || 'Kiểm tra kết nối Moodle thất bại');
     } finally {
       setCheckingKey('');
     }
   };
 
   const handleDeactivate = async (target) => {
-    if (!window.confirm(`Khóa Moodle target "${target.site_name}"?`)) return;
+    if (!window.confirm(`Khóa kết nối Moodle "${target.site_name}"? Câu hỏi sẽ không được đưa lên site này nữa.`)) return;
     setSaving(true);
     setError('');
     try {
       await deactivateMoodleTarget(target.site_key);
       await loadTargets();
     } catch (err) {
-      setError(err.message || 'Khóa Moodle target thất bại');
+      setError(err.message || 'Khóa kết nối Moodle thất bại');
     } finally {
       setSaving(false);
     }
   };
 
   const handleRetryPublication = async (item) => {
-    if (!window.confirm(`Retry Moodle publication cho "${item.question_code || item.question_id}"?`)) return;
+    if (!window.confirm(`Gửi lại câu hỏi "${item.question_code || item.question_id}" lên Moodle?`)) return;
     setRetryingId(item.id);
     setError('');
     try {
       await retryMoodlePublication(item.id);
       await loadPublications();
     } catch (err) {
-      setError(err.message || 'Retry publication Moodle thất bại');
+      setError(err.message || 'Gửi lại câu hỏi lên Moodle thất bại');
     } finally {
       setRetryingId('');
     }
@@ -258,8 +266,8 @@ function AdminMoodlePage() {
       <section className="moodle-header">
         <div>
           <span>Quản trị hệ thống</span>
-          <h1>Moodle target</h1>
-          <p>Quản lý site, course, category và theo dõi publication Moodle theo mode MOCK hoặc REST API.</p>
+          <h1>Kết nối Moodle</h1>
+          <p>Cấu hình site Moodle (khóa học, danh mục câu hỏi) và theo dõi các lượt đưa câu hỏi lên Moodle, ở chế độ mô phỏng hoặc REST API thật.</p>
         </div>
         <button type="button" className="moodle-primary-button" onClick={() => { loadTargets(); loadPublications(); }} disabled={loading || publicationsLoading}>
           <FontAwesomeIcon icon={faRotateRight} />
@@ -269,19 +277,19 @@ function AdminMoodlePage() {
 
       <section className="moodle-summary">
         <button type="button" onClick={() => setPublicationStatus('all')}>
-          <b>{publicationSummary.total}</b>
-          <span>Tổng publication</span>
+          <b>{publicationSummary?.total ?? '—'}</b>
+          <span>Tổng lượt đưa lên</span>
         </button>
         <button type="button" onClick={() => setPublicationStatus('PUBLISHED')}>
-          <b>{publicationSummary.published}</b>
-          <span>{publicationSummary.simulated || 0} mô phỏng</span>
+          <b>{publicationSummary?.published ?? '—'}</b>
+          <span>Đã ghi nhận ({publicationSummary?.simulated || 0} mô phỏng)</span>
         </button>
         <button type="button" className="summary-danger" onClick={() => setPublicationStatus('FAILED')}>
-          <b>{publicationSummary.failed}</b>
-          <span>Dead-letter</span>
+          <b>{publicationSummary?.failed ?? '—'}</b>
+          <span>Lỗi cần gửi lại</span>
         </button>
         <button type="button" onClick={() => setPublicationStatus('PROCESSING')}>
-          <b>{publicationSummary.pending}</b>
+          <b>{publicationSummary?.pending ?? '—'}</b>
           <span>Đang xử lý</span>
         </button>
       </section>
@@ -292,14 +300,14 @@ function AdminMoodlePage() {
         <div className="moodle-target-panel">
           <div className="panel-heading">
             <div>
-              <h2>Targets</h2>
-              <span>{targets.length} cấu hình</span>
+              <h2>Site Moodle</h2>
+              <span>{targets.length} kết nối</span>
             </div>
-            <button type="button" onClick={newTarget}>Tạo mới</button>
+            <button type="button" onClick={newTarget}>Thêm kết nối</button>
           </div>
 
           {loading ? (
-            <p className="moodle-empty">Đang tải target...</p>
+            <p className="moodle-empty">Đang tải kết nối...</p>
           ) : (
             <div className="target-list">
               {targets.map((target) => (
@@ -318,9 +326,9 @@ function AdminMoodlePage() {
                     </span>
                   </div>
                   <div className="target-meta">
-                    <span>{target.mode}</span>
-                    <span>{target.is_active ? 'Active' : 'Locked'}</span>
-                    <span>{(target.allowed_roles?.length ? target.allowed_roles : emptyForm.allowed_roles).join(', ')}</span>
+                    <span>{MODE_LABEL[target.mode] || target.mode}</span>
+                    <span>{target.is_active ? 'Đang dùng' : 'Đã khóa'}</span>
+                    <span>{(target.allowed_roles?.length ? target.allowed_roles : emptyForm.allowed_roles).map((role) => ROLE_LABEL[role] || role).join(', ')}</span>
                     <span>{formatDateTime(target.last_check?.checked_at)}</span>
                   </div>
                   <div className="target-actions">
@@ -337,7 +345,7 @@ function AdminMoodlePage() {
                     </button>
                     <button
                       type="button"
-                      title="Khóa target"
+                      title="Khóa kết nối"
                       disabled={!target.is_active || saving}
                       onClick={(event) => {
                         event.stopPropagation();
@@ -349,7 +357,7 @@ function AdminMoodlePage() {
                   </div>
                 </article>
               ))}
-              {targets.length === 0 && <p className="moodle-empty">Chưa có Moodle target.</p>}
+              {targets.length === 0 && <p className="moodle-empty">Chưa có kết nối Moodle nào.</p>}
             </div>
           )}
         </div>
@@ -357,13 +365,13 @@ function AdminMoodlePage() {
         <form className="moodle-form-panel" onSubmit={handleSave}>
           <div className="panel-heading">
             <div>
-              <h2>{selectedTarget ? 'Cập nhật target' : 'Tạo target'}</h2>
-              <span>{selectedTarget?.last_check?.message || 'Credential thật chỉ lưu qua biến môi trường'}</span>
+              <h2>{selectedTarget ? 'Cập nhật kết nối' : 'Thêm kết nối'}</h2>
+              <span>{selectedTarget?.last_check?.message || 'Token Moodle thật chỉ được đọc từ biến môi trường của máy chủ'}</span>
             </div>
           </div>
           <div className="form-grid">
             <label>
-              Site key
+              Mã site
               <input value={form.site_key} onChange={(event) => updateForm('site_key', event.target.value)} />
             </label>
             <label>
@@ -371,37 +379,37 @@ function AdminMoodlePage() {
               <input value={form.site_name} onChange={(event) => updateForm('site_name', event.target.value)} />
             </label>
             <label>
-              Mode
+              Chế độ
               <select value={form.mode} onChange={(event) => updateForm('mode', event.target.value)}>
-                <option value="MOCK">MOCK</option>
-                <option value="REST_API">REST_API</option>
+                <option value="MOCK">{MODE_LABEL.MOCK}</option>
+                <option value="REST_API">{MODE_LABEL.REST_API}</option>
               </select>
             </label>
             <label>
-              Active
+              Trạng thái
               <select value={form.is_active ? 'true' : 'false'} onChange={(event) => updateForm('is_active', event.target.value === 'true')}>
-                <option value="true">Active</option>
-                <option value="false">Locked</option>
+                <option value="true">Đang dùng</option>
+                <option value="false">Đã khóa</option>
               </select>
             </label>
             <label className="form-span">
-              Base URL
+              Địa chỉ site (URL)
               <input value={form.base_url || ''} onChange={(event) => updateForm('base_url', event.target.value)} placeholder="https://moodle.example.edu" />
             </label>
             <label>
-              Token env var
+              Biến môi trường chứa token
               <input value={form.token_env_var || ''} onChange={(event) => updateForm('token_env_var', event.target.value)} placeholder="MOODLE_API_TOKEN" />
             </label>
             <label>
-              Course ID
+              Mã khóa học (course ID)
               <input value={form.default_course_id} onChange={(event) => updateForm('default_course_id', event.target.value)} />
             </label>
             <label>
-              Category ID
+              Mã danh mục câu hỏi (category ID)
               <input value={form.default_category_id} onChange={(event) => updateForm('default_category_id', event.target.value)} />
             </label>
             <div className="form-span role-toggle-group">
-              <span>Được publish</span>
+              <span>Vai trò được đưa câu hỏi lên</span>
               <div>
                 {PUBLISH_ROLES.map((role) => (
                   <label key={role.value}>
@@ -425,7 +433,7 @@ function AdminMoodlePage() {
             )}
             <button type="submit" disabled={saving}>
               <FontAwesomeIcon icon={faFloppyDisk} />
-              <span>{saving ? 'Đang lưu' : 'Lưu target'}</span>
+              <span>{saving ? 'Đang lưu' : 'Lưu kết nối'}</span>
             </button>
           </div>
         </form>
@@ -434,7 +442,7 @@ function AdminMoodlePage() {
       <section className="publication-panel">
         <div className="panel-heading">
           <div>
-            <h2>Publication / dead-letter</h2>
+            <h2>Lịch sử đưa câu hỏi lên Moodle</h2>
             <span>{publicationTotal} kết quả</span>
           </div>
           <div className="publication-filters">
@@ -460,14 +468,14 @@ function AdminMoodlePage() {
           <table className="publication-table">
             <thead>
               <tr>
-                <th>Question</th>
-                <th>Target</th>
+                <th>Câu hỏi</th>
+                <th>Site</th>
                 <th>Trạng thái</th>
-                <th>Ref</th>
-                <th>Export</th>
+                <th>Mã trên Moodle</th>
+                <th>Định dạng</th>
                 <th>Thời gian</th>
                 <th>Ghi chú</th>
-                <th>Retry</th>
+                <th>Gửi lại</th>
               </tr>
             </thead>
             <tbody>
@@ -475,11 +483,11 @@ function AdminMoodlePage() {
                 <tr key={item.id}>
                   <td>
                     <strong>{item.question_code || item.question_id}</strong>
-                    <small>Version {item.question_version}</small>
+                    <small>Phiên bản {item.question_version}</small>
                   </td>
                   <td>
-                    <span>{item.target?.site_name || item.target?.moodle_site_id || 'Target'}</span>
-                    <small>{item.publication_mode || item.target?.mode || 'MOCK'} · {item.target?.course_id}/{item.target?.category_id}</small>
+                    <span>{item.target?.site_name || item.target?.moodle_site_id || 'Site'}</span>
+                    <small>{MODE_LABEL[item.publication_mode || item.target?.mode || 'MOCK']} · {item.target?.course_id}/{item.target?.category_id}</small>
                   </td>
                   <td>
                     <span className={`publication-status publication-status--${publicationStatusClass(item.status)}`}>
@@ -488,7 +496,7 @@ function AdminMoodlePage() {
                   </td>
                   <td>
                     <span>{item.moodle_question_ref_id || 'Chưa có'}</span>
-                    {item.publication_mode === 'MOCK' && <small>Mock local, không phải Moodle ID thật</small>}
+                    {item.publication_mode === 'MOCK' && <small>Mã mô phỏng, không phải ID thật trên Moodle</small>}
                   </td>
                   <td>{item.export_formats?.length ? item.export_formats.join(', ') : item.export_format}</td>
                   <td>{formatDateTime(item.created_at)}</td>
@@ -498,7 +506,7 @@ function AdminMoodlePage() {
                       <button
                         type="button"
                         className="publication-retry-button"
-                        title="Retry publication lỗi"
+                        title="Gửi lại lượt bị lỗi"
                         disabled={retryingId === item.id}
                         onClick={() => handleRetryPublication(item)}
                       >
@@ -512,8 +520,8 @@ function AdminMoodlePage() {
               ))}
             </tbody>
           </table>
-          {publicationsLoading && <p className="moodle-empty">Đang tải publication...</p>}
-          {!publicationsLoading && publications.length === 0 && <p className="moodle-empty">Không có publication phù hợp.</p>}
+          {publicationsLoading && <p className="moodle-empty">Đang tải lịch sử...</p>}
+          {!publicationsLoading && publications.length === 0 && <p className="moodle-empty">Không có lượt đưa lên nào phù hợp.</p>}
         </div>
       </section>
     </main>

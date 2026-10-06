@@ -8,6 +8,7 @@ export const DEMO_LOGIN_ALIASES = {
 };
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PENDING_APPROVAL_PATTERN = /chờ quản trị viên kích hoạt/i;
 
 export function normalizeLoginEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -28,7 +29,7 @@ export function validateLoginIdentifier(value, demoLoginEnabled = false) {
   if (demoUsernameFor(identifier, demoLoginEnabled)) return '';
   if (isValidEmail(identifier)) return '';
   return demoLoginEnabled
-    ? 'Tài khoản demo chỉ hỗ trợ admin/reviewer. Nếu đăng nhập thường, vui lòng nhập email hợp lệ.'
+    ? 'Tài khoản demo chỉ hỗ trợ admin, teacher hoặc reviewer. Nếu đăng nhập thường, vui lòng nhập email hợp lệ.'
     : 'Vui lòng nhập email hợp lệ, ví dụ: example@ctu.edu.vn.';
 }
 
@@ -53,9 +54,20 @@ function readableErrorDetail(value) {
   return String(value);
 }
 
+function errorDetailText(error) {
+  return readableErrorDetail(error?.payload?.detail)
+    || readableErrorDetail(error?.payload?.message)
+    || readableErrorDetail(error?.message)
+    || '';
+}
+
+export function isPendingApprovalError(error) {
+  return PENDING_APPROVAL_PATTERN.test(errorDetailText(error));
+}
+
 export function loginErrorMessage(error, demoLoginEnabled = false) {
   if (error?.code === 'auth/not-configured') {
-    return 'Firebase web app chưa khởi tạo được với project nckh-e6817. Vui lòng rebuild frontend hoặc dùng tài khoản demo admin/reviewer.';
+    return 'Firebase web app chưa khởi tạo được với project nckh-e6817. Vui lòng rebuild frontend hoặc dùng tài khoản demo.';
   }
   if (
     error?.code === 'auth/invalid-credential'
@@ -66,15 +78,21 @@ export function loginErrorMessage(error, demoLoginEnabled = false) {
   }
   if (error?.code === 'auth/invalid-email') {
     return demoLoginEnabled
-      ? 'Email không hợp lệ. Bạn có thể nhập email đầy đủ hoặc tài khoản demo admin/reviewer.'
+      ? 'Email không hợp lệ. Bạn có thể nhập email đầy đủ hoặc tài khoản demo.'
       : 'Email không hợp lệ. Vui lòng nhập email đầy đủ, ví dụ: example@ctu.edu.vn.';
   }
   if (error?.code === 'auth/operation-not-allowed') {
-    return 'Đăng nhập email/mật khẩu chưa được bật trong Firebase project hiện tại. Hãy bật Email/Password provider trong Firebase Authentication, hoặc dùng tài khoản demo admin/reviewer.';
+    return 'Đăng nhập email/mật khẩu chưa được bật trong Firebase project hiện tại. Hãy bật Email/Password provider trong Firebase Authentication, hoặc dùng tài khoản demo.';
   }
-  const message = readableErrorDetail(error?.payload?.detail)
-    || readableErrorDetail(error?.payload?.message)
-    || readableErrorDetail(error?.message)
-    || 'Lỗi không xác định';
+  if (error?.code === 'auth/user-disabled') {
+    return 'Tài khoản đã bị khóa. Vui lòng liên hệ quản trị viên.';
+  }
+  if (error?.code === 'auth/popup-closed-by-user' || error?.code === 'auth/cancelled-popup-request') {
+    return 'Bạn đã đóng cửa sổ đăng nhập Google.';
+  }
+  const message = errorDetailText(error) || 'Lỗi không xác định';
+  if (PENDING_APPROVAL_PATTERN.test(message)) {
+    return 'Tài khoản của bạn đang chờ quản trị viên kích hoạt. Bạn sẽ đăng nhập được sau khi được duyệt.';
+  }
   return `Đăng nhập thất bại: ${message}`;
 }

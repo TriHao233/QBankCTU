@@ -21,6 +21,16 @@ import {
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import "../css/RegisterPage.css";
 import { landingPathForRole } from "../auth/permissions";
+import { isPendingApprovalError, loginErrorMessage } from "../auth/loginIdentifier";
+
+const MIN_PASSWORD_LENGTH = 8;
+
+function passwordPolicyError(password) {
+  if (password.length < MIN_PASSWORD_LENGTH || !/[A-Za-zÀ-ỹ]/.test(password) || !/[0-9]/.test(password)) {
+    return `Mật khẩu phải có ít nhất ${MIN_PASSWORD_LENGTH} ký tự, gồm cả chữ và số.`;
+  }
+  return "";
+}
 
 function DangKy() {
   const navigate = useNavigate();
@@ -29,6 +39,7 @@ function DangKy() {
   const [showPassword, setShowPassword] = useState(false);
   const [showPassword2, setShowPassword2] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState(null);
 
   const [formData, setFormData] = useState({
     fullName: "",
@@ -63,18 +74,19 @@ function DangKy() {
   // Xử lý Đăng ký/Đăng nhập bằng Google
   const handleGoogleAuth = async () => {
     setLoading(true);
+    setNotice(null);
     try {
       if (!auth || !googleProvider) {
         throw new Error("Firebase web app chưa khởi tạo được với project nckh-e6817. Vui lòng rebuild frontend và tải lại trang.");
       }
       const result = await signInWithPopup(auth, googleProvider);
       const appUser = await login(result.user);
-      navigate(landingPathForRole(appUser.role), { replace: true });
+      navigate(landingPathForRole(appUser), { replace: true });
     } catch (error) {
       if (auth) {
         await signOut(auth).catch(() => {});
       }
-      alert("Đăng nhập/Đăng ký Google thất bại: " + error.message);
+      setNotice({ type: isPendingApprovalError(error) ? "success" : "error", message: loginErrorMessage(error) });
     } finally {
       setLoading(false);
     }
@@ -83,32 +95,40 @@ function DangKy() {
   // Xử lý Đăng ký bằng Email/Password
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (formData.password !== formData.confirmPassword) {
-      alert("Mật khẩu xác nhận không khớp!");
+    const policyError = passwordPolicyError(formData.password);
+    if (policyError) {
+      setNotice({ type: "error", message: policyError });
       return;
     }
-    if (formData.password.length < 6) {
-      alert("Mật khẩu phải có ít nhất 6 ký tự theo yêu cầu hệ thống!");
+    if (formData.password !== formData.confirmPassword) {
+      setNotice({ type: "error", message: "Mật khẩu xác nhận không khớp." });
       return;
     }
 
     setLoading(true);
+    setNotice(null);
 
     try {
       await apiRequest("/auth/register", {
         method: "POST",
         body: {
-          email: formData.email,
+          email: formData.email.trim(),
           password: formData.password,
-          full_name: formData.fullName
+          full_name: formData.fullName.trim()
         },
         authRequired: false,
       });
 
-      alert("Đăng ký thành công! Đang chuyển hướng đến trang đăng nhập...");
-      navigate("/dang-nhap");
+      setFormData({ fullName: "", email: "", password: "", confirmPassword: "" });
+      setNotice({
+        type: "success",
+        message: "Đăng ký thành công. Tài khoản đang chờ quản trị viên kích hoạt; bạn sẽ đăng nhập được sau khi được duyệt.",
+      });
     } catch (error) {
-      alert("Lỗi: " + error.message);
+      setNotice({
+        type: "error",
+        message: loginErrorMessage(error).replace(/^Đăng nhập thất bại: /, "Đăng ký thất bại: "),
+      });
     } finally {
       setLoading(false);
     }
@@ -117,10 +137,10 @@ function DangKy() {
   return (
     <div className="register-page">
       <header className="topbar">
-        <Link to="/" className="topbar-brand">
+        <Link to="/trang-chu" className="topbar-brand">
           <img
-            src="https://www.ctu.edu.vn/images/upload/logo.png"
-            alt="CTU"
+            src={`${import.meta.env.BASE_URL}images/qbankctu-logo.png`}
+            alt="QBankCTU"
             className="topbar-logo"
           />
           <div>
@@ -128,7 +148,7 @@ function DangKy() {
             <span className="topbar-sub">Đại Học Cần Thơ</span>
           </div>
         </Link>
-        <Link to="/" className="topbar-back">
+        <Link to="/trang-chu" className="topbar-back">
           <FontAwesomeIcon icon={faArrowLeft} />
           Trang chủ
         </Link>
@@ -139,19 +159,19 @@ function DangKy() {
           <div className="auth-panel auth-panel--left">
             <div className="panel-content">
               <h2 className="panel-heading">
-                Bắt đầu <br />
+                Bắt đầu
                 <em>ngay hôm nay</em>
               </h2>
               <p className="panel-desc">
-                Tạo tài khoản để trải nghiệm hệ thống sinh câu hỏi AI đầu tiên
-                tích hợp thang phân loại Bloom tại Đại học Cần Thơ.
+                Tạo tài khoản giảng viên để sinh câu hỏi từ tài liệu học phần.
+                Tài khoản mới được quản trị viên kích hoạt trước khi sử dụng.
               </p>
               <ul className="panel-perks">
                 <li className="perk-item">
                   <span className="perk-icon">
                     <FontAwesomeIcon icon={faCheck} />
                   </span>
-                  Sinh câu hỏi đa dạng từ PDF, DOCX
+                  Sinh câu hỏi nháp từ PDF, DOCX bằng RAG
                 </li>
                 <li className="perk-item">
                   <span className="perk-icon">
@@ -163,13 +183,13 @@ function DangKy() {
                   <span className="perk-icon">
                     <FontAwesomeIcon icon={faCheck} />
                   </span>
-                  Đánh giá chất lượng bằng Multi-LLM
+                  Người duyệt kiểm định trước khi dùng
                 </li>
                 <li className="perk-item">
                   <span className="perk-icon">
                     <FontAwesomeIcon icon={faCheck} />
                   </span>
-                  Xuất DOCX, JSON
+                  Đồng bộ câu đã duyệt sang Moodle
                 </li>
               </ul>
             </div>
@@ -187,7 +207,15 @@ function DangKy() {
                 </p>
               </div>
 
-              {/* NÚT GOOGLE ĐÃ GẮN SỰ KIỆN */}
+              {notice && (
+                <p className={`auth-notice auth-notice--${notice.type}`} role={notice.type === "error" ? "alert" : "status"}>
+                  {notice.message}
+                  {notice.type === "success" && (
+                    <> <Link to="/dang-nhap" className="form-link">Về trang đăng nhập</Link></>
+                  )}
+                </p>
+              )}
+
               <button 
                 className="btn-google" 
                 type="button" 
@@ -215,12 +243,14 @@ function DangKy() {
 
               <form className="auth-form" onSubmit={handleSubmit}>
                 <div className="field-group">
-                  <label className="field-label">Họ và tên</label>
+                  <label className="field-label" htmlFor="register-name">Họ và tên</label>
                   <div className="field-wrap">
                     <FontAwesomeIcon icon={faUser} className="field-icon" />
                     <input
                       type="text"
+                      id="register-name"
                       name="fullName"
+                      autoComplete="name"
                       className="field-input"
                       placeholder="Nguyễn Văn A"
                       value={formData.fullName}
@@ -231,12 +261,14 @@ function DangKy() {
                 </div>
 
                 <div className="field-group">
-                  <label className="field-label">Email</label>
+                  <label className="field-label" htmlFor="register-email">Email</label>
                   <div className="field-wrap">
                     <FontAwesomeIcon icon={faEnvelope} className="field-icon" />
                     <input
                       type="email"
+                      id="register-email"
                       name="email"
+                      autoComplete="email"
                       className="field-input"
                       placeholder="example@ctu.edu.vn"
                       value={formData.email}
@@ -247,14 +279,17 @@ function DangKy() {
                 </div>
 
                 <div className="field-group">
-                  <label className="field-label">Mật khẩu</label>
+                  <label className="field-label" htmlFor="register-password">Mật khẩu</label>
                   <div className="field-wrap">
                     <FontAwesomeIcon icon={faLock} className="field-icon" />
                     <input
                       type={showPassword ? "text" : "password"}
+                      id="register-password"
                       name="password"
                       className="field-input"
-                      placeholder="Tối thiểu 6 ký tự"
+                      placeholder="Ít nhất 8 ký tự, gồm chữ và số"
+                      minLength={MIN_PASSWORD_LENGTH}
+                      autoComplete="new-password"
                       value={formData.password}
                       onChange={handleChange}
                       required
@@ -263,6 +298,7 @@ function DangKy() {
                       type="button"
                       className="field-toggle"
                       onClick={() => setShowPassword(!showPassword)}
+                      aria-label={showPassword ? "Ẩn mật khẩu" : "Hiện mật khẩu"}
                     >
                       <FontAwesomeIcon
                         icon={showPassword ? faEyeSlash : faEye}
@@ -294,14 +330,16 @@ function DangKy() {
                 </div>
 
                 <div className="field-group">
-                  <label className="field-label">Xác nhận mật khẩu</label>
+                  <label className="field-label" htmlFor="register-confirm">Xác nhận mật khẩu</label>
                   <div className="field-wrap">
                     <FontAwesomeIcon icon={faLock} className="field-icon" />
                     <input
                       type={showPassword2 ? "text" : "password"}
+                      id="register-confirm"
                       name="confirmPassword"
                       className="field-input"
                       placeholder="Nhập lại mật khẩu"
+                      autoComplete="new-password"
                       value={formData.confirmPassword}
                       onChange={handleChange}
                       required
@@ -310,6 +348,7 @@ function DangKy() {
                       type="button"
                       className="field-toggle"
                       onClick={() => setShowPassword2(!showPassword2)}
+                      aria-label={showPassword2 ? "Ẩn mật khẩu" : "Hiện mật khẩu"}
                     >
                       <FontAwesomeIcon
                         icon={showPassword2 ? faEyeSlash : faEye}

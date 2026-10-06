@@ -1,9 +1,16 @@
 import React, { useState, useContext, useEffect, useRef } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faArrowLeft, faArrowRight, faLock, faSpinner } from "@fortawesome/free-solid-svg-icons";
+import { faEnvelope, faEye, faEyeSlash } from "@fortawesome/free-regular-svg-icons";
 import "../css/LoginPage.css";
 import { AuthContext } from "../context/AuthContext";
 import {
+  browserLocalPersistence,
+  browserSessionPersistence,
   getRedirectResult,
+  sendPasswordResetEmail,
+  setPersistence,
   signInWithEmailAndPassword,
   signInWithPopup,
   signInWithRedirect,
@@ -14,6 +21,7 @@ import { apiRequest } from "../services/apiClient";
 import { landingPathForRole } from "../auth/permissions";
 import {
   demoUsernameFor,
+  isValidEmail,
   loginErrorMessage,
   normalizeLoginEmail,
   validateLoginIdentifier,
@@ -50,7 +58,7 @@ function LoginPage() {
   const [formData, setFormData] = useState({
     email: "",
     password: "",
-    remember: false,
+    remember: true,
   });
 
   const handleChange = (e) => {
@@ -67,7 +75,7 @@ function LoginPage() {
 
   useEffect(() => {
     if (!loading && user) {
-      navigate(landingPathForRole(user.role, requestedPath), { replace: true });
+      navigate(landingPathForRole(user, requestedPath), { replace: true });
     }
   }, [loading, navigate, requestedPath, user]);
 
@@ -85,7 +93,7 @@ function LoginPage() {
         if (!active || !result?.user) return;
         setIsLoading(true);
         const appUser = await login(result.user);
-        navigate(landingPathForRole(appUser.role, requestedPath), { replace: true });
+        navigate(landingPathForRole(appUser, requestedPath), { replace: true });
       })
       .catch(async (error) => {
         if (!active) return;
@@ -103,6 +111,38 @@ function LoginPage() {
     };
   }, [login, navigate, requestedPath]);
 
+  const applyPersistence = () => setPersistence(
+    auth,
+    formData.remember ? browserLocalPersistence : browserSessionPersistence,
+  );
+
+  const handleForgotPassword = async () => {
+    const email = normalizeLoginEmail(formData.email);
+    if (!isValidEmail(email)) {
+      setAuthNotice({ type: "error", message: "Nhập email tài khoản vào ô phía trên rồi bấm \"Quên mật khẩu?\" để nhận link đặt lại." });
+      return;
+    }
+    if (!auth) {
+      setAuthNotice({ type: "error", message: loginErrorMessage({ code: "auth/not-configured" }, DEMO_LOGIN_ENABLED) });
+      return;
+    }
+    setIsLoading(true);
+    try {
+      await sendPasswordResetEmail(auth, email);
+    } catch (error) {
+      if (error?.code === "auth/invalid-email") {
+        setAuthNotice({ type: "error", message: "Email không hợp lệ." });
+        return;
+      }
+    } finally {
+      setIsLoading(false);
+    }
+    setAuthNotice({
+      type: "info",
+      message: `Nếu ${email} đã đăng ký, hệ thống đã gửi link đặt lại mật khẩu. Vui lòng kiểm tra hộp thư (kể cả mục Spam).`,
+    });
+  };
+
   // Xử lý đăng nhập bằng Google
   const handleGoogleAuth = async () => {
     setIsLoading(true);
@@ -113,9 +153,10 @@ function LoginPage() {
         error.code = "auth/not-configured";
         throw error;
       }
+      await applyPersistence();
       const result = await signInWithPopup(auth, googleProvider);
       const appUser = await login(result.user);
-      navigate(landingPathForRole(appUser.role, requestedPath), { replace: true });
+      navigate(landingPathForRole(appUser, requestedPath), { replace: true });
     } catch (error) {
       if (auth) {
         await signOut(auth).catch(() => {});
@@ -169,15 +210,15 @@ function LoginPage() {
             },
             authRequired: false,
           }).then((data) => ({ user: null, appUser: data }))
-        : await signInWithEmailAndPassword(
+        : await applyPersistence().then(() => signInWithEmailAndPassword(
             auth,
             normalizeLoginEmail(formData.email),
             formData.password
-      );
+          ));
       const appUser = demoUsername
         ? await loginWithDemoSession(userCredential.appUser)
         : await login(userCredential.user);
-      navigate(landingPathForRole(appUser.role, requestedPath), { replace: true });
+      navigate(landingPathForRole(appUser, requestedPath), { replace: true });
     } catch (error) {
       if (auth) {
         await signOut(auth).catch(() => {});
@@ -193,8 +234,8 @@ function LoginPage() {
       <header className="topbar">
         <Link to="/trang-chu" className="topbar-brand">
           <img
-            src="https://www.ctu.edu.vn/images/upload/logo.png"
-            alt="Logo Đại học Cần Thơ"
+            src={`${import.meta.env.BASE_URL}images/qbankctu-logo.png`}
+            alt="QBankCTU"
             className="topbar-logo"
           />
           <div>
@@ -203,7 +244,7 @@ function LoginPage() {
           </div>
         </Link>
         <Link to="/trang-chu" className="topbar-back">
-          <i className="fa-solid fa-arrow-left"></i>
+          <FontAwesomeIcon icon={faArrowLeft} />
           Trang chủ
         </Link>
       </header>
@@ -287,7 +328,7 @@ function LoginPage() {
                     {DEMO_LOGIN_ENABLED ? "Tài khoản hoặc email" : "Email"}
                   </label>
                   <div className="field-wrap">
-                    <i className="fa-regular fa-envelope field-icon"></i>
+                    <FontAwesomeIcon icon={faEnvelope} className="field-icon" />
                     <input
                       type="text"
                       id="email"
@@ -295,7 +336,7 @@ function LoginPage() {
                       value={formData.email}
                       onChange={handleChange}
                       className="field-input"
-                      placeholder={DEMO_LOGIN_ENABLED ? "admin, reviewer hoặc example@ctu.edu.vn" : "example@ctu.edu.vn"}
+                      placeholder={DEMO_LOGIN_ENABLED ? "admin, teacher, reviewer hoặc email" : "example@ctu.edu.vn"}
                       autoComplete="username"
                     />
                   </div>
@@ -306,15 +347,17 @@ function LoginPage() {
                     <label className="field-label" htmlFor="password">
                       Mật khẩu
                     </label>
-                    <Link
-                      to="/quen-mat-khau"
-                      className="form-link form-link--small"
+                    <button
+                      type="button"
+                      className="form-link form-link--small form-link--button"
+                      onClick={handleForgotPassword}
+                      disabled={isLoading}
                     >
                       Quên mật khẩu?
-                    </Link>
+                    </button>
                   </div>
                   <div className="field-wrap">
-                    <i className="fa-solid fa-lock field-icon"></i>
+                    <FontAwesomeIcon icon={faLock} className="field-icon" />
                     <input
                       type={showPassword ? "text" : "password"}
                       id="password"
@@ -329,11 +372,9 @@ function LoginPage() {
                       type="button"
                       className="field-toggle"
                       onClick={handleTogglePassword}
-                      aria-label="Hiện mật khẩu"
+                      aria-label={showPassword ? "Ẩn mật khẩu" : "Hiện mật khẩu"}
                     >
-                      <i
-                        className={`fa-regular ${showPassword ? "fa-eye-slash" : "fa-eye"}`}
-                      ></i>
+                      <FontAwesomeIcon icon={showPassword ? faEyeSlash : faEye} />
                     </button>
                   </div>
                 </div>
@@ -359,13 +400,13 @@ function LoginPage() {
                 >
                   {isLoading ? (
                     <>
-                      <i className="fa-solid fa-spinner fa-spin"></i>
+                      <FontAwesomeIcon icon={faSpinner} spin />
                       <span>Đang xử lý…</span>
                     </>
                   ) : (
                     <>
                       <span>Đăng nhập</span>
-                      <i className="fa-solid fa-arrow-right"></i>
+                      <FontAwesomeIcon icon={faArrowRight} />
                     </>
                   )}
                 </button>

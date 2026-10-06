@@ -24,7 +24,7 @@ import {
 import { AuthContext } from '../context/AuthContext';
 import { auth } from '../firebase';
 import { getMe, updateMe, uploadMyAvatar } from '../api/users';
-import { canAccessPath } from '../auth/permissions';
+import { PERMISSION_LABELS, canAccessPath, permissionsForUser } from '../auth/permissions';
 import { buildFallbackAvatar, normalizeAvatarUrl } from '../utils/avatarUrl';
 import '../css/UserProfile.css';
 
@@ -359,24 +359,6 @@ function InfoTab({ user, onProfileUpdated }) {
         </div>
       </div>
 
-      <div className="profile-form-section">
-        <h4><FontAwesomeIcon icon={faFileLines} /> Thông tin khác</h4>
-        <div className="field-row-2">
-          <div className="field-group">
-            <label className="field-label">Trạng thái tài khoản</label>
-            <input className="field-input" value={user?.is_active ? 'Đang hoạt động' : 'Ngừng hoạt động'} disabled />
-          </div>
-          <div className="field-group">
-            <label className="field-label">Ngày tham gia</label>
-            <input
-              className="field-input"
-              value={user?.created_at ? new Date(user.created_at).toLocaleDateString('vi-VN') : '—'}
-              disabled
-            />
-          </div>
-        </div>
-      </div>
-
       <div className="profile-actions">
         <button className="btn btn--primary" type="submit" disabled={isSaving || isLoading || !isDirty}>
           <FontAwesomeIcon icon={faUpload} />
@@ -508,11 +490,18 @@ function SecurityTab() {
 
 function ProfileSidebar({ user }) {
   const quickLinks = [
+    { path: '/tong-quan', label: 'Tổng quan quản trị' },
+    { path: '/sinh-cau-hoi', label: 'Sinh câu hỏi' },
     { path: '/quan-ly', label: 'Quản lý câu hỏi' },
     { path: '/kiem-duyet', label: 'Hàng kiểm duyệt' },
+    { path: '/lich-cong-viec', label: 'Lịch công việc' },
     { path: '/huong-dan', label: 'Hướng dẫn sử dụng' },
     { path: '/lien-he', label: 'Liên hệ hỗ trợ' },
   ].filter((link) => canAccessPath(user, link.path));
+  const permissionLabels = user?.role === 'Admin'
+    ? ['Toàn quyền quản trị hệ thống']
+    : permissionsForUser(user).map((key) => PERMISSION_LABELS[key]).filter(Boolean);
+  const reviewSubjectCount = Array.isArray(user?.review_subject_ids) ? user.review_subject_ids.length : 0;
 
   const displayStatus = user?.is_active ? 'Đang hoạt động' : 'Ngừng hoạt động';
   const joinedAt = user?.created_at ? new Date(user.created_at).toLocaleDateString('vi-VN') : '—';
@@ -534,7 +523,24 @@ function ProfileSidebar({ user }) {
             <span className="info-list-label"><FontAwesomeIcon icon={faFileLines} /> Ngày tham gia</span>
             <span>{joinedAt}</span>
           </li>
+          {user?.role === 'Reviewer' && (
+            <li>
+              <span className="info-list-label"><FontAwesomeIcon icon={faBriefcase} /> Học phần phụ trách</span>
+              <span>{reviewSubjectCount > 0 ? `${reviewSubjectCount} học phần` : 'Tất cả học phần'}</span>
+            </li>
+          )}
         </ul>
+      </div>
+
+      <div className="card side-card">
+        <h3><FontAwesomeIcon icon={faShieldHalved} /> Quyền đang có</h3>
+        {permissionLabels.length > 0 ? (
+          <ul className="profile-permission-list">
+            {permissionLabels.map((label) => <li key={label}>{label}</li>)}
+          </ul>
+        ) : (
+          <p className="profile-permission-empty">Chưa được cấp quyền nào. Liên hệ quản trị viên.</p>
+        )}
       </div>
 
       <div className="card side-card">

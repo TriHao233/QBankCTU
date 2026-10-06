@@ -1,12 +1,22 @@
 /* Shared page backdrop: preserve opaque cards, forms and table surfaces. */
 body {
   background-color: #f5f9fd;
+}
+
+/* A fixed layer instead of a repeat-y body background: the artwork does not
+   tile seamlessly, and background-attachment: fixed is ignored on iOS. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
   background-image:
     linear-gradient(rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.18)),
     url('/images/body-background.png');
-  background-size: 100% 100%, 100% auto;
+  background-size: cover;
   background-position: center top;
-  background-repeat: no-repeat, repeat-y;
+  background-repeat: no-repeat;
 }
 
 .app-shell .page-main > main,
@@ -19,13 +29,11 @@ body {
   background: transparent;
 }
 
-@media (max-width: 640px) {
-  body {
-    background-size: 100% 100%, auto 1100px;
-  }
-}
-
 @media print {
+  body::before {
+    display: none;
+  }
+
   body {
     background: #ffffff;
   }

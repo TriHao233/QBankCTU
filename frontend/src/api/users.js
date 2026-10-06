@@ -14,12 +14,13 @@ export function uploadMyAvatar(file) {
   return apiRequest('/users/me/avatar', { method: 'POST', body });
 }
 
-export function listUsers({ page = 1, pageSize = 20, role, search } = {}) {
+export function listUsers({ page = 1, pageSize = 20, role, search, approvalStatus } = {}) {
   const params = new URLSearchParams();
   params.set('page', page);
   params.set('page_size', pageSize);
   if (role) params.set('role', role);
   if (search) params.set('search', search);
+  if (approvalStatus) params.set('approval_status', approvalStatus);
   return apiRequest(`/users?${params.toString()}`);
 }
 

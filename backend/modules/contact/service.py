@@ -75,8 +75,8 @@ class ContactService:
     # ---- create / list -------------------------------------------------
 
     def create_request(self, payload: ContactRequestCreate, user: CurrentUser) -> dict:
-        if user.role not in ("Teacher", "Admin"):
-            raise PermissionError("Chỉ giảng viên hoặc quản trị viên mới có thể gửi yêu cầu")
+        if user.role not in ("Teacher", "Reviewer", "Admin"):
+            raise PermissionError("Chỉ người dùng nội bộ mới có thể gửi yêu cầu")
         now = utc_now()
         record = {
             "id": str(ObjectId()),

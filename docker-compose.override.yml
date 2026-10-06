@@ -8,6 +8,7 @@ services:
       - ./backend/db/migrations/0018_contact_requests.sql:/app/db/migrations/0018_contact_requests.sql:ro
       - ./backend/db/migrations/0019_contact_categories.sql:/app/db/migrations/0019_contact_categories.sql:ro
       - ./backend/db/migrations/0020_contact_lifecycle.sql:/app/db/migrations/0020_contact_lifecycle.sql:ro
+      - ./backend/db/migrations/0021_user_approval.sql:/app/db/migrations/0021_user_approval.sql:ro
       - ./backend/modules/dictionary/dictionary.py:/app/modules/dictionary/dictionary.py:ro
       - ./backend/core/config.py:/app/core/config.py:ro
       - ./backend/core/bootstrap.py:/app/core/bootstrap.py:ro

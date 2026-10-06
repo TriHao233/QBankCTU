@@ -5,7 +5,7 @@ import {
   faArrowsRotate,
   faChevronDown,
   faClone,
-  faDownload,
+  faHourglassHalf,
   faFile,
   faFileLines,
   faFilter,
@@ -15,6 +15,7 @@ import {
   faShareNodes,
   faTrashCan,
   faUpload,
+  faWandMagicSparkles,
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
 import {
@@ -47,7 +48,7 @@ import {
 } from '../api/documents';
 import { listSubjects, saveSubject } from '../api/catalog';
 import { listTeacherOptions } from '../api/users';
-import { permissionsForUser } from '../auth/permissions';
+import { canAccessPath, permissionsForUser } from '../auth/permissions';
 import { BLOOM_LEVELS, DIFFICULTIES, QUESTION_TYPES, difficultyLabel, questionTypeLabel } from '../constants/generationEnums';
 import { AuthContext } from '../context/AuthContext';
 import {
@@ -88,6 +89,7 @@ import {
   timestampedQuestionBankFilename,
 } from '../utils/questionBankExchange';
 import '../css/ManagePage.css';
+import { notify } from '../utils/notify';
 
 const REVIEW_STATUS_LABEL = {
   DRAFT: 'Nháp',
@@ -124,8 +126,8 @@ const JOB_STATUS_LABEL = {
 
 const PIPELINE_STEP_LABEL = {
   ocr_status: 'OCR',
-  chunk_status: 'Chunk',
-  index_status: 'Index',
+  chunk_status: 'Tách đoạn',
+  index_status: 'Chỉ mục',
 };
 
 const ACTIVE_DOCUMENT_JOB_STATUSES = new Set(['QUEUED', 'PROCESSING']);
@@ -144,7 +146,7 @@ const EVALUATION_STATUS_LABEL = {
 };
 
 const PUBLICATION_STATUS_LABEL = {
-  NOT_PUBLISHED: 'Chưa ghi mô phỏng',
+  NOT_PUBLISHED: 'Chưa ghi lên Moodle',
   PUBLISHED: 'Đã ghi mô phỏng Moodle',
   STALE: 'Cần ghi mô phỏng lại',
   FAILED: 'Mô phỏng lỗi',
@@ -478,10 +480,11 @@ function ManagePage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user } = useContext(AuthContext);
-  const canEditQuestions = ['Admin', 'Teacher'].includes(user?.role);
-  const canManageDocuments = ['Admin', 'Teacher'].includes(user?.role);
-  const canReviewQuestions = ['Admin', 'Reviewer'].includes(user?.role);
   const permissions = permissionsForUser(user);
+  const canEditQuestions = permissions.includes('questions.manage_own') || permissions.includes('questions.manage_all');
+  const canManageDocuments = permissions.includes('documents.manage_own') || permissions.includes('documents.manage_all');
+  const canReviewQuestions = permissions.includes('reviews.manage');
+  const canGenerate = canAccessPath(user, '/sinh-cau-hoi');
   const canCreateSubjects = permissions.includes('catalog.subjects.manage_own');
 
   const [questions, setQuestions] = useState([]);
@@ -664,7 +667,7 @@ function ManagePage() {
   const handleSaveQuestionFilter = () => {
     const name = savedFilterName.trim();
     if (!name) {
-      alert('Vui lòng nhập tên bộ lọc.');
+      notify('Vui lòng nhập tên bộ lọc.');
       return;
     }
     const existing = savedQuestionFilters.find((item) => item.id === selectedSavedFilterId);
@@ -1000,6 +1003,7 @@ function ManagePage() {
     NEEDS_REVISION: questionStatusCounts.NEEDS_REVISION || 0,
     REJECTED: questionStatusCounts.REJECTED || 0,
   }), [questionStatusCounts]);
+  const countLabel = (key) => (questionsError ? '—' : counts[key]);
 
   const filtered = questions;
 
@@ -1018,9 +1022,10 @@ function ManagePage() {
     [createdToFilter, ''],
   ].filter(([value, fallback]) => value !== fallback).length;
 
-  const approvedForPublication = questions.filter((q) => (
-    q.review_status === 'APPROVED' && q.publication_status !== 'PUBLISHED'
-  ));
+  const showApprovedNotPublished = () => {
+    setStatusFilter('APPROVED');
+    setPublicationFilter('NOT_PUBLISHED');
+  };
 
   const subjectById = useMemo(() => {
     const items = new Map();
@@ -1163,7 +1168,7 @@ function ManagePage() {
     e.preventDefault();
     if (!editing) return;
     if (!editContent.trim()) {
-      alert('Nội dung câu hỏi không được để trống.');
+      notify('Nội dung câu hỏi không được để trống.');
       return;
     }
     const answerValidationError = validateQuestionAnswer({
@@ -1172,7 +1177,7 @@ function ManagePage() {
       correctAnswer: editCorrectAnswer,
     });
     if (answerValidationError) {
-      alert(answerValidationError);
+      notify(answerValidationError);
       return;
     }
     setSaving(true);
@@ -1195,7 +1200,7 @@ function ManagePage() {
       setEditing(null);
       await fetchQuestions(searchTerm);
     } catch (error) {
-      alert('Cập nhật câu hỏi thất bại: ' + error.message);
+      notify('Cập nhật câu hỏi thất bại: ' + error.message);
     } finally {
       setSaving(false);
     }
@@ -1210,7 +1215,7 @@ function ManagePage() {
       await deleteQuestion(item.id);
       await fetchQuestions(searchTerm);
     } catch (error) {
-      alert('Xoá câu hỏi thất bại: ' + error.message);
+      notify('Xoá câu hỏi thất bại: ' + error.message);
     } finally {
       setDeletingId(null);
     }
@@ -1223,7 +1228,7 @@ function ManagePage() {
       await fetchQuestions(searchTerm);
       setWorkflowMessage(`Đã nhân bản ${item.question_code} thành ${duplicate.question_code} ở trạng thái nháp.`);
     } catch (error) {
-      alert('Nhân bản câu hỏi thất bại: ' + error.message);
+      notify('Nhân bản câu hỏi thất bại: ' + error.message);
     } finally {
       setDuplicatingQuestionId(null);
     }
@@ -1399,7 +1404,7 @@ function ManagePage() {
 
   const handleBulkSubmit = async () => {
     if (selectedSubmittableQuestions.length === 0) {
-      alert('Không có câu hỏi đã chọn nào ở trạng thái có thể gửi duyệt.');
+      notify('Không có câu hỏi đã chọn nào ở trạng thái có thể gửi duyệt.');
       return;
     }
     if (!window.confirm(`Gửi duyệt ${selectedSubmittableQuestions.length} câu hỏi đã chọn?`)) return;
@@ -1459,7 +1464,7 @@ function ManagePage() {
   const handleBulkEdit = async (event) => {
     event.preventDefault();
     if (bulkEditDraft.applyClo && !bulkCloSubject) {
-      alert('Chỉ có thể sửa CLO hàng loạt khi các câu đã chọn thuộc cùng một môn.');
+      notify('Chỉ có thể sửa CLO hàng loạt khi các câu đã chọn thuộc cùng một môn.');
       return;
     }
     const workItems = selectedQuestions
@@ -1469,7 +1474,7 @@ function ManagePage() {
       }))
       .filter((item) => item.payload);
     if (workItems.length === 0) {
-      alert('Chọn ít nhất một trường cần cập nhật.');
+      notify('Chọn ít nhất một trường cần cập nhật.');
       return;
     }
     setBulkActionBusy('edit');
@@ -1504,7 +1509,7 @@ function ManagePage() {
 
   const handleQuestionBankExport = async () => {
     if (selectedQuestions.length === 0 && questionTotal === 0) {
-      alert('Không có câu hỏi nào để xuất.');
+      notify('Không có câu hỏi nào để xuất.');
       return;
     }
     setQuestionExchangeBusy('export');
@@ -1574,11 +1579,11 @@ function ManagePage() {
       if (parsed.errors.length > 0) {
         const preview = parsed.errors.slice(0, 6).join('\n');
         const suffix = parsed.errors.length > 6 ? `\n... và ${parsed.errors.length - 6} lỗi khác` : '';
-        alert(`Không nhập được file này:\n${preview}${suffix}`);
+        notify(`Không nhập được file này:\n${preview}${suffix}`);
         return;
       }
       if (parsed.items.length === 0) {
-        alert('File không có câu hỏi hợp lệ để nhập.');
+        notify('File không có câu hỏi hợp lệ để nhập.');
         return;
       }
       if (!window.confirm(`Tạo ${parsed.items.length} câu hỏi từ file "${file.name}"?`)) return;
@@ -1607,10 +1612,10 @@ function ManagePage() {
       await fetchQuestions(searchTerm);
       setQuestionExchangeMessage(`Đã nhập ${summary.success}/${parsed.items.length} câu hỏi từ ${file.name}.`);
       if (summary.failed > 0) {
-        alert(`Có ${summary.failed} câu hỏi nhập thất bại. Lỗi đầu tiên: ${summary.firstError}`);
+        notify(`Có ${summary.failed} câu hỏi nhập thất bại. Lỗi đầu tiên: ${summary.firstError}`);
       }
     } catch (error) {
-      alert('Nhập ngân hàng câu hỏi thất bại: ' + error.message);
+      notify('Nhập ngân hàng câu hỏi thất bại: ' + error.message);
     } finally {
       setQuestionExchangeBusy('');
     }
@@ -1618,7 +1623,7 @@ function ManagePage() {
 
   const handleSubmitForReview = async (item) => {
     if (!SUBMITTABLE_REVIEW_STATUSES.has(item.review_status)) {
-      alert('Câu hỏi này không còn ở trạng thái có thể gửi duyệt.');
+      notify('Câu hỏi này không còn ở trạng thái có thể gửi duyệt.');
       return;
     }
     setWorkflowBusyId(item.id);
@@ -1626,7 +1631,7 @@ function ManagePage() {
       await submitQuestionForReview(item.id);
       await refreshAfterWorkflow('Đã gửi duyệt và tự động đưa câu hỏi vào hàng đợi thẩm định AI.', item);
     } catch (error) {
-      alert('Gửi duyệt thất bại: ' + error.message);
+      notify('Gửi duyệt thất bại: ' + error.message);
     } finally {
       setWorkflowBusyId(null);
     }
@@ -1641,7 +1646,7 @@ function ManagePage() {
       await deleteDocument(doc.id);
       await fetchDocuments();
     } catch (error) {
-      alert('Xoá tài liệu thất bại: ' + error.message);
+      notify('Xoá tài liệu thất bại: ' + error.message);
     } finally {
       setDeletingDocId(null);
     }
@@ -1720,7 +1725,7 @@ function ManagePage() {
         return next;
       });
     } catch (error) {
-      alert('Lưu OCR page thất bại: ' + error.message);
+      notify('Lưu OCR page thất bại: ' + error.message);
     } finally {
       setSavingOcrPageKey('');
     }
@@ -1756,7 +1761,7 @@ function ManagePage() {
       await retryDocumentJob(doc.id, job.id);
       await refreshDocumentJobState(doc.id);
     } catch (error) {
-      alert('Chạy lại tác vụ OCR thất bại: ' + error.message);
+      notify('Chạy lại tác vụ OCR thất bại: ' + error.message);
     } finally {
       setDocumentJobActionKey('');
     }
@@ -1770,7 +1775,7 @@ function ManagePage() {
       await cancelDocumentJob(doc.id, job.id);
       await refreshDocumentJobState(doc.id);
     } catch (error) {
-      alert('Hủy tác vụ thất bại: ' + error.message);
+      notify('Hủy tác vụ thất bại: ' + error.message);
     } finally {
       setDocumentJobActionKey('');
     }
@@ -1784,7 +1789,7 @@ function ManagePage() {
       setExpandedDocumentId(doc.id);
       await refreshDocumentJobState(doc.id);
     } catch (error) {
-      alert('Re-index tài liệu thất bại: ' + error.message);
+      notify('Re-index tài liệu thất bại: ' + error.message);
     } finally {
       setDocumentJobActionKey('');
     }
@@ -1822,7 +1827,7 @@ function ManagePage() {
   const handleCreateQuestion = async (e) => {
     e.preventDefault();
     if (!newContent.trim()) {
-      alert('Nội dung câu hỏi không được để trống.');
+      notify('Nội dung câu hỏi không được để trống.');
       return;
     }
     const answerValidationError = validateQuestionAnswer({
@@ -1831,11 +1836,11 @@ function ManagePage() {
       correctAnswer: newCorrectAnswer,
     });
     if (answerValidationError) {
-      alert(answerValidationError);
+      notify(answerValidationError);
       return;
     }
     if (newDocumentId && !newSourceContext.trim()) {
-      alert('Câu hỏi gắn tài liệu cần có đoạn minh chứng trích nguyên văn từ tài liệu.');
+      notify('Câu hỏi gắn tài liệu cần có đoạn minh chứng trích nguyên văn từ tài liệu.');
       return;
     }
     setCreatingSaving(true);
@@ -1858,7 +1863,7 @@ function ManagePage() {
       setCreatingQuestion(false);
       await fetchQuestions(searchTerm);
     } catch (error) {
-      alert('Tạo câu hỏi thất bại: ' + error.message);
+      notify('Tạo câu hỏi thất bại: ' + error.message);
     } finally {
       setCreatingSaving(false);
     }
@@ -1879,7 +1884,7 @@ function ManagePage() {
     e.preventDefault();
     if (!editingDoc) return;
     if (!editDocTitle.trim()) {
-      alert('Tên tài liệu không được để trống.');
+      notify('Tên tài liệu không được để trống.');
       return;
     }
     setSavingDoc(true);
@@ -1891,7 +1896,7 @@ function ManagePage() {
       setEditingDoc(null);
       await fetchDocuments();
     } catch (error) {
-      alert('Cập nhật tài liệu thất bại: ' + error.message);
+      notify('Cập nhật tài liệu thất bại: ' + error.message);
     } finally {
       setSavingDoc(false);
     }
@@ -1912,7 +1917,7 @@ function ManagePage() {
       });
       await refreshAfterWorkflow('Đã đưa câu hỏi vào hàng đợi AI đánh giá. Xem kết quả trong tab Thẩm định AI.', item);
     } catch (error) {
-      alert('Kiểm tra AI thất bại: ' + error.message);
+      notify('Kiểm tra AI thất bại: ' + error.message);
     } finally {
       setWorkflowBusyId(null);
     }
@@ -1957,7 +1962,7 @@ function ManagePage() {
 
   const handlePublishMoodle = async (item) => {
     if (item.review_status !== 'APPROVED') {
-      alert('Chỉ câu hỏi đã duyệt mới được ghi mô phỏng Moodle.');
+      notify('Chỉ câu hỏi đã duyệt mới được ghi mô phỏng Moodle.');
       return;
     }
     if (!window.confirm(`Ghi mô phỏng Moodle cho ${item.question_code}?`)) {
@@ -1972,7 +1977,7 @@ function ManagePage() {
       });
       await refreshAfterWorkflow('Đã ghi mô phỏng Moodle.', item);
     } catch (error) {
-      alert('Ghi mô phỏng Moodle thất bại: ' + error.message);
+      notify('Ghi mô phỏng Moodle thất bại: ' + error.message);
     } finally {
       setWorkflowBusyId(null);
     }
@@ -2031,7 +2036,9 @@ function ManagePage() {
             <div className="page-hero-badge">Khu vực quản lý</div>
             <h1 className="page-hero-title">Quản lý ngân hàng câu hỏi</h1>
             <p className="page-hero-desc">
-              Theo dõi, chỉnh sửa và phê duyệt câu hỏi trước khi export hoặc ghi mô phỏng Moodle.
+              {canReviewQuestions
+                ? 'Theo dõi toàn bộ ngân hàng câu hỏi, chạy kiểm tra AI và ghi mô phỏng Moodle cho câu đã duyệt.'
+                : 'Theo dõi, chỉnh sửa câu hỏi của bạn và gửi đi kiểm duyệt trước khi dùng cho đề thi.'}
             </p>
           </div>
           <div className="manage-hero-actions">
@@ -2040,18 +2047,28 @@ function ManagePage() {
               className="btn btn--outline"
               onClick={() => setStatusFilter('PENDING')}
             >
-              <FontAwesomeIcon icon={faDownload} />
-              Hàng đợi duyệt
+              <FontAwesomeIcon icon={faHourglassHalf} />
+              Câu chờ duyệt
             </button>
-            <button
-              type="button"
-              className="btn btn--primary"
-              disabled={!canReviewQuestions || approvedForPublication.length === 0}
-              onClick={() => handlePublishMoodle(approvedForPublication[0])}
-            >
-              <FontAwesomeIcon icon={faArrowsRotate} />
-              Mô phỏng Moodle
-            </button>
+            {canReviewQuestions ? (
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={showApprovedNotPublished}
+              >
+                <FontAwesomeIcon icon={faArrowsRotate} />
+                Câu chờ ghi Moodle
+              </button>
+            ) : canGenerate && (
+              <button
+                type="button"
+                className="btn btn--primary"
+                onClick={() => navigate('/sinh-cau-hoi')}
+              >
+                <FontAwesomeIcon icon={faWandMagicSparkles} />
+                Sinh câu hỏi mới
+              </button>
+            )}
           </div>
         </div>
       </section>
@@ -2062,24 +2079,24 @@ function ManagePage() {
           <div className="manage-main">
             <div className="stats-row">
               <button type="button" className={`stat-card ${statusFilter === 'all' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter('all')}>
-                <b>{counts.all}</b>
+                <b>{countLabel('all')}</b>
                 <span>Tổng câu hỏi</span>
               </button>
               <button type="button" className={`stat-card ${statusFilter === 'DRAFT' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter('DRAFT')}>
-                <b>{counts.DRAFT}</b>
+                <b>{countLabel('DRAFT')}</b>
                 <span>Nháp</span>
               </button>
-              <button type="button" className={`stat-card ${statusFilter === 'APPROVED' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter('APPROVED')}>
-                <b>{counts.APPROVED}</b>
-                <span>Đã duyệt</span>
-              </button>
               <button type="button" className={`stat-card ${statusFilter === 'PENDING' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter('PENDING')}>
-                <b>{counts.PENDING}</b>
+                <b>{countLabel('PENDING')}</b>
                 <span>Chờ duyệt</span>
               </button>
               <button type="button" className={`stat-card ${statusFilter === 'NEEDS_REVISION' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter('NEEDS_REVISION')}>
-                <b>{counts.NEEDS_REVISION}</b>
+                <b>{countLabel('NEEDS_REVISION')}</b>
                 <span>Cần sửa</span>
+              </button>
+              <button type="button" className={`stat-card ${statusFilter === 'APPROVED' ? 'stat-card--active' : ''}`} onClick={() => setStatusFilter('APPROVED')}>
+                <b>{countLabel('APPROVED')}</b>
+                <span>Đã duyệt</span>
               </button>
             </div>
 
@@ -2508,10 +2525,9 @@ function ManagePage() {
                           {subjectLabelForQuestion(item) && (
                             <span className="source-tag">Môn: {subjectLabelForQuestion(item)}</span>
                           )}
-                          {submitterLabelForQuestion(item) && (
+                          {item.review_status !== 'DRAFT' && item.submitted_at && submitterLabelForQuestion(item) && (
                             <span className="source-tag">
-                              Người gửi duyệt: {submitterLabelForQuestion(item)}
-                              {item.submitted_at ? ` · ${formatDateTime(item.submitted_at)}` : ''}
+                              Người gửi duyệt: {submitterLabelForQuestion(item)} · {formatDateTime(item.submitted_at)}
                             </span>
                           )}
                           {(item.shared_scope === 'SUBJECT' || (item.shared_with_user_ids || []).length > 0) && (
@@ -2530,9 +2546,11 @@ function ManagePage() {
                           <span className={`quality-pill ${QUALITY_COLOR_CLASS[item.quality_summary?.color] || ''}`}>
                             AI: {latestEvaluationText(item)}
                           </span>
-                          <span className="publication-pill">
-                            {PUBLICATION_STATUS_LABEL[item.publication_status] || item.publication_status}
-                          </span>
+                          {item.review_status === 'APPROVED' && (
+                            <span className="publication-pill">
+                              {PUBLICATION_STATUS_LABEL[item.publication_status] || item.publication_status}
+                            </span>
+                          )}
                         </div>
                         {item.review_status === 'NEEDS_REVISION' && (
                           <div className="revision-inline-note">
@@ -2846,9 +2864,15 @@ function ManagePage() {
 	                    )}
 	                  </div>
 	                )}
-	                <button type="button" className="btn btn--outline doc-upload-btn" onClick={() => navigate('/sinh-cau-hoi')}>
-	                  + Tải tài liệu mới
-	                </button>
+	                {canGenerate ? (
+	                  <button type="button" className="btn btn--outline doc-upload-btn" onClick={() => navigate('/sinh-cau-hoi')}>
+	                    + Tải tài liệu mới
+	                  </button>
+	                ) : (
+	                  <button type="button" className="btn btn--outline doc-upload-btn" onClick={() => navigate('/quan-ly-tai-lieu')}>
+	                    Mở thư viện tài liệu
+	                  </button>
+	                )}
 	              </div>
 	            )}
 
@@ -3050,16 +3074,24 @@ function ManagePage() {
               )}
             </div>
 
-            <div className="card side-card">
-              <h3>Trạng thái mô phỏng Moodle</h3>
-              <p className="side-note">
-                Câu hỏi đã duyệt có thể được ghi mô phỏng Moodle trong môi trường demo.
-              </p>
-              <div className="moodle-status">
-                <span className="moodle-dot" />
-                Moodle demo: sẵn sàng ghi nhận
+            {canReviewQuestions && (
+              <div className="card side-card">
+                <h3>Mô phỏng Moodle</h3>
+                <p className="side-note">
+                  Chỉ câu hỏi đã duyệt mới ghi mô phỏng được. Dùng nút "Mô phỏng" trên từng câu; kết nối Moodle thật được cấu hình ở trang Moodle.
+                </p>
+                <div className="side-card-actions">
+                  <button type="button" className="btn btn--outline btn--sm" onClick={showApprovedNotPublished}>
+                    Lọc câu chưa ghi
+                  </button>
+                  {canAccessPath(user, '/quan-ly-moodle') && (
+                    <button type="button" className="btn btn--outline btn--sm" onClick={() => navigate('/quan-ly-moodle')}>
+                      Cấu hình Moodle
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
           </aside>
         </div>
       </section>

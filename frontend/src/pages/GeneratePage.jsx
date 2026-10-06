@@ -36,6 +36,7 @@ import {
   validateQuestionAnswer,
 } from '../utils/questionOptions';
 import '../css/GeneratePage.css';
+import { notify } from '../utils/notify';
 
 const PHASE_LABELS = {
   idle: 'Sẵn sàng',
@@ -691,7 +692,7 @@ function GeneratePage() {
         setSelectedPresetId('');
         setStatusDetail(`Đã xóa mẫu "${preset.name}" trên trình duyệt; server chưa xác nhận.`);
       } catch (storageError) {
-        alert(`Xóa mẫu thất bại: ${storageError.message || err.message}`);
+        notify(`Xóa mẫu thất bại: ${storageError.message || err.message}`);
       }
     }
   };
@@ -726,12 +727,12 @@ function GeneratePage() {
 
   const handleSaveDraft = async (draft) => {
     if (!draft.text.trim()) {
-      alert('Nội dung câu hỏi không được để trống.');
+      notify('Nội dung câu hỏi không được để trống.');
       return;
     }
     const draftValidationError = validateDraftBeforeSave(draft);
     if (draftValidationError) {
-      alert(draftValidationError);
+      notify(draftValidationError);
       return;
     }
 
@@ -765,7 +766,7 @@ function GeneratePage() {
       setEditingDraftId(null);
       setStatusDetail(`Đã lưu ${draft.questionCode || 'câu hỏi nháp'}`);
     } catch (err) {
-      alert(`Lưu câu hỏi thất bại: ${err.message}`);
+      notify(`Lưu câu hỏi thất bại: ${err.message}`);
     } finally {
       setSavingDraftId(null);
     }
@@ -789,7 +790,7 @@ function GeneratePage() {
       }
       setStatusDetail(`Đã bỏ ${label}`);
     } catch (err) {
-      alert(`Bỏ câu hỏi thất bại: ${err.message}`);
+      notify(`Bỏ câu hỏi thất bại: ${err.message}`);
     } finally {
       setRemovingDraftId(null);
     }
@@ -797,7 +798,7 @@ function GeneratePage() {
 
   const handleSubmitDraftForReview = async (draft) => {
     if (!canSubmitDraft(draft)) {
-      alert('Câu hỏi này không còn ở trạng thái có thể gửi duyệt.');
+      notify('Câu hỏi này không còn ở trạng thái có thể gửi duyệt.');
       return;
     }
     setSubmittingDraftId(draft.id);
@@ -824,7 +825,7 @@ function GeneratePage() {
           // Best-effort cleanup: preserve the original submission error.
         }
       }
-      alert(`Gửi duyệt thất bại: ${err.message}`);
+      notify(`Gửi duyệt thất bại: ${err.message}`);
     } finally {
       setSubmittingDraftId(null);
     }
@@ -874,7 +875,7 @@ function GeneratePage() {
         setStatusDetail(`Đã gửi ${successCount}/${targets.length} câu; ${failures.length} câu thất bại.`);
         const preview = failures.slice(0, 3).map((item) => `• ${item.label}: ${item.message}`).join('\n');
         const suffix = failures.length > 3 ? `\n... và ${failures.length - 3} câu khác` : '';
-        alert(`Có ${failures.length}/${targets.length} câu gửi duyệt thất bại:\n${preview}${suffix}`);
+        notify(`Có ${failures.length}/${targets.length} câu gửi duyệt thất bại:\n${preview}${suffix}`);
       }
     } finally {
       setSubmittingDraftId(null);
@@ -1365,8 +1366,11 @@ function GeneratePage() {
                 <span className="gen-panel-kicker">Thiết lập</span>
                 <h2 className="gen-card-title">Nguồn và ma trận</h2>
               </div>
-              <span className={`plan-total ${totalQuestions > MAX_TOTAL_QUESTIONS ? 'plan-total--error' : ''}`}>
-                {totalQuestions}/{MAX_TOTAL_QUESTIONS}
+              <span
+                className={`plan-total ${totalQuestions > MAX_TOTAL_QUESTIONS ? 'plan-total--error' : ''}`}
+                title={`Tổng số câu sẽ sinh trong lượt này (tối đa ${MAX_TOTAL_QUESTIONS} câu)`}
+              >
+                {totalQuestions}/{MAX_TOTAL_QUESTIONS} câu
               </span>
             </div>
 
@@ -1377,7 +1381,7 @@ function GeneratePage() {
                   <strong>{PHASE_LABELS[phase] || phase}</strong>
                   {statusDetail && <span>{statusDetail}</span>}
                   {activeJobId && (
-                    <span className="job-badge">Job: {shortId(activeJobId)}</span>
+                    <span className="job-badge">Mã tác vụ: {shortId(activeJobId)}</span>
                   )}
                   {phase === 'completed' && generationInfo && (
                     <span className="job-badge">

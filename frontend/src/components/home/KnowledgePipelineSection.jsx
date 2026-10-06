@@ -24,7 +24,7 @@ export const PIPELINE_STAGES = [
   {
     id: 'document',
     label: 'Tài liệu',
-    detail: 'Giáo trình, bài giảng, đề cương PDF/DOC. Bản scan đi qua OCR trước khi vào pipeline.',
+    detail: 'Giáo trình, bài giảng, đề cương PDF/DOCX. Bản scan đi qua OCR trước khi vào pipeline.',
   },
   {
     id: 'rag',
@@ -44,7 +44,7 @@ export const PIPELINE_STAGES = [
   {
     id: 'review',
     label: 'Kiểm duyệt',
-    detail: 'Giảng viên và người duyệt đối chiếu nguồn, chỉnh sửa, phê duyệt hoặc trả lại để sửa.',
+    detail: 'Người duyệt đối chiếu nguồn rồi phê duyệt, hoặc trả lại để giảng viên chỉnh sửa.',
   },
   {
     id: 'moodle',
@@ -134,7 +134,7 @@ export default function KnowledgePipelineSection() {
       <div className="container">
         <div className="pipeline-head">
           <h2 className="pipeline-heading" id="pipeline-heading">
-            Tri thức đi qua sáu chặng trước khi thành câu hỏi
+            Sáu chặng xử lý tri thức trước khi thành câu hỏi
           </h2>
           <p className="pipeline-lede">
             Không có bước nào bị bỏ qua và không có câu hỏi nào tự động vào ngân hàng.

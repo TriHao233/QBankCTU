@@ -15,7 +15,7 @@ from modules.users.repository import MongoUserRepository
 
 JSON_FIELDS = {"permissions", "permission_grants", "permission_revokes",
                "review_subject_ids", "profile", "generation_presets", "task_calendar"}
-UPDATE_FIELDS = JSON_FIELDS | {"email", "display_name", "role", "is_active"}
+UPDATE_FIELDS = JSON_FIELDS | {"email", "display_name", "role", "is_active", "approval_status"}
 TASK_DATES = {"created_at", "updated_at", "completed_at", "due_date", "createdAt", "updatedAt"}
 
 
@@ -116,7 +116,7 @@ class PostgresUserRepository:
             ).fetchone()
         return _user(row)
 
-    def sync_identity(self, claims: dict) -> dict:
+    def sync_identity(self, claims: dict, *, self_signup: bool = False) -> dict:
         firebase_uid = claims["uid"]
         email = (claims.get("email") or f"{firebase_uid}@firebase.local").lower()
         display_name = claims.get("name") or email.split("@", 1)[0]
@@ -143,23 +143,29 @@ class PostgresUserRepository:
                 row = conn.execute(
                     """INSERT INTO users (
                         id, firebase_uid, email, display_name, role, permissions, profile,
-                        generation_presets, task_calendar, is_active, created_at, updated_at
+                        generation_presets, task_calendar, is_active, approval_status,
+                        created_at, updated_at
                     ) VALUES (%s, %s, %s, %s, 'Teacher', '[]'::jsonb, %s,
-                              '[]'::jsonb, '[]'::jsonb, true, %s, %s)
+                              '[]'::jsonb, '[]'::jsonb, %s, %s, %s, %s)
                     RETURNING *""",
                     (
                         str(ObjectId()), firebase_uid, email, display_name,
-                        Jsonb({"school": "", "address": "", "avatar": avatar}), now, now,
+                        Jsonb({"school": "", "address": "", "avatar": avatar}),
+                        not self_signup, "PENDING" if self_signup else "APPROVED", now, now,
                     ),
                 ).fetchone()
         return _user(row)
 
-    def list(self, page: int, page_size: int, role: str | None, search: str | None):
+    def list(self, page: int, page_size: int, role: str | None, search: str | None,
+             approval_status: str | None = None):
         conditions = []
         params = []
         if role:
             conditions.append("role = %s")
             params.append(role)
+        if approval_status:
+            conditions.append("approval_status = %s")
+            params.append(approval_status)
         if search:
             conditions.append("(display_name ILIKE %s OR email ILIKE %s)")
             params.extend([f"%{search}%", f"%{search}%"])
@@ -196,7 +202,8 @@ class PostgresUserRepository:
                      count(*) FILTER (WHERE is_active) AS active,
                      count(*) FILTER (WHERE is_active AND role='Admin') AS admins,
                      count(*) FILTER (WHERE is_active AND role='Teacher') AS teachers,
-                     count(*) FILTER (WHERE is_active AND role='Reviewer') AS reviewers
+                     count(*) FILTER (WHERE is_active AND role='Reviewer') AS reviewers,
+                     count(*) FILTER (WHERE approval_status='PENDING') AS pending
                    FROM users"""
             ).fetchone())
 

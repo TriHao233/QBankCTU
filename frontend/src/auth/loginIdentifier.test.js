@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   demoUsernameFor,
+  isPendingApprovalError,
   isValidEmail,
   loginErrorMessage,
   normalizeLoginEmail,
@@ -48,4 +49,11 @@ test('login errors render structured API details instead of object placeholders'
     loginErrorMessage({ payload: { detail: { msg: 'PhiÃªn Ä‘Äƒng nháº­p háº¿t háº¡n' } } }, false),
     /\[object Object\]/,
   );
+});
+
+test('pending-approval 403 from the backend is detected and explained', () => {
+  const pending = { status: 403, payload: { detail: 'Tài khoản đang chờ quản trị viên kích hoạt' } };
+  assert.equal(isPendingApprovalError(pending), true);
+  assert.match(loginErrorMessage(pending), /đang chờ quản trị viên kích hoạt/);
+  assert.equal(isPendingApprovalError({ code: 'auth/wrong-password' }), false);
 });

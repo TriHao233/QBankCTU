@@ -93,8 +93,23 @@ class PublicRegisterRequest(BaseModel):
         max_length=320,
         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
     )
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=8, max_length=128)
     full_name: str = Field(..., min_length=1, max_length=120)
+
+    @field_validator("password")
+    @classmethod
+    def _validate_password_strength(cls, value: str) -> str:
+        if not any(ch.isalpha() for ch in value) or not any(ch.isdigit() for ch in value):
+            raise ValueError("Mật khẩu phải có ít nhất 8 ký tự, gồm cả chữ và số")
+        return value
+
+    @field_validator("full_name")
+    @classmethod
+    def _validate_full_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Họ và tên không được để trống")
+        return value
 
 
 class UserSelfUpdateRequest(BaseModel):
@@ -279,6 +294,7 @@ class UserResponse(BaseModel):
     review_subject_ids: list[str] = Field(default_factory=list)
     profile: UserProfile
     is_active: bool
+    approval_status: Literal["PENDING", "APPROVED"] = "APPROVED"
     created_at: datetime
     updated_at: datetime
 

@@ -20,6 +20,7 @@ import {
 import { listSubjects } from '../api/catalog';
 import { difficultyLabel, questionTypeLabel } from '../constants/generationEnums';
 import '../css/ExamBuilderPage.css';
+import { notify } from '../utils/notify';
 
 function refId(value) {
   if (!value) return '';
@@ -135,7 +136,7 @@ function ExamBuilderPage() {
       const updated = await updateExamStatus(exam.id, targetStatus);
       setExam(updated);
     } catch (err) {
-      alert('Cập nhật trạng thái đề thi thất bại: ' + err.message);
+      notify('Cập nhật trạng thái đề thi thất bại: ' + err.message);
     }
   };
 
@@ -151,7 +152,7 @@ function ExamBuilderPage() {
             ← Danh sách đề thi
           </button>
           <h1 className="page-hero-title">{exam.name}</h1>
-          <p className="page-hero-desc">{exam.exam_title}</p>
+          <p className="page-hero-desc">{[exam.exam_title, subject ? `${subject.subject_code} · ${subject.subject_name}` : ''].filter(Boolean).join(' — ')}</p>
         </div>
       </section>
 
@@ -181,7 +182,7 @@ function ExamBuilderPage() {
                 Đề thi đã {statusValue === 'ARCHIVED' ? 'lưu trữ' : 'chốt'}; thông tin, ma trận và danh sách câu hỏi đang được khóa.
               </p>
             )}
-            {step === 'info' && <InfoStep exam={exam} onSaved={setExam} readOnly={locked} />}
+            {step === 'info' && <InfoStep exam={exam} subject={subject} onSaved={setExam} readOnly={locked} />}
             {step === 'header' && <HeaderStep exam={exam} onSaved={setExam} readOnly={locked} />}
             {step === 'matrix' && <MatrixStep exam={exam} chapters={chapters} onSaved={setExam} readOnly={locked} />}
             {step === 'questions' && <QuestionsStep exam={exam} chapters={chapters} onSaved={setExam} readOnly={locked} />}
@@ -245,7 +246,7 @@ function LifecycleBar({ exam, status, onStatusChange }) {
   );
 }
 
-function InfoStep({ exam, onSaved, readOnly }) {
+function InfoStep({ exam, subject, onSaved, readOnly }) {
   const [name, setName] = useState(exam.name);
   const [examTitle, setExamTitle] = useState(exam.exam_title);
   const [questionCount, setQuestionCount] = useState(exam.question_count);
@@ -263,7 +264,7 @@ function InfoStep({ exam, onSaved, readOnly }) {
       });
       onSaved(updated);
     } catch (err) {
-      alert('Lưu thất bại: ' + err.message);
+      notify('Lưu thất bại: ' + err.message);
     } finally {
       setSaving(false);
     }
@@ -272,6 +273,11 @@ function InfoStep({ exam, onSaved, readOnly }) {
   return (
     <form onSubmit={handleSave}>
       <h3 className="step-title">Thông tin đề thi</h3>
+      <div className="field-group">
+        <label className="field-label">Học phần</label>
+        <input className="field-input" value={subject ? `${subject.subject_code} · ${subject.subject_name}` : 'Đang tải học phần...'} disabled />
+        <small className="field-hint">Học phần được chọn khi tạo đề và không đổi được, vì câu hỏi trong đề lấy từ học phần này.</small>
+      </div>
       <div className="field-group">
         <label className="field-label">Tên đề thi</label>
         <input className="field-input" value={name} onChange={(e) => setName(e.target.value)} disabled={readOnly} />
@@ -303,7 +309,7 @@ function HeaderStep({ exam, onSaved, readOnly }) {
       const updated = await updateExam(exam.id, { header });
       onSaved(updated);
     } catch (err) {
-      alert('Lưu thất bại: ' + err.message);
+      notify('Lưu thất bại: ' + err.message);
     } finally {
       setSaving(false);
     }
@@ -377,7 +383,7 @@ function MatrixStep({ exam, chapters, onSaved, readOnly }) {
     }));
     const invalidCell = normalizedCells.findIndex((cell) => cell.count <= 0);
     if (invalidCell >= 0) {
-      alert(`Dòng ${invalidCell + 1} có số câu không hợp lệ (phải ≥ 1).`);
+      notify(`Dòng ${invalidCell + 1} có số câu không hợp lệ (phải ≥ 1).`);
       return;
     }
     setSaving(true);
@@ -386,7 +392,7 @@ function MatrixStep({ exam, chapters, onSaved, readOnly }) {
       onSaved(updated);
       setAvailability(null);
     } catch (err) {
-      alert('Lưu ma trận thất bại: ' + err.message);
+      notify('Lưu ma trận thất bại: ' + err.message);
     } finally {
       setSaving(false);
     }
@@ -398,7 +404,7 @@ function MatrixStep({ exam, chapters, onSaved, readOnly }) {
       const result = await getMatrixAvailability(exam.id);
       setAvailability(result);
     } catch (err) {
-      alert('Kiểm tra thất bại: ' + err.message);
+      notify('Kiểm tra thất bại: ' + err.message);
     } finally {
       setChecking(false);
     }
@@ -534,7 +540,7 @@ function QuestionsStep({ exam, chapters, onSaved, readOnly }) {
       setPoolItems(result.items || []);
       setPoolTotal(result.total || 0);
     } catch (err) {
-      alert('Tải câu hỏi thất bại: ' + err.message);
+      notify('Tải câu hỏi thất bại: ' + err.message);
       setPoolItems([]);
       setPoolTotal(0);
     } finally {
@@ -557,9 +563,9 @@ function QuestionsStep({ exam, chapters, onSaved, readOnly }) {
     try {
       const updated = await autoGenerateQuestions(exam.id);
       onSaved(updated);
-      alert('Đã tự sinh đề theo ma trận.');
+      notify('Đã tự sinh đề theo ma trận.', 'success');
     } catch (err) {
-      alert('Tự sinh đề thất bại: ' + err.message);
+      notify('Tự sinh đề thất bại: ' + err.message);
     } finally {
       setBusy(false);
     }
@@ -578,7 +584,7 @@ function QuestionsStep({ exam, chapters, onSaved, readOnly }) {
       setSelectedIds([]);
       await loadApproved();
     } catch (err) {
-      alert('Thêm câu hỏi thất bại: ' + err.message);
+      notify('Thêm câu hỏi thất bại: ' + err.message);
     } finally {
       setBusy(false);
     }
@@ -591,7 +597,7 @@ function QuestionsStep({ exam, chapters, onSaved, readOnly }) {
       const updated = await removeQuestion(exam.id, questionId);
       onSaved(updated);
     } catch (err) {
-      alert('Xoá câu hỏi thất bại: ' + err.message);
+      notify('Xoá câu hỏi thất bại: ' + err.message);
     } finally {
       setBusy(false);
     }
@@ -710,7 +716,7 @@ function VariantsStep({ exam }) {
       const result = await listVariants(exam.id);
       setVariants(result || []);
     } catch (err) {
-      alert('Tải mã đề thất bại: ' + err.message);
+      notify('Tải mã đề thất bại: ' + err.message);
     } finally {
       setLoading(false);
     }
@@ -730,7 +736,7 @@ function VariantsStep({ exam }) {
       setExamCode('');
       await load();
     } catch (err) {
-      alert('Tạo mã đề thất bại: ' + err.message);
+      notify('Tạo mã đề thất bại: ' + err.message);
     } finally {
       setBusy(false);
     }
@@ -743,7 +749,7 @@ function VariantsStep({ exam }) {
       await deleteVariant(exam.id, variantId);
       await load();
     } catch (err) {
-      alert('Xoá mã đề thất bại: ' + err.message);
+      notify('Xoá mã đề thất bại: ' + err.message);
     } finally {
       setBusy(false);
     }
@@ -802,7 +808,7 @@ function PreviewStep({ exam }) {
     setLoading(true);
     getVariantPreview(exam.id, variantId)
       .then(setPreview)
-      .catch((err) => alert('Xem trước thất bại: ' + err.message))
+      .catch((err) => notify('Xem trước thất bại: ' + err.message))
       .finally(() => setLoading(false));
   }, [exam.id, variantId]);
 
@@ -862,7 +868,7 @@ function ExportStep({ exam }) {
         await downloadVariantPdf(exam.id, variantId, type);
       }
     } catch (err) {
-      alert(`Xuất ${format.toUpperCase()} thất bại: ${err.message}`);
+      notify(`Xuất ${format.toUpperCase()} thất bại: ${err.message}`);
     } finally {
       setBusy('');
     }

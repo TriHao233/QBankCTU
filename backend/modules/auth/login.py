@@ -11,7 +11,7 @@ from core.audit import record_audit_event
 from core.config import settings
 from core.database import get_rag_db
 from core.demo_auth import create_demo_session_token
-from core.dependencies import CurrentUser, get_current_user
+from core.dependencies import PENDING_APPROVAL_DETAIL, CurrentUser, get_current_user
 from core.firebase_auth import verify_firebase_id_token
 from modules.auth.session_repository import get_firebase_session_repository
 from modules.users.repository import serialize_user
@@ -49,8 +49,8 @@ DEMO_USERS = {
         "role": "Reviewer",
     },
     "teacher": {
-        "password": settings.demo_admin_password,
-        "email": "teacher@qbankctu.edu.vn",
+        "password": settings.demo_teacher_password,
+        "email": settings.demo_teacher_email,
         "display_name": "Teacher Demo",
         "role": "Teacher",
     },
@@ -157,6 +157,8 @@ def login_user(request: Request, body: TokenRequest):
 
     try:
         user = get_user_service().sync_from_claims(claims)
+        if user.get("approval_status") == "PENDING":
+            raise HTTPException(status_code=403, detail=PENDING_APPROVAL_DETAIL)
         if not user["is_active"]:
             raise HTTPException(status_code=403, detail="Tài khoản đã bị khóa")
         get_firebase_session_repository().upsert(claims["uid"], body.id_token)

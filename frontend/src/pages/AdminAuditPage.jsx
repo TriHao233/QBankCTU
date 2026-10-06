@@ -18,6 +18,8 @@ import {
   timestampedXlsxFilename,
 } from '../utils/csvExport';
 import '../css/AdminJobsPage.css';
+import { notify } from '../utils/notify';
+import { userOptionText, useUserOptions } from '../hooks/useUserOptions';
 
 const PAGE_SIZE = 25;
 const EXPORT_PAGE_SIZE = 100;
@@ -121,6 +123,7 @@ function AdminAuditPage() {
   const [actionFilter, setActionFilter] = useState('all');
   const [entityTypeFilter, setEntityTypeFilter] = useState('all');
   const [actorUserId, setActorUserId] = useState('');
+  const userOptions = useUserOptions();
   const [entityId, setEntityId] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
@@ -227,7 +230,7 @@ function AdminAuditPage() {
       const csv = rowsToCsv(AUDIT_EXPORT_COLUMNS, exportRows);
       downloadCsv(timestampedCsvFilename('admin-audit'), csv);
     } catch (err) {
-      window.alert(err.message || 'Xuất CSV thất bại');
+      notify(err.message || 'Xuất CSV thất bại');
     } finally {
       setExportKey('');
     }
@@ -239,7 +242,7 @@ function AdminAuditPage() {
       const exportRows = await fetchAuditForExport();
       downloadXlsx(timestampedXlsxFilename('admin-audit'), AUDIT_EXPORT_COLUMNS, exportRows, 'Admin audit');
     } catch (err) {
-      window.alert(err.message || 'Xuất XLSX thất bại');
+      notify(err.message || 'Xuất XLSX thất bại');
     } finally {
       setExportKey('');
     }
@@ -314,12 +317,17 @@ function AdminAuditPage() {
           </select>
         </div>
         <div className="toolbar-field">
-          <label htmlFor="audit-actor">ID người thực hiện</label>
-          <input id="audit-actor" value={actorUserId} onChange={(event) => updateActorUserId(event.target.value)} placeholder="User ID" />
+          <label htmlFor="audit-actor">Người thực hiện</label>
+          <select id="audit-actor" value={actorUserId} onChange={(event) => updateActorUserId(event.target.value)}>
+            <option value="">Tất cả người dùng</option>
+            {userOptions.map((option) => (
+              <option key={option.id} value={option.id}>{userOptionText(option)}</option>
+            ))}
+          </select>
         </div>
         <div className="toolbar-field">
-          <label htmlFor="audit-entity">ID đối tượng</label>
-          <input id="audit-entity" value={entityId} onChange={(event) => updateEntityId(event.target.value)} placeholder="Object ID" />
+          <label htmlFor="audit-entity">Mã đối tượng</label>
+          <input id="audit-entity" value={entityId} onChange={(event) => updateEntityId(event.target.value)} placeholder="Mã đối tượng (tùy chọn)" />
         </div>
         <div className="toolbar-field">
           <label htmlFor="audit-from">Từ ngày</label>

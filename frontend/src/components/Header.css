@@ -749,3 +749,22 @@
   .navbar--admin .nav-link { font-size: 0.8rem; }
   .navbar--admin .nav-link-icon { display: none; }
 }
+
+/* Laptop widths: the menu scrolls horizontally with a hidden scrollbar, so
+   items would be silently cut off unless the bar is compacted. */
+@media (min-width: 1281px) and (max-width: 1520px) {
+  .nav-container {
+    width: calc(100% - 48px);
+    grid-template-columns: 170px minmax(0, 1fr) auto;
+    gap: 16px;
+  }
+  .nav-brand { max-width: 170px; }
+  .nav-logo { width: 170px; height: 58px; }
+  .nav-menu { gap: 16px; }
+  .nav-section,
+  .nav-section-links { gap: 14px; }
+  .nav-link { font-size: 0.86rem; }
+  .nav-link-icon { display: none; }
+  .navbar .user-identity,
+  .navbar .user-chevron { display: none; }
+}

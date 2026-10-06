@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import datetime, timezone
 from typing import Callable, Protocol
@@ -28,6 +29,8 @@ from modules.users.schemas import (
     UserInviteRequest,
     UserSelfUpdateRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_GENERATION_PRESETS = 12
 MAX_TASK_CALENDAR_ITEMS = 500
@@ -90,7 +93,11 @@ class UserService:
             self.release_review_assignments(user_id, actor, reason)
 
     def sync_from_claims(self, claims: dict) -> dict:
-        return serialize_user(self.repository.sync_identity(claims))
+        known = self.repository.find_by_firebase_uid(claims["uid"]) is not None
+        user = self.repository.sync_identity(claims, self_signup=True)
+        if not known:
+            self._notify_admins_pending(user)
+        return serialize_user(user)
 
     def register_teacher(self, payload: PublicRegisterRequest) -> dict:
         firebase_user = self.identity.create_user(
@@ -105,7 +112,8 @@ class UserService:
                     "uid": firebase_user.uid,
                     "email": str(payload.email),
                     "name": payload.full_name,
-                }
+                },
+                self_signup=True,
             )
             self.sessions.upsert(firebase_user.uid, None)
         except Exception:
@@ -113,7 +121,30 @@ class UserService:
                 self.repository.delete_by_id(user["_id"])
             self.identity.delete_user(firebase_user.uid)
             raise
+        self._notify_admins_pending(user)
         return serialize_user(user)
+
+    def _notify_admins_pending(self, user: dict) -> None:
+        if (user.get("approval_status") or "APPROVED") != "PENDING":
+            return
+        try:
+            from modules.notifications.service import get_notification_service
+
+            admins, _total = self.repository.list(1, 100, "Admin", None)
+            get_notification_service().create_many([
+                {
+                    "recipient_user_id": admin["_id"],
+                    "type": "user.pending_approval",
+                    "title": "Tài khoản mới chờ kích hoạt",
+                    "body": f"{user.get('display_name') or user.get('email')} ({user.get('email')}) vừa đăng ký.",
+                    "link": "/quan-ly-nguoi-dung?approval=PENDING",
+                    "entity": {"user_id": str(user["_id"])},
+                }
+                for admin in admins
+                if admin.get("is_active", True)
+            ])
+        except Exception as exc:
+            logger.warning("Failed to notify admins about pending user %s: %s", user.get("email"), exc)
 
     def create_user(self, payload: UserCreateRequest) -> dict:
         overrides = permission_overrides(
@@ -272,8 +303,16 @@ class UserService:
         user = self.repository.find_by_firebase_uid(firebase_uid)
         return serialize_user(user) if user else None
 
-    def list(self, page: int, page_size: int, role: str | None, search: str | None) -> dict:
-        records, total = self.repository.list(page, page_size, role, search)
+    def list(
+        self,
+        page: int,
+        page_size: int,
+        role: str | None,
+        search: str | None,
+        approval_status: str | None = None,
+    ) -> dict:
+        filters = {"approval_status": approval_status} if approval_status else {}
+        records, total = self.repository.list(page, page_size, role, search, **filters)
         return {
             "items": [serialize_user(item) for item in records],
             "total": total,
@@ -495,6 +534,7 @@ class UserService:
         return {
             "role": user.get("role"),
             "is_active": user.get("is_active", True),
+            "approval_status": user.get("approval_status") or "APPROVED",
             "permissions": list(effective_permissions(user)),
             "review_subject_ids": [str(item) for item in user.get("review_subject_ids") or []],
         }
@@ -524,6 +564,8 @@ class UserService:
             # Đổi vai trò mà không gửi quyền thì về đúng mặc định của vai trò mới.
             fields.update(permission_overrides(next_role, desired_permissions))
             fields["permissions"] = []  # bỏ dữ liệu quyền kiểu cũ (chỉ cộng thêm)
+        if fields.get("is_active") is True and user.get("approval_status") == "PENDING":
+            fields["approval_status"] = "APPROVED"
         self._ensure_admin_floor(user, fields)
         before = self._user_audit_snapshot(user)
         # Chỉ gọi Firebase khi tên hoặc trạng thái thật sự thay đổi.

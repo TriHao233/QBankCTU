@@ -48,6 +48,7 @@ import { shouldRenewLock, renewIntervalMs } from '../utils/reviewLock';
 import { scoreToPercent, percentToScore } from '../utils/reviewPolicy';
 import { assignmentReasonLabel, reviewerFlagLabel } from '../utils/reviewAssignment';
 import '../css/ReviewQueuePage.css';
+import { notify } from '../utils/notify';
 
 const REVIEW_STATUS_LABEL = {
   all: 'Tất cả',
@@ -1001,7 +1002,7 @@ function ReviewQueuePage() {
       && !window.confirm(`Câu này đang được ${reviewerLabelForQuestion(question)} xử lý. Bạn vẫn muốn kiểm duyệt thay?`)) return;
     try { await renewExpiredReview(question); } catch (err) { setError(err.message); return; }
     if (!canReviewQuestion(question)) {
-      alert('Bạn cần nhận câu hỏi và giữ quyền xử lý còn hiệu lực trước khi kiểm duyệt.');
+      notify('Bạn cần nhận câu hỏi và giữ quyền xử lý còn hiệu lực trước khi kiểm duyệt.');
       return;
     }
     setReviewFormError('');
@@ -1131,7 +1132,7 @@ function ReviewQueuePage() {
         const fresh = await renewQuestionReview(question.id); applyRenewedQuestion(fresh);
       } else { await claimQuestionReview(question.id); await refreshAfterAction(question); }
     } catch (err) {
-      alert('Nhận câu kiểm duyệt thất bại: ' + err.message);
+      notify('Nhận câu kiểm duyệt thất bại: ' + err.message);
     } finally {
       setBusyId('');
     }
@@ -1143,7 +1144,7 @@ function ReviewQueuePage() {
       await releaseQuestionReview(question.id);
       await refreshAfterAction(question);
     } catch (err) {
-      alert('Trả câu kiểm duyệt thất bại: ' + err.message);
+      notify('Trả câu kiểm duyệt thất bại: ' + err.message);
     } finally {
       setBusyId('');
     }
@@ -1188,7 +1189,7 @@ function ReviewQueuePage() {
       });
       await refreshAfterAction(question);
     } catch (err) {
-      alert('Bỏ phân công kiểm duyệt thất bại: ' + err.message);
+      notify('Bỏ phân công kiểm duyệt thất bại: ' + err.message);
     } finally {
       setBusyId('');
     }
@@ -1238,7 +1239,7 @@ function ReviewQueuePage() {
       });
       await refreshAfterAction(question);
     } catch (err) {
-      alert('Đánh giá AI thất bại: ' + err.message);
+      notify('Đánh giá AI thất bại: ' + err.message);
     } finally {
       setBusyId('');
     }
@@ -1344,7 +1345,7 @@ function ReviewQueuePage() {
       });
       await refreshAfterAction(question);
     } catch (err) {
-      alert('Ghi mô phỏng Moodle thất bại: ' + err.message);
+      notify('Ghi mô phỏng Moodle thất bại: ' + err.message);
     } finally {
       setBusyId('');
     }
@@ -1356,7 +1357,7 @@ function ReviewQueuePage() {
       const content = await exportQuestionMoodle(question.id, format);
       downloadMoodleExport(question, format, content);
     } catch (err) {
-      alert('Tải câu hỏi Moodle thất bại: ' + err.message);
+      notify('Tải câu hỏi Moodle thất bại: ' + err.message);
     } finally {
       setBusyId('');
     }
@@ -1377,7 +1378,7 @@ function ReviewQueuePage() {
       }
       await Promise.all([fetchQuestions(), fetchDashboard()]);
     } catch (err) {
-      alert('Đánh giá hàng loạt dừng lại: ' + err.message);
+      notify('Đánh giá hàng loạt dừng lại: ' + err.message);
     } finally {
       setBulkBusy(false);
     }

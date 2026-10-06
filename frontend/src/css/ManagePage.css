@@ -51,7 +51,9 @@
   margin-bottom: 18px;
 }
 .manage-page .page-hero-title { font-family: 'Fraunces', serif; font-size: clamp(1.7rem, 3vw, 2.3rem); font-weight: 700; color: var(--navy, #003a75); margin-bottom: 12px; }
-.manage-page .page-hero-desc { font-size: 0.98rem; color: var(--text-muted, #5c6f89); max-width: 560px; line-height: 1.65; }
+.manage-page .page-hero-desc { font-size: 0.98rem; color: var(--text-muted, #5c6f89); max-width: 560px; line-height: 1.65; margin: 0; }
+.manage-page .page-hero { text-align: left; }
+.manage-page .page-hero-title { margin-left: 0; margin-right: 0; }
 .manage-page .manage-hero-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .manage-page .manage-hero-actions svg { width: 16px; height: 16px; }
 
@@ -965,8 +967,7 @@
 .manage-page .doc-upload-btn { width: 100%; }
 
 .manage-page .side-note { font-size: 0.84rem; color: var(--text-muted, #5c6f89); line-height: 1.6; margin-bottom: 16px; }
-.manage-page .moodle-status { display: flex; align-items: center; gap: 8px; font-size: 0.82rem; font-weight: 600; color: #16A34A; }
-.manage-page .moodle-dot { width: 8px; height: 8px; border-radius: 50%; background: #16A34A; flex-shrink: 0; }
+.manage-page .side-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .manage-page .workflow-card { position: sticky; top: 88px; }
 .manage-page .workflow-question-code { font-size: 0.8rem; font-weight: 800; color: var(--navy, #003a75); margin-bottom: 12px; }
 .manage-page .workflow-status-grid {

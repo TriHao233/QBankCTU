@@ -51,6 +51,7 @@ def serialize_user(user: dict) -> dict:
         "review_subject_ids": [str(item) for item in user.get("review_subject_ids") or []],
         "profile": profile,
         "is_active": user.get("is_active", True),
+        "approval_status": user.get("approval_status") or "APPROVED",
         "created_at": user["created_at"],
         "updated_at": user["updated_at"],
     }
@@ -69,9 +70,16 @@ class UserRepository(Protocol):
 
     def create(self, data: dict) -> dict: ...
 
-    def sync_identity(self, claims: dict) -> dict: ...
+    def sync_identity(self, claims: dict, *, self_signup: bool = False) -> dict: ...
 
-    def list(self, page: int, page_size: int, role: str | None, search: str | None) -> tuple[list[dict], int]: ...
+    def list(
+        self,
+        page: int,
+        page_size: int,
+        role: str | None,
+        search: str | None,
+        approval_status: str | None = None,
+    ) -> tuple[list[dict], int]: ...
 
     def update(self, user_id: str | ObjectId, fields: dict) -> dict | None: ...
 
@@ -113,7 +121,7 @@ class MongoUserRepository:
         result = self.collection.insert_one(record)
         return self.collection.find_one({"_id": result.inserted_id})
 
-    def sync_identity(self, claims: dict) -> dict:
+    def sync_identity(self, claims: dict, *, self_signup: bool = False) -> dict:
         now = utc_now()
         firebase_uid = claims["uid"]
         email = (claims.get("email") or f"{firebase_uid}@firebase.local").lower()
@@ -144,7 +152,22 @@ class MongoUserRepository:
                                 profile_overlay,
                             ]
                         },
-                        "is_active": {"$ifNull": ["$is_active", True]},
+                        "is_active": {
+                            "$ifNull": [
+                                "$is_active",
+                                {"$cond": [{"$ifNull": ["$created_at", False]}, True, not self_signup]},
+                            ]
+                        },
+                        "approval_status": {
+                            "$ifNull": [
+                                "$approval_status",
+                                {"$cond": [
+                                    {"$ifNull": ["$created_at", False]},
+                                    "APPROVED",
+                                    "PENDING" if self_signup else "APPROVED",
+                                ]},
+                            ]
+                        },
                         "created_at": {"$ifNull": ["$created_at", now]},
                         "updated_at": now,
                     }
@@ -160,10 +183,15 @@ class MongoUserRepository:
         page_size: int,
         role: str | None,
         search: str | None,
+        approval_status: str | None = None,
     ) -> tuple[list[dict], int]:
         query: dict = {}
         if role:
             query["role"] = role
+        if approval_status == "PENDING":
+            query["approval_status"] = "PENDING"
+        elif approval_status == "APPROVED":
+            query["approval_status"] = {"$ne": "PENDING"}
         if search:
             query["$or"] = [
                 {"display_name": {"$regex": search, "$options": "i"}},

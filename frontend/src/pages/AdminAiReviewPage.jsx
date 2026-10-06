@@ -57,6 +57,16 @@ function formatDate(value) {
   return date.toLocaleString('vi-VN');
 }
 
+const CLOSED_REVIEW_STATUSES = new Set(['APPROVED', 'REJECTED']);
+
+function questionTypeOf(question) {
+  return questionTypeLabel(String(question?.classification?.assessment_type || question?.question_type || '').toLowerCase());
+}
+
+function explanationOf(question) {
+  return question?.question_data?.explanation || question?.explanation || '';
+}
+
 function evaluationModeLabel(mode) {
   if (mode === 'local_llm') return 'AI cục bộ';
   if (mode === 'heuristic_fallback') return 'Đánh giá dự phòng';
@@ -213,7 +223,7 @@ function AdminAiReviewPage() {
   }, [location.search, questions, openedDeepLinkId]);
 
   const counts = useMemo(() => ({
-    active: questions.filter((item) => item.review_status !== 'APPROVED').length,
+    active: questions.filter((item) => !CLOSED_REVIEW_STATUSES.has(item.review_status)).length,
     processing: questions.filter((item) => isEvaluationBusy(item)).length,
     passed: questions.filter((item) => item.evaluation_status === 'PASSED' && item.review_status !== 'APPROVED').length,
     failed: questions.filter((item) => ['FAILED', 'ERROR', 'STALE', 'INSUFFICIENT_EVIDENCE', 'EVIDENCE_VALIDATION_FAILED'].includes(item.evaluation_status)).length,
@@ -223,7 +233,7 @@ function AdminAiReviewPage() {
   const filtered = useMemo(() => {
     const normalizedSearch = searchTerm.toLowerCase();
     return questions.filter((item) => {
-      if (statusFilter === 'active' && item.review_status === 'APPROVED') return false;
+      if (statusFilter === 'active' && CLOSED_REVIEW_STATUSES.has(item.review_status)) return false;
       if (statusFilter === 'processing' && !isEvaluationBusy(item)) return false;
       if (statusFilter === 'passed' && !(item.evaluation_status === 'PASSED' && item.review_status !== 'APPROVED')) return false;
       if (statusFilter === 'failed' && !['FAILED', 'ERROR', 'STALE', 'INSUFFICIENT_EVIDENCE', 'EVIDENCE_VALIDATION_FAILED'].includes(item.evaluation_status)) return false;
@@ -232,7 +242,7 @@ function AdminAiReviewPage() {
       return [
         item.question_code,
         item.content,
-        item.explanation,
+        explanationOf(item),
       ].filter(Boolean).some((value) => String(value).toLowerCase().includes(normalizedSearch));
     });
   }, [questions, searchTerm, statusFilter]);
@@ -388,11 +398,10 @@ function AdminAiReviewPage() {
                 >
                   <div>
                     <strong>{question.question_code}</strong>
-                    <span>{questionTypeLabel(question.question_type)} · Version {question.current_version}</span>
+                    <span>{[questionTypeOf(question), `Phiên bản ${question.current_version}`].filter(Boolean).join(' · ')}</span>
                   </div>
                   <p>{question.content}</p>
                   <div className="ai-review-row__meta">
-                    <span>{evaluationStatusLabel(question.evaluation_status)}</span>
                     <span>{reviewStatusLabel(question.review_status)}</span>
                     <b className={`quality-${question.quality_summary?.color || 'NONE'}`}>{questionSummary(question)}</b>
                   </div>
@@ -410,7 +419,7 @@ function AdminAiReviewPage() {
               <div className="ai-review-detail-head">
                 <div>
                   <span>{selected.question_code}</span>
-                  <h2>{questionTypeLabel(selected.question_type)}</h2>
+                  <h2>{questionTypeOf(selected)}</h2>
                 </div>
                 <button type="button" className="btn btn--outline" onClick={() => navigate(`/quan-ly?questionId=${selected.id}`)}>
                   Mở bên Câu hỏi
@@ -419,7 +428,7 @@ function AdminAiReviewPage() {
 
               <div className="ai-review-question">
                 <p>{selected.content}</p>
-                {selected.explanation && <small>{selected.explanation}</small>}
+                {explanationOf(selected) && <small>{explanationOf(selected)}</small>}
               </div>
 
               <div className="ai-review-detail-actions">

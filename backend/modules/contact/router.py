@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from core.config import settings
 from core.dependencies import (
     CurrentUser,
-    require_teacher_or_admin,
+    require_authenticated,
 )
 from modules.contact.schemas import (
     ContactMessageCreate,
@@ -41,7 +41,7 @@ def _translate(exc: Exception):
 )
 def create_request(
     payload: ContactRequestCreate,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -58,7 +58,7 @@ def list_requests(
     category: str | None = Query(None),
     search: str | None = Query(None),
     scope: str = Query("mine", pattern="^(mine|all|deleted)$"),
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     all_tickets = scope == "all" or (scope == "deleted" and current_user.role == "Admin")
@@ -77,7 +77,7 @@ def list_requests(
 @router.get("/requests/{request_id}", response_model=ContactRequestDetail)
 def get_request(
     request_id: str,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -90,7 +90,7 @@ def get_request(
 def edit_request(
     request_id: str,
     payload: ContactRequestUpdate,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -102,7 +102,7 @@ def edit_request(
 @router.post("/requests/{request_id}/withdraw", response_model=ContactRequestResponse)
 def withdraw_request(
     request_id: str,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -114,7 +114,7 @@ def withdraw_request(
 @router.delete("/requests/{request_id}", response_model=ContactRequestResponse)
 def delete_request(
     request_id: str,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -126,7 +126,7 @@ def delete_request(
 @router.post("/requests/{request_id}/restore", response_model=ContactRequestResponse)
 def restore_request(
     request_id: str,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -143,7 +143,7 @@ def restore_request(
 def add_message(
     request_id: str,
     payload: ContactMessageCreate,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -156,7 +156,7 @@ def add_message(
 def respond_to_request(
     request_id: str,
     payload: ContactResponseSubmit,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:
@@ -172,7 +172,7 @@ def respond_to_request(
 def update_status(
     request_id: str,
     payload: ContactStatusUpdate,
-    current_user: CurrentUser = Depends(require_teacher_or_admin),
+    current_user: CurrentUser = Depends(require_authenticated),
     service: ContactService = Depends(get_contact_service),
 ):
     try:

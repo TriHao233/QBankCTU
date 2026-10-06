@@ -18,6 +18,9 @@ import {
   withdrawContactRequest,
 } from '../api/contact';
 
+const CONTACT_EMAIL = 'haob2203553@student.ctu.edu.vn';
+const SENDER_ROLE_LABEL = { Admin: 'Quản trị', Teacher: 'Giảng viên', Reviewer: 'Người duyệt' };
+
 const PAGE_SIZE = 10;
 
 function StatusBadge({ status }) {
@@ -333,7 +336,7 @@ function TicketDetail({ ticketId, currentUser, onBack, onChanged, onDeleted, onR
           >
             <div className="msg-bubble__author">
               {m.sender_name || 'Người dùng'}
-              <span className="msg-bubble__role">{m.sender_role === 'Admin' ? 'Quản trị' : 'Giảng viên'}</span>
+              <span className="msg-bubble__role">{SENDER_ROLE_LABEL[m.sender_role] || 'Người dùng'}</span>
             </div>
             <div className="msg-bubble__body-wrap">
               <div className="msg-bubble__body">{m.message}</div>
@@ -580,10 +583,10 @@ function PublicContactInfo({ teacherView = false }) {
     <div className="info-card" key="project-lead">
       <span className="info-label">Chủ nhiệm đề tài</span>
       <h3>Trương Trí Hào</h3>
-      <p className="info-card__sub">B2203561 · Lớp DI2296F1</p>
+      <p className="info-card__sub">B2203553 · Lớp DI2296F1</p>
       <p className="info-card__detail">Kỹ Thuật Phần Mềm (CT. CLC) · Khoá 48</p>
       <ul className="info-list">
-        <li><IconEmail /><span>haob2203553@student.ctu.edu.vn</span></li>
+        <li><IconEmail /><a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a></li>
         <li><IconPhone /><span>0399 348 365</span></li>
       </ul>
     </div>
@@ -595,7 +598,6 @@ function PublicContactInfo({ teacherView = false }) {
 
       <div className="supervisor-entry">
         <h3>TS. Phan Phương Lan</h3>
-        <p className="info-card__sub">MSCB: 1232</p>
         <p className="info-card__detail">Tiến sĩ, GVCC Khoa Công Nghệ Phần Mềm, Trường Công Nghệ Thông Tin &amp; Truyền Thông, Đại học Cần Thơ</p>
       </div>
 
@@ -622,8 +624,8 @@ function PublicContactInfo({ teacherView = false }) {
           <li className="info-list__item-stack">
             <IconEmail />
             <span>
-              <small className="info-list__label">Email tiếp nhận Liên hệ</small>
-              <span>vnglinh23@gmail.com <em className="info-list__note">· Lập trình viên phát triển chức năng</em></span>
+              <small className="info-list__label">Email tiếp nhận liên hệ</small>
+              <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>
             </span>
           </li>
         </ul>
@@ -716,7 +718,7 @@ function AdminContactSidebar() {
       <strong><span>Trường Công Nghệ Thông Tin</span><span>&amp; Truyền Thông</span></strong>
       <p>Đại học Cần Thơ</p>
       <div className="admin-contact-sidecard__line"><IconPin /><span>Khu II, Đường 3/2, phường Xuân Khánh, quận Ninh Kiều, TP Cần Thơ</span></div>
-      <div className="admin-contact-sidecard__line admin-contact-sidecard__line--email"><IconEmail /><span><a href="mailto:vnglinh23@gmail.com">vnglinh23@gmail.com</a><small>Email tiếp nhận liên hệ</small></span></div>
+      <div className="admin-contact-sidecard__line admin-contact-sidecard__line--email"><IconEmail /><span><a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a><small>Email tiếp nhận liên hệ</small></span></div>
     </section>
     <section className="admin-contact-sidecard">
       <h2><span className="admin-contact-sidecard__icon" aria-hidden="true">?</span>Quy trình xử lý</h2>
@@ -736,8 +738,8 @@ function ContactPage() {
   const openTicketId = searchParams.get('ticket');
   const initialTab = searchParams.get('tab');
   const isAdmin = !authLoading && user?.role === 'Admin';
-  const isTeacher = !authLoading && user?.role === 'Teacher';
-  const canUseTickets = isAdmin || isTeacher;
+  const isMember = !authLoading && ['Teacher', 'Reviewer'].includes(user?.role);
+  const canUseTickets = isAdmin || isMember;
 
   const [tab, setTab] = useState(isAdmin ? 'all' : 'mine');
   const [reloadKey, setReloadKey] = useState(0);
@@ -792,17 +794,17 @@ function ContactPage() {
   }, [canUseTickets, isAdmin]);
 
   return (
-    <main className={`contact-page ${isAdmin ? 'contact-page--admin' : ''} ${isTeacher ? 'contact-page--teacher' : ''}`}>
+    <main className={`contact-page ${isAdmin ? 'contact-page--admin' : ''} ${isMember ? 'contact-page--teacher' : ''}`}>
       <section className="page-hero">
         <div className="container">
           <div className="page-hero-badge">Liên hệ</div>
-          <h1 className="page-hero-title">{isAdmin ? 'Quản lý liên hệ' : isTeacher ? 'Trung tâm hỗ trợ' : 'Kết nối với nhóm nghiên cứu QBankCTU'}</h1>
+          <h1 className="page-hero-title">{isAdmin ? 'Quản lý liên hệ' : isMember ? 'Trung tâm hỗ trợ' : 'Kết nối với nhóm nghiên cứu QBankCTU'}</h1>
           <p className="page-hero-desc">
             {isAdmin
-              ? 'Tiếp nhận, phân loại và phản hồi các yêu cầu liên hệ từ giảng viên.'
+              ? 'Tiếp nhận, phân loại và phản hồi các yêu cầu hỗ trợ từ giảng viên và người duyệt.'
               : canUseTickets
               ? 'Gửi yêu cầu cho quản trị viên và theo dõi phản hồi của bạn tại đây.'
-              : 'Mọi góp ý về đề tài, đề xuất hợp tác hoặc câu hỏi trong quá trình sử dụng hệ thống, vui lòng liên hệ qua thông tin bên dưới.'}
+              : 'Góp ý về đề tài hoặc đề xuất hợp tác, vui lòng gửi email cho nhóm nghiên cứu. Người dùng hệ thống đăng nhập để gửi và theo dõi yêu cầu hỗ trợ.'}
           </p>
         </div>
       </section>
@@ -811,7 +813,7 @@ function ContactPage() {
         {isAdmin && <div className="container"><AdminContactOverview reloadKey={reloadKey} /></div>}
         <div className="container contact-grid">
 
-          {isTeacher ? (
+          {isMember ? (
             <details className="teacher-contact-other" open>
               <summary>
                 <span className="teacher-contact-other__heading">
@@ -827,11 +829,14 @@ function ContactPage() {
           <div className="contact-right">
             {!canUseTickets ? (
               <div className="contact-panel contact-anonymous">
-                <h3 className="form-card-title">Bạn cần đăng nhập để gửi yêu cầu</h3>
+                <h3 className="form-card-title">Gửi yêu cầu hỗ trợ</h3>
                 <p className="form-card-sub">
-                  Chức năng Liên hệ nội bộ dành cho giảng viên và quản trị viên. Vui lòng đăng nhập để tạo và theo dõi yêu cầu hỗ trợ.
+                  Giảng viên và người duyệt đăng nhập để tạo, theo dõi yêu cầu hỗ trợ và nhận phản hồi từ quản trị viên ngay trong hệ thống.
                 </p>
-                <p className="form-card-sub">Với các liên hệ khác, vui lòng dùng thông tin bên trái.</p>
+                <div className="contact-anonymous__actions">
+                  <Link to="/dang-nhap" state={{ from: '/lien-he' }} className="btn btn--primary">Đăng nhập để gửi yêu cầu</Link>
+                  <a href={`mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('[QBankCTU] Góp ý / hợp tác')}`} className="btn btn--outline">Gửi email cho nhóm</a>
+                </div>
               </div>
             ) : (
               <>
@@ -854,14 +859,14 @@ function ContactPage() {
                     ticketId={openTicketId}
                     currentUser={user}
                     onBack={() => {
-                      if (isTeacher) selectTab(tab === 'deleted' ? 'deleted' : 'mine');
+                      if (isMember) selectTab(tab === 'deleted' ? 'deleted' : 'mine');
                       else setOpenTicket(null);
                     }}
                     onChanged={bump}
                     onDeleted={() => { selectTab('deleted'); bump(); }}
                     onRestored={() => { selectTab(isAdmin ? 'all' : 'mine'); bump(); }}
                   />
-                ) : isTeacher && createdTicket ? (
+                ) : isMember && createdTicket ? (
                   <TeacherTicketConfirmation
                     ticket={createdTicket}
                     onOpen={setOpenTicket}
@@ -869,9 +874,9 @@ function ContactPage() {
                   />
                 ) : tab === 'new' ? (
                   <CreateTicketForm
-                    teacherView={isTeacher}
+                    teacherView={isMember}
                     onCreated={(created) => {
-                      if (isTeacher) setCreatedTicket(created);
+                      if (isMember) setCreatedTicket(created);
                       else selectTab('all');
                       bump();
                     }}
@@ -883,7 +888,7 @@ function ContactPage() {
                     onOpen={setOpenTicket}
                     onCreate={() => selectTab('new')}
                     reloadKey={reloadKey}
-                    teacherView={isTeacher}
+                    teacherView={isMember}
                   />
                 )}
               </>

@@ -24,11 +24,14 @@
   --transition:   0.25s cubic-bezier(0.4, 0, 0.2, 1);
 
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
+  font-family: var(--font-body);
 }
 
 /* ─── Top bar ────────────────────────────────────────────────── */
-.topbar {
+.register-page .topbar {
   position: relative;
   z-index: 10;
   display: flex;
@@ -37,21 +40,21 @@
   padding: 16px 32px;
 }
 
-.topbar-brand {
+.register-page .topbar-brand {
   display: flex;
   align-items: center;
   gap: 10px;
   text-decoration: none;
 }
 
-.topbar-logo {
+.register-page .topbar-logo {
   height: 36px;
-  background: #fff;
+  background: var(--secondary);
   border-radius: 6px;
   padding: 2px 4px;
 }
 
-.topbar-title {
+.register-page .topbar-title {
   display: block;
   font-family: var(--font-display);
   font-size: 1rem;
@@ -59,14 +62,14 @@
   color: var(--secondary);
 }
 
-.topbar-sub {
+.register-page .topbar-sub {
   display: block;
   font-size: 0.72rem;
   font-weight: 600;
   color: var(--text-muted);
 }
 
-.topbar-back {
+.register-page .topbar-back {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -81,33 +84,29 @@
   text-decoration: none;
   transition: all var(--transition);
 }
-.topbar-back:hover {
+.register-page .topbar-back:hover {
   color: var(--primary);
   border-color: var(--primary);
 }
 
 /* ─── Main wrapper ───────────────────────────────────────────── */
-.auth-wrapper {
+.register-page .auth-wrapper {
   position: relative;
   z-index: 1;
   flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px 20px;
+  padding: 16px 20px 32px;
   box-sizing: border-box;
-  overflow: hidden;
-  min-height: 0; /* ✨ QUAN TRỌNG: Ngăn flex-item tự phình to quá màn hình */
 }
 
 /* ─── Auth card ──────────────────────────────────────────────── */
-.auth-card {
+.register-page .auth-card {
   display: grid;
   grid-template-columns: 1fr 1.1fr;
   width: 100%;
   max-width: 1000px;
-  height: 100%; /* Bắt buộc lấy chiều cao theo wrapper */
-  max-height: 680px; /* Giới hạn chiều cao tối đa để form không bị kéo dãn quá đà */
   background: #fff;
   border-radius: var(--radius-xl);
   overflow: hidden;
@@ -122,7 +121,7 @@
 }
 
 /* ─── Left panel (Branding) ──────────────────────────────────── */
-.auth-panel--left {
+.register-page .auth-panel--left {
   background: linear-gradient(155deg, var(--navy) 0%, var(--secondary) 55%, var(--primary) 100%);
   position: relative;
   display: flex;
@@ -132,7 +131,7 @@
   color: #fff;
 }
 
-.panel-heading {
+.register-page .panel-heading {
   font-family: var(--font-display);
   font-size: clamp(2rem, 3.5vw, 2.8rem);
   font-weight: 700;
@@ -140,12 +139,31 @@
   margin-bottom: 20px;
 }
 
-.panel-heading em {
+.register-page .panel-heading em {
+  display: block;
   font-style: italic;
   color: var(--accent);
 }
 
-.panel-desc {
+.register-page .auth-notice {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+.register-page .auth-notice--error {
+  color: #8a1f1f;
+  background: #fff2f2;
+  border: 1px solid #f3b9b9;
+}
+.register-page .auth-notice--success {
+  color: #14532d;
+  background: #effbf3;
+  border: 1px solid #b7e4c7;
+}
+
+.register-page .panel-desc {
   font-size: 0.95rem;
   color: rgba(255,255,255,0.75);
   line-height: 1.6;
@@ -153,7 +171,7 @@
   max-width: 320px;
 }
 
-.panel-perks {
+.register-page .panel-perks {
   list-style: none;
   padding: 0;
   margin: 0;
@@ -161,7 +179,7 @@
   gap: 16px;
 }
 
-.perk-item {
+.register-page .perk-item {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -170,7 +188,7 @@
   color: rgba(255,255,255,0.9);
 }
 
-.perk-icon {
+.register-page .perk-icon {
   width: 22px;
   height: 22px;
   background: rgba(92, 200, 255, 0.2);
@@ -185,36 +203,29 @@
 }
 
 /* ─── Right panel (Form) ─────────────────────────────────────── */
-.auth-panel--right {
-  padding: 32px 60px; /* Giảm padding dọc từ 48px xuống 32px */
+.register-page .auth-panel--right {
+  padding: 32px 60px;
   display: flex;
   align-items: center;
-  overflow-y: auto; /* Nội dung dư sẽ tự cuộn ngầm bên trong thẻ card */
-  scrollbar-width: none;
-  -ms-overflow-style: none;
 }
 
-.auth-panel--right::-webkit-scrollbar {
-  display: none;
-}
-
-.form-wrap {
+.register-page .form-wrap {
   width: 100%;
 }
 
-.form-header { margin-bottom: 24px; }
-.form-title {
+.register-page .form-header { margin-bottom: 24px; }
+.register-page .form-title {
   font-family: var(--font-display);
   font-size: 1.85rem;
   color: var(--navy);
   margin-bottom: 4px;
 }
-.form-subtitle { font-size: 0.875rem; color: var(--text-muted); }
-.form-link { color: var(--primary); font-weight: 600; text-decoration: none; }
-.form-link:hover { text-decoration: underline; }
+.register-page .form-subtitle { font-size: 0.875rem; color: var(--text-muted); }
+.register-page .form-link { color: var(--primary); font-weight: 600; text-decoration: none; }
+.register-page .form-link:hover { text-decoration: underline; }
 
 /* Google Button & Divider */
-.btn-google {
+.register-page .btn-google {
   width: 100%;
   padding: 10px;
   border: 1.5px solid var(--border);
@@ -231,9 +242,9 @@
   font-family: inherit;
   color: var(--text);
 }
-.btn-google:hover { background: #f8fbff; border-color: var(--primary); }
+.register-page .btn-google:hover { background: #f8fbff; border-color: var(--primary); }
 
-.divider {
+.register-page .divider {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -242,15 +253,15 @@
   font-size: 0.75rem;
   text-transform: uppercase;
 }
-.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.register-page .divider::before, .register-page .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 
 /* Form Fields */
-.auth-form { display: grid; gap: 16px; }
-.field-group { display: grid; gap: 6px; }
-.field-label { font-size: 0.85rem; font-weight: 600; color: var(--text); }
+.register-page .auth-form { display: grid; gap: 16px; }
+.register-page .field-group { display: grid; gap: 6px; }
+.register-page .field-label { font-size: 0.85rem; font-weight: 600; color: var(--text); }
 
-.field-wrap { position: relative; display: flex; align-items: center; }
-.field-icon {
+.register-page .field-wrap { position: relative; display: flex; align-items: center; }
+.register-page .field-icon {
   position: absolute;
   left: 14px;
   color: var(--text-light);
@@ -258,7 +269,7 @@
   pointer-events: none;
 }
 
-.field-input {
+.register-page .field-input {
   width: 100%;
   padding: 11px 14px 11px 40px;
   border: 1.5px solid var(--border);
@@ -269,9 +280,9 @@
   transition: all var(--transition);
   font-family: inherit;
 }
-.field-input:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(0,153,229,0.1); }
+.register-page .field-input:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(0,153,229,0.1); }
 
-.field-toggle {
+.register-page .field-toggle {
   position: absolute;
   right: 10px;
   background: none;
@@ -282,25 +293,25 @@
 }
 
 /* Độ mạnh mật khẩu (Strength Meter) */
-.pw-strength {
+.register-page .pw-strength {
   margin-top: 8px;
   display: flex;
   align-items: center;
   gap: 12px;
 }
-.pw-bars {
+.register-page .pw-bars {
   display: flex;
   gap: 4px;
   flex: 1;
 }
-.pw-bar {
+.register-page .pw-bar {
   height: 4px;
   flex: 1;
   background: var(--border);
   border-radius: 2px;
   transition: all 0.3s ease;
 }
-.pw-label {
+.register-page .pw-label {
   font-size: 0.75rem;
   font-weight: 700;
   min-width: 65px;
@@ -308,7 +319,7 @@
 }
 
 /* Nút Submit */
-.btn-submit {
+.register-page .btn-submit {
   width: 100%;
   padding: 13px;
   background: var(--primary);
@@ -327,29 +338,25 @@
   margin-top: 10px;
   font-family: inherit;
 }
-.btn-submit:hover { background: var(--primary-dark); transform: translateY(-1px); }
+.register-page .btn-submit:hover { background: var(--primary-dark); transform: translateY(-1px); }
 
 /* ─── Responsive ─────────────────────────────────────────────── */
 @media (max-width: 900px) {
-  .auth-card { 
+  .register-page .auth-card { 
     grid-template-columns: 1fr; 
-    max-width: 500px; 
-    height: auto; 
-    max-height: 90vh; /* Điều chỉnh lại cho màn hình di động/tablet */
+    max-width: 500px;
   }
-  .auth-panel--left { display: none; }
-  .auth-panel--right { padding: 40px 30px; }
+  .register-page .auth-panel--left { display: none; }
+  .register-page .auth-panel--right { padding: 40px 30px; }
 }
 
 @media (max-width: 480px) {
   .register-page .topbar { min-height: 60px; padding: 12px 16px; }
   .register-page .auth-wrapper {
     align-items: flex-start;
-    overflow: visible;
     padding: 12px 16px 28px;
   }
-  .register-page .auth-card { max-height: none; }
-  .register-page .auth-panel--right { overflow: visible; padding: 32px 22px; }
+  .register-page .auth-panel--right { padding: 32px 22px; }
 }
 
 @media (max-width: 360px) {

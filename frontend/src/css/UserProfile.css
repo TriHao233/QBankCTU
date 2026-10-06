@@ -898,3 +898,26 @@
   .page-main .profile-page .profile-card,
   .page-main .profile-page .side-card { padding: 20px; }
 }
+
+.profile-page .profile-permission-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.profile-page .profile-permission-list li {
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #f2f8ff;
+  color: #13355f;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.profile-page .profile-permission-empty {
+  margin: 0;
+  color: #5c6f89;
+  font-size: 0.85rem;
+}

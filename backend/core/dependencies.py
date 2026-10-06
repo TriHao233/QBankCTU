@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Keep in sync with modules/auth/login.py's TOKEN_CLOCK_SKEW_SECONDS.
 TOKEN_CLOCK_SKEW_SECONDS = 60
+PENDING_APPROVAL_DETAIL = "Tài khoản đang chờ quản trị viên kích hoạt"
 
 # Mô hình quyền:
 # - Vai trò quyết định bộ quyền mặc định.
@@ -175,6 +176,8 @@ def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tài khoản chưa được đồng bộ với hệ thống",
         )
+    if user.get("approval_status") == "PENDING":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PENDING_APPROVAL_DETAIL)
     if not user.get("is_active", True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tài khoản đã bị khóa")
     get_firebase_session_repository().upsert(

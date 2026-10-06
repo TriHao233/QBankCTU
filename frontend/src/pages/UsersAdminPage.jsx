@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
+  faCheck,
   faChevronLeft,
   faChevronRight,
   faCopy,
@@ -23,6 +25,7 @@ import { listSubjects } from '../api/catalog';
 import { suggestReviewSubjects } from '../api/questions';
 import '../css/AdminJobsPage.css';
 import '../css/UsersAdminPage.css';
+import { notify } from '../utils/notify';
 
 const PAGE_SIZE = 20;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -111,8 +114,10 @@ function UsersAdminPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
-  const [stats, setStats] = useState({ all: 0, Admin: 0, Teacher: 0, Reviewer: 0 });
+  const [stats, setStats] = useState(null);
 
+  const [searchParams, setSearchParams] = useSearchParams();
+  const approvalFilter = searchParams.get('approval') === 'PENDING' ? 'PENDING' : '';
   const [roleFilter, setRoleFilter] = useState('all');
   const [searchInput, setSearchInput] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
@@ -171,6 +176,7 @@ function UsersAdminPage() {
         pageSize: PAGE_SIZE,
         role: roleFilter === 'all' ? undefined : roleFilter,
         search: searchTerm || undefined,
+        approvalStatus: approvalFilter || undefined,
       });
       setUsers(result.items || []);
       setTotal(result.total || 0);
@@ -185,17 +191,19 @@ function UsersAdminPage() {
 
   const fetchStats = async () => {
     try {
-      const [allRes, adminRes, teacherRes, reviewerRes] = await Promise.all([
+      const [allRes, adminRes, teacherRes, reviewerRes, pendingRes] = await Promise.all([
         listUsers({ page: 1, pageSize: 1 }),
         listUsers({ page: 1, pageSize: 1, role: 'Admin' }),
         listUsers({ page: 1, pageSize: 1, role: 'Teacher' }),
         listUsers({ page: 1, pageSize: 1, role: 'Reviewer' }),
+        listUsers({ page: 1, pageSize: 1, approvalStatus: 'PENDING' }),
       ]);
       setStats({
         all: allRes.total || 0,
         Admin: adminRes.total || 0,
         Teacher: teacherRes.total || 0,
         Reviewer: reviewerRes.total || 0,
+        PENDING: pendingRes.total || 0,
       });
     } catch {
       // stat tiles are non-critical; keep the previously known values on failure
@@ -205,7 +213,7 @@ function UsersAdminPage() {
   useEffect(() => {
     fetchUsers(page);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, searchTerm, roleFilter]);
+  }, [page, searchTerm, roleFilter, approvalFilter]);
 
   useEffect(() => {
     fetchStats();
@@ -216,6 +224,13 @@ function UsersAdminPage() {
   const selectRoleFilter = (role) => {
     setRoleFilter(role);
     setPage(1);
+    if (approvalFilter) setSearchParams({}, { replace: true });
+  };
+
+  const selectPendingFilter = () => {
+    setRoleFilter('all');
+    setPage(1);
+    setSearchParams({ approval: 'PENDING' }, { replace: true });
   };
 
   const refreshAll = async (pageArg = page) => {
@@ -252,15 +267,15 @@ function UsersAdminPage() {
     const email = createForm.email.trim();
     const displayName = createForm.display_name.trim();
     if (!email || !displayName) {
-      alert('Vui lòng nhập đầy đủ email và họ tên.');
+      notify('Vui lòng nhập đầy đủ email và họ tên.');
       return;
     }
     if (!EMAIL_RE.test(email)) {
-      alert('Email không hợp lệ.');
+      notify('Email không hợp lệ.');
       return;
     }
     if (createMode === 'direct' && createForm.password.length < 6) {
-      alert('Mật khẩu phải có ít nhất 6 ký tự.');
+      notify('Mật khẩu phải có ít nhất 6 ký tự.');
       return;
     }
     setCreating(true);
@@ -286,7 +301,7 @@ function UsersAdminPage() {
       await refreshAll(1);
       setPage(1);
     } catch (err) {
-      alert('Tạo tài khoản thất bại: ' + err.message);
+      notify('Tạo tài khoản thất bại: ' + err.message);
     } finally {
       setCreating(false);
     }
@@ -324,7 +339,7 @@ function UsersAdminPage() {
       setEditing(null);
       await refreshAll();
     } catch (err) {
-      alert('Cập nhật tài khoản thất bại: ' + err.message);
+      notify('Cập nhật tài khoản thất bại: ' + err.message);
     } finally {
       setSaving(false);
     }
@@ -336,7 +351,7 @@ function UsersAdminPage() {
       const result = await resetUserPassword(user.id);
       setResetResult(result);
     } catch (err) {
-      alert('Tạo link reset mật khẩu thất bại: ' + err.message);
+      notify('Tạo link reset mật khẩu thất bại: ' + err.message);
     } finally {
       setResettingId(null);
     }
@@ -345,7 +360,7 @@ function UsersAdminPage() {
   const handleImportUsers = async (event) => {
     event.preventDefault();
     if (importRows.length === 0) {
-      alert('Vui lòng nhập ít nhất một dòng CSV.');
+      notify('Vui lòng nhập ít nhất một dòng CSV.');
       return;
     }
     setImporting(true);
@@ -356,7 +371,7 @@ function UsersAdminPage() {
       await refreshAll(1);
       setPage(1);
     } catch (err) {
-      alert('Import tài khoản thất bại: ' + err.message);
+      notify('Import tài khoản thất bại: ' + err.message);
     } finally {
       setImporting(false);
     }
@@ -364,9 +379,12 @@ function UsersAdminPage() {
 
   const handleToggleActive = async (user) => {
     const activate = !user.is_active;
-    const confirmMessage = activate
-      ? `Kích hoạt lại tài khoản "${user.display_name}" (${user.email})?`
-      : `Vô hiệu hoá tài khoản "${user.display_name}" (${user.email})?`;
+    const pending = user.approval_status === 'PENDING';
+    const confirmMessage = pending
+      ? `Duyệt và kích hoạt tài khoản "${user.display_name}" (${user.email}) với vai trò ${ROLE_LABEL[user.role] || user.role}?`
+      : activate
+        ? `Kích hoạt lại tài khoản "${user.display_name}" (${user.email})?`
+        : `Vô hiệu hoá tài khoản "${user.display_name}" (${user.email})?`;
     if (!window.confirm(confirmMessage)) return;
     setTogglingId(user.id);
     try {
@@ -377,7 +395,7 @@ function UsersAdminPage() {
       }
       await refreshAll();
     } catch (err) {
-      alert((activate ? 'Kích hoạt' : 'Vô hiệu hoá') + ' tài khoản thất bại: ' + err.message);
+      notify((activate ? 'Kích hoạt' : 'Vô hiệu hoá') + ' tài khoản thất bại: ' + err.message);
     } finally {
       setTogglingId(null);
     }
@@ -398,7 +416,7 @@ function UsersAdminPage() {
           </button>
           <button type="button" className="jobs-secondary-button" onClick={() => setShowImport(true)}>
             <FontAwesomeIcon icon={faFileImport} />
-            <span>Import CSV</span>
+            <span>Nhập từ CSV</span>
           </button>
           <button type="button" className="jobs-secondary-button" onClick={() => openCreate('invite')}>
             <FontAwesomeIcon icon={faEnvelope} />
@@ -411,22 +429,26 @@ function UsersAdminPage() {
         </div>
       </section>
 
-      <section className="jobs-summary">
-        <button type="button" className={`summary-tile ${roleFilter === 'all' ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('all')}>
-          <b>{stats.all}</b>
+      <section className="jobs-summary users-summary">
+        <button type="button" className={`summary-tile ${roleFilter === 'all' && !approvalFilter ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('all')}>
+          <b>{stats ? stats.all : '—'}</b>
           <span>Tổng tài khoản</span>
         </button>
-        <button type="button" className={`summary-tile ${roleFilter === 'Admin' ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('Admin')}>
-          <b>{stats.Admin}</b>
+        <button type="button" className={`summary-tile ${roleFilter === 'Admin' && !approvalFilter ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('Admin')}>
+          <b>{stats ? stats.Admin : '—'}</b>
           <span>Quản trị viên</span>
         </button>
-        <button type="button" className={`summary-tile ${roleFilter === 'Teacher' ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('Teacher')}>
-          <b>{stats.Teacher}</b>
+        <button type="button" className={`summary-tile ${roleFilter === 'Teacher' && !approvalFilter ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('Teacher')}>
+          <b>{stats ? stats.Teacher : '—'}</b>
           <span>Giảng viên</span>
         </button>
-        <button type="button" className={`summary-tile ${roleFilter === 'Reviewer' ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('Reviewer')}>
-          <b>{stats.Reviewer}</b>
+        <button type="button" className={`summary-tile ${roleFilter === 'Reviewer' && !approvalFilter ? 'summary-tile--active' : ''}`} onClick={() => selectRoleFilter('Reviewer')}>
+          <b>{stats ? stats.Reviewer : '—'}</b>
           <span>Người duyệt</span>
+        </button>
+        <button type="button" className={`summary-tile ${approvalFilter ? 'summary-tile--active' : ''} ${stats?.PENDING ? 'summary-tile--attention' : ''}`} onClick={selectPendingFilter}>
+          <b>{stats ? stats.PENDING : '—'}</b>
+          <span>Chờ kích hoạt</span>
         </button>
       </section>
 
@@ -509,7 +531,9 @@ function UsersAdminPage() {
                     </td>
                     <td>{(u.permissions || []).length} quyền</td>
                     <td>
-                      {u.is_active ? (
+                      {u.approval_status === 'PENDING' ? (
+                        <span className="status-pill status-pill--warning">Chờ kích hoạt</span>
+                      ) : u.is_active ? (
                         <span className="status-pill status-pill--success">Hoạt động</span>
                       ) : (
                         <span className="status-pill status-pill--danger">Đã khoá</span>
@@ -531,12 +555,12 @@ function UsersAdminPage() {
                         </button>
                         <button
                           type="button"
-                          className={u.is_active ? 'danger-action' : ''}
-                          title={u.is_active ? 'Vô hiệu hoá tài khoản' : 'Kích hoạt lại tài khoản'}
+                          className={u.is_active ? 'danger-action' : u.approval_status === 'PENDING' ? 'approve-action' : ''}
+                          title={u.approval_status === 'PENDING' ? 'Duyệt và kích hoạt tài khoản' : u.is_active ? 'Vô hiệu hoá tài khoản' : 'Kích hoạt lại tài khoản'}
                           disabled={togglingId === u.id}
                           onClick={() => handleToggleActive(u)}
                         >
-                          <FontAwesomeIcon icon={u.is_active ? faLock : faLockOpen} />
+                          <FontAwesomeIcon icon={u.approval_status === 'PENDING' ? faCheck : u.is_active ? faLock : faLockOpen} />
                         </button>
                       </div>
                     </td>
@@ -546,7 +570,9 @@ function UsersAdminPage() {
             </table>
             {!loading && users.length === 0 && (
               <p className="jobs-empty">
-                {searchTerm || roleFilter !== 'all'
+                {approvalFilter
+                  ? 'Không có tài khoản nào đang chờ kích hoạt.'
+                  : searchTerm || roleFilter !== 'all'
                   ? 'Không có người dùng nào khớp với bộ lọc hiện tại.'
                   : 'Chưa có người dùng nào trong hệ thống.'}
               </p>

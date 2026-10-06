@@ -19,7 +19,9 @@
   background: rgba(255,255,255,0.85); border: 1px solid var(--border, #d9e6f2); border-radius: 40px; padding: 6px 16px; margin-bottom: 18px;
 }
 .exam-list-page .page-hero-title { font-family: 'Fraunces', serif; font-size: clamp(1.7rem, 3vw, 2.3rem); font-weight: 700; color: var(--navy, #003a75); margin-bottom: 12px; }
-.exam-list-page .page-hero-desc { font-size: 0.98rem; color: var(--text-muted, #5c6f89); max-width: 560px; line-height: 1.65; }
+.exam-list-page .page-hero-desc { font-size: 0.98rem; color: var(--text-muted, #5c6f89); max-width: 560px; line-height: 1.65; margin: 0; }
+.exam-list-page .page-hero { text-align: left; }
+.exam-list-page .page-hero-title { margin-left: 0; margin-right: 0; }
 
 .exam-list-page .exam-list-body { padding: 40px 0 96px; background: #fafcff; }
 .exam-list-page .exam-error { color: #DC2626; font-size: 0.85rem; margin-bottom: 12px; }

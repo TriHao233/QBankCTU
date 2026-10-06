@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -241,10 +242,11 @@ def list_users(
     page_size: int = Query(20, ge=1, le=100),
     role: RoleEnum | None = None,
     search: str | None = None,
+    approval_status: Literal["PENDING", "APPROVED"] | None = None,
     _admin: CurrentUser = Depends(require_permissions("admin.users")),
     service: UserService = Depends(get_user_service),
 ):
-    return service.list(page, page_size, role.value if role else None, search)
+    return service.list(page, page_size, role.value if role else None, search, approval_status)
 
 
 @router.get("/teachers", response_model=TeacherOptionListResponse)

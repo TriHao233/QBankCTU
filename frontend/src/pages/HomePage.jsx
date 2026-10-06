@@ -20,7 +20,7 @@ const WORKFLOW = [
     name: 'Tải lên',
     heading: 'Tài liệu học phần vào hệ thống',
     body:
-      'Giảng viên tải giáo trình, slide bài giảng hoặc đề cương chi tiết dạng PDF/DOC. '
+      'Giảng viên tải giáo trình, slide bài giảng hoặc đề cương chi tiết dạng PDF, DOCX, Markdown hoặc TXT. '
       + 'Tài liệu scan được đưa qua OCR để bóc tách văn bản trước khi xử lý.',
     aside: {
       kind: 'files',
@@ -58,7 +58,7 @@ const WORKFLOW = [
       items: [
         { k: 'Loại câu hỏi', v: 'Trắc nghiệm' },
         { k: 'Cấp độ Bloom', v: 'Vận dụng' },
-        { k: 'Số lượng', v: '10 câu' },
+        { k: 'Số lượng', v: '7 câu / lượt' },
       ],
     },
   },
@@ -289,7 +289,7 @@ function HomePage() {
       <section className="workflow" aria-labelledby="workflow-heading">
         <div className="container">
           <h2 className="workflow-heading" id="workflow-heading">
-            Năm chặng, theo đúng thứ tự
+            Với người dùng, gói gọn trong năm bước
           </h2>
 
           <div className="workflow-stages">

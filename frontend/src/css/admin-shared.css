@@ -39,6 +39,16 @@
   margin-bottom: 6px;
 }
 
+/* The eyebrow rule above is meant for header labels, not button captions. */
+:is(.overview-header, .overview-panel-heading, .jobs-header, .job-detail-header, .moodle-header, .panel-heading, .catalog-header, .ai-review-toolbar__title, .review-toolbar__title) :is(button, a) span {
+  display: inline;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  text-transform: none;
+  margin: 0;
+}
+
 .overview-header h1,
 .jobs-header h1,
 .moodle-header h1,

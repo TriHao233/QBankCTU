@@ -50,15 +50,15 @@ function childId(item) {
 
 function factoryText(model) {
   const status = model?.factory_status;
-  if (!status) return 'Chưa kiểm tra factory';
-  if (!status.supported) return status.error || 'Factory chưa hỗ trợ';
+  if (!status) return 'Chưa kiểm tra kết nối';
+  if (!status.supported) return status.error || 'Chưa hỗ trợ mô hình này';
   const runtime = status.runtime || {};
   return `${runtime.provider_class || 'Provider'}${runtime.model_name ? ` · ${runtime.model_name}` : ''}`;
 }
 
 function healthText(model) {
   const health = model?.last_health_check;
-  if (!health) return 'Chưa health-check';
+  if (!health) return 'Chưa kiểm tra kết nối';
   return health.status === 'OK'
     ? `OK · ${health.latency_ms || 0}ms`
     : `${health.status || 'FAILED'}${health.error ? ` · ${health.error}` : ''}`;
@@ -353,7 +353,7 @@ function CatalogAdminPage() {
       setModelHealth(result);
       await loadCatalog();
     } catch (err) {
-      setError(err.message || 'Health-check model thất bại');
+      setError(err.message || 'Kiểm tra kết nối mô hình thất bại');
     } finally {
       setHealthCheckingCode('');
     }
@@ -451,9 +451,9 @@ function CatalogAdminPage() {
         <section className="catalog-grid">
           <div className="catalog-card catalog-card--wide catalog-runtime-panel">
             <div className="catalog-card-title-row">
-              <h2>Runtime đang dùng</h2>
+              <h2>Cấu hình AI đang chạy</h2>
               <span className={`catalog-status ${runtimeConfig.prompt_source === 'db' ? 'ok' : 'warn'}`}>
-                PROMPT_SOURCE={runtimeConfig.prompt_source || 'file'}
+                Nguồn prompt: {runtimeConfig.prompt_source === 'db' ? 'cơ sở dữ liệu' : 'tệp mặc định'}
               </span>
             </div>
             <div className="runtime-grid">
@@ -468,12 +468,12 @@ function CatalogAdminPage() {
                 <span>{runtimeConfig.evaluation_factory?.runtime?.provider_class || factoryText(runtimeConfig.evaluation_catalog_model)}</span>
               </div>
               <div>
-                <small>Prompt DB active</small>
+                <small>Prompt đang dùng trong CSDL</small>
                 <b>{runtimeConfig.active_prompt_count ?? 0}</b>
-                <span>{runtimeConfig.prompt_source === 'db' ? 'Có hiệu lực runtime' : 'Chưa có hiệu lực runtime'}</span>
+                <span>{runtimeConfig.prompt_source === 'db' ? 'Đang được áp dụng' : 'Chưa áp dụng (đang dùng tệp mặc định)'}</span>
               </div>
               <div>
-                <small>Policy active</small>
+                <small>Bộ tiêu chí đang áp dụng</small>
                 <b>{runtimeConfig.active_evaluation_policy?.policy_name || '--'}</b>
                 <span>Phiên bản {runtimeConfig.active_evaluation_policy?.version || 1}</span>
               </div>
@@ -495,9 +495,18 @@ function CatalogAdminPage() {
               </button>
             </div>
             <form className="catalog-form catalog-form--inline" onSubmit={handleSaveSubject}>
-              <input placeholder="Mã môn" value={subjectForm.subject_code} onChange={(e) => setSubjectForm({ ...subjectForm, subject_code: e.target.value })} />
-              <input placeholder="Tên môn" value={subjectForm.subject_name} onChange={(e) => setSubjectForm({ ...subjectForm, subject_name: e.target.value })} />
-              <input placeholder="Mô tả" value={subjectForm.description} onChange={(e) => setSubjectForm({ ...subjectForm, description: e.target.value })} />
+              <label className="catalog-model-field">
+                <span>Mã môn</span>
+                <input placeholder="Ví dụ: CT177" value={subjectForm.subject_code} onChange={(e) => setSubjectForm({ ...subjectForm, subject_code: e.target.value })} />
+              </label>
+              <label className="catalog-model-field">
+                <span>Tên môn</span>
+                <input placeholder="Ví dụ: Cấu trúc dữ liệu" value={subjectForm.subject_name} onChange={(e) => setSubjectForm({ ...subjectForm, subject_name: e.target.value })} />
+              </label>
+              <label className="catalog-model-field">
+                <span>Mô tả</span>
+                <input placeholder="Nội dung chính của học phần" value={subjectForm.description} onChange={(e) => setSubjectForm({ ...subjectForm, description: e.target.value })} />
+              </label>
               <label className="catalog-check">
                 <input type="checkbox" checked={subjectForm.is_active} onChange={(e) => setSubjectForm({ ...subjectForm, is_active: e.target.checked })} />
                 Đang dùng
@@ -531,83 +540,107 @@ function CatalogAdminPage() {
                     </button>
                   )}
                 </div>
-                <div className="catalog-columns">
-                  <form className="catalog-form" onSubmit={handleSaveChapter}>
-                    <h4>{chapterForm.id ? 'Sửa chương' : 'Thêm chương'}</h4>
-                    <input placeholder="CH01" value={chapterForm.chapter_code} onChange={(e) => setChapterForm({ ...chapterForm, chapter_code: e.target.value })} />
-                    <input placeholder="Tên chương" value={chapterForm.chapter_name} onChange={(e) => setChapterForm({ ...chapterForm, chapter_name: e.target.value })} />
-                    <input type="number" min="1" value={chapterForm.sequence_no} onChange={(e) => setChapterForm({ ...chapterForm, sequence_no: e.target.value })} />
-                    <label className="catalog-check">
-                      <input type="checkbox" checked={chapterForm.is_active} onChange={(e) => setChapterForm({ ...chapterForm, is_active: e.target.checked })} />
-                      Đang dùng
-                    </label>
-                    <div className="catalog-form-actions">
-                      {chapterForm.id && (
-                        <button type="button" className="catalog-ghost-button" onClick={() => setChapterForm(EMPTY_CHAPTER_FORM)} disabled={saving}>
-                          Hủy
-                        </button>
-                      )}
-                      <button type="submit" disabled={!activeSubject || saving}>{chapterForm.id ? 'Lưu chương' : 'Thêm chương'}</button>
+                {activeSubject ? (
+                  <>
+                    <div className="catalog-columns">
+                      <form className="catalog-form" onSubmit={handleSaveChapter}>
+                        <h4>{chapterForm.id ? 'Sửa chương' : 'Thêm chương'}</h4>
+                        <label className="catalog-model-field">
+                          <span>Mã chương</span>
+                          <input placeholder="Ví dụ: C1" value={chapterForm.chapter_code} onChange={(e) => setChapterForm({ ...chapterForm, chapter_code: e.target.value })} />
+                        </label>
+                        <label className="catalog-model-field">
+                          <span>Tên chương</span>
+                          <input placeholder="Ví dụ: Danh sách liên kết" value={chapterForm.chapter_name} onChange={(e) => setChapterForm({ ...chapterForm, chapter_name: e.target.value })} />
+                        </label>
+                        <label className="catalog-model-field">
+                          <span>Thứ tự chương</span>
+                          <input type="number" min="1" value={chapterForm.sequence_no} onChange={(e) => setChapterForm({ ...chapterForm, sequence_no: e.target.value })} />
+                        </label>
+                        <label className="catalog-check">
+                          <input type="checkbox" checked={chapterForm.is_active} onChange={(e) => setChapterForm({ ...chapterForm, is_active: e.target.checked })} />
+                          Đang dùng
+                        </label>
+                        <div className="catalog-form-actions">
+                          {chapterForm.id && (
+                            <button type="button" className="catalog-ghost-button" onClick={() => setChapterForm(EMPTY_CHAPTER_FORM)} disabled={saving}>
+                              Hủy
+                            </button>
+                          )}
+                          <button type="submit" disabled={!activeSubject || saving}>{chapterForm.id ? 'Lưu chương' : 'Thêm chương'}</button>
+                        </div>
+                      </form>
+                      <form className="catalog-form" onSubmit={handleSaveClo}>
+                        <h4>{cloForm.id ? 'Sửa CLO' : 'Thêm CLO'}</h4>
+                        <label className="catalog-model-field">
+                          <span>Mã CLO</span>
+                          <input placeholder="Ví dụ: CLO1" value={cloForm.clo_code} onChange={(e) => setCloForm({ ...cloForm, clo_code: e.target.value })} />
+                        </label>
+                        <label className="catalog-model-field">
+                          <span>Mô tả chuẩn đầu ra</span>
+                          <input placeholder="Sinh viên có khả năng..." value={cloForm.description} onChange={(e) => setCloForm({ ...cloForm, description: e.target.value })} />
+                        </label>
+                        <label className="catalog-model-field">
+                          <span>Trọng số (0–1)</span>
+                          <input type="number" min="0" max="1" step="0.05" value={cloForm.target_weight} onChange={(e) => setCloForm({ ...cloForm, target_weight: e.target.value })} />
+                        </label>
+                        <label className="catalog-check">
+                          <input type="checkbox" checked={cloForm.is_active} onChange={(e) => setCloForm({ ...cloForm, is_active: e.target.checked })} />
+                          Đang dùng
+                        </label>
+                        <div className="catalog-form-actions">
+                          {cloForm.id && (
+                            <button type="button" className="catalog-ghost-button" onClick={() => setCloForm(EMPTY_CLO_FORM)} disabled={saving}>
+                              Hủy
+                            </button>
+                          )}
+                          <button type="submit" disabled={!activeSubject || saving}>{cloForm.id ? 'Lưu CLO' : 'Thêm CLO'}</button>
+                        </div>
+                      </form>
                     </div>
-                  </form>
-                  <form className="catalog-form" onSubmit={handleSaveClo}>
-                    <h4>{cloForm.id ? 'Sửa CLO' : 'Thêm CLO'}</h4>
-                    <input placeholder="CLO1" value={cloForm.clo_code} onChange={(e) => setCloForm({ ...cloForm, clo_code: e.target.value })} />
-                    <input placeholder="Mô tả chuẩn đầu ra" value={cloForm.description} onChange={(e) => setCloForm({ ...cloForm, description: e.target.value })} />
-                    <input type="number" min="0" max="1" step="0.05" value={cloForm.target_weight} onChange={(e) => setCloForm({ ...cloForm, target_weight: e.target.value })} />
-                    <label className="catalog-check">
-                      <input type="checkbox" checked={cloForm.is_active} onChange={(e) => setCloForm({ ...cloForm, is_active: e.target.checked })} />
-                      Đang dùng
-                    </label>
-                    <div className="catalog-form-actions">
-                      {cloForm.id && (
-                        <button type="button" className="catalog-ghost-button" onClick={() => setCloForm(EMPTY_CLO_FORM)} disabled={saving}>
-                          Hủy
-                        </button>
-                      )}
-                      <button type="submit" disabled={!activeSubject || saving}>{cloForm.id ? 'Lưu CLO' : 'Thêm CLO'}</button>
+                    <div className="catalog-list">
+                      {(activeSubject?.chapters || []).map((chapter) => (
+                        <article className={`catalog-list-item ${chapter.is_active === false ? 'inactive' : ''}`} key={childId(chapter)}>
+                          <div>
+                            <b>{chapter.chapter_code} - {chapter.chapter_name}</b>
+                            <span>{usageText(chapter.usage_counts)}</span>
+                          </div>
+                          <div className="catalog-item-actions">
+                            <button type="button" className="catalog-ghost-button" onClick={() => setChapterForm(chapterToForm(chapter))} disabled={saving}>
+                              Sửa
+                            </button>
+                            <button type="button" className="catalog-ghost-button" onClick={() => toggleChapterActive(chapter)} disabled={saving}>
+                              {chapter.is_active === false ? 'Kích hoạt' : 'Tạm khóa'}
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                      {(activeSubject?.learning_outcomes || []).map((clo) => (
+                        <article className={`catalog-list-item ${clo.is_active === false ? 'inactive' : ''}`} key={childId(clo)}>
+                          <div>
+                            <b>{clo.clo_code}: {clo.description}</b>
+                            <span>{usageText(clo.usage_counts)}</span>
+                          </div>
+                          <div className="catalog-item-actions">
+                            <button type="button" className="catalog-ghost-button" onClick={() => setCloForm(cloToForm(clo))} disabled={saving}>
+                              Sửa
+                            </button>
+                            <button type="button" className="catalog-ghost-button" onClick={() => toggleCloActive(clo)} disabled={saving}>
+                              {clo.is_active === false ? 'Kích hoạt' : 'Tạm khóa'}
+                            </button>
+                          </div>
+                        </article>
+                      ))}
                     </div>
-                  </form>
-                </div>
-                <div className="catalog-list">
-                  {(activeSubject?.chapters || []).map((chapter) => (
-                    <article className={`catalog-list-item ${chapter.is_active === false ? 'inactive' : ''}`} key={childId(chapter)}>
-                      <div>
-                        <b>{chapter.chapter_code} - {chapter.chapter_name}</b>
-                        <span>{usageText(chapter.usage_counts)}</span>
-                      </div>
-                      <div className="catalog-item-actions">
-                        <button type="button" className="catalog-ghost-button" onClick={() => setChapterForm(chapterToForm(chapter))} disabled={saving}>
-                          Sửa
-                        </button>
-                        <button type="button" className="catalog-ghost-button" onClick={() => toggleChapterActive(chapter)} disabled={saving}>
-                          {chapter.is_active === false ? 'Kích hoạt' : 'Tạm khóa'}
-                        </button>
-                      </div>
-                    </article>
-                  ))}
-                  {(activeSubject?.learning_outcomes || []).map((clo) => (
-                    <article className={`catalog-list-item ${clo.is_active === false ? 'inactive' : ''}`} key={childId(clo)}>
-                      <div>
-                        <b>{clo.clo_code}: {clo.description}</b>
-                        <span>{usageText(clo.usage_counts)}</span>
-                      </div>
-                      <div className="catalog-item-actions">
-                        <button type="button" className="catalog-ghost-button" onClick={() => setCloForm(cloToForm(clo))} disabled={saving}>
-                          Sửa
-                        </button>
-                        <button type="button" className="catalog-ghost-button" onClick={() => toggleCloActive(clo)} disabled={saving}>
-                          {clo.is_active === false ? 'Kích hoạt' : 'Tạm khóa'}
-                        </button>
-                      </div>
-                    </article>
-                  ))}
-                </div>
+                  </>
+                ) : (
+                  <p className="catalog-empty">Tạo hoặc chọn một môn ở bên trái để thêm chương và CLO.</p>
+                )}
               </div>
             </div>
           </div>
 
-          <div className="catalog-card">
+          <div className="catalog-card catalog-card--wide catalog-card--split">
             <h2>Mô hình AI</h2>
             <p className="catalog-card-note">Thêm phiên bản mới hoặc đổi model đang dùng mà không cần sửa code.</p>
             <form className="catalog-form" onSubmit={handleSaveModel}>
@@ -684,6 +717,7 @@ function CatalogAdminPage() {
               <button type="submit" disabled={saving}>Lưu mô hình</button>
             </form>
             <div className="catalog-list">
+              {catalog.ai_models.length === 0 && <p className="catalog-list-empty">Chưa có mô hình AI nào. Điền form bên trái để thêm mô hình đầu tiên.</p>}
               {catalog.ai_models.map((model) => (
                 <article className={`catalog-list-item ${model.is_active === false ? 'inactive' : ''}`} key={model._id || model.model_code}>
                   <div>
@@ -708,7 +742,7 @@ function CatalogAdminPage() {
             </div>
             {modelHealth && (
               <p className={`catalog-result ${modelHealth.status === 'OK' ? 'ok' : 'warn'}`}>
-                {modelHealth.status === 'OK' ? 'Model hoạt động tốt' : 'Model chưa sẵn sàng'}
+                {modelHealth.status === 'OK' ? 'Mô hình hoạt động tốt' : 'Mô hình chưa sẵn sàng'}
                 {' · '}{modelHealth.latency_ms || 0} ms
               </p>
             )}
@@ -718,32 +752,47 @@ function CatalogAdminPage() {
             <div className="catalog-card-title-row">
               <h2>Mẫu prompt</h2>
               <button type="button" className="catalog-ghost-button" onClick={handleTestPrompt} disabled={promptTesting}>
-                {promptTesting ? 'Đang build...' : 'Test prompt mẫu'}
+                {promptTesting ? 'Đang dựng prompt...' : 'Xem trước prompt'}
               </button>
             </div>
             <div className="prompt-layout">
-              <select value={selectedPromptKey} onChange={(e) => handleSelectPrompt(e.target.value)}>
-                <option value="">Chọn prompt</option>
+              <label className="catalog-model-field prompt-picker">
+                <span>Prompt cần sửa</span>
+                <select value={selectedPromptKey} onChange={(e) => handleSelectPrompt(e.target.value)}>
+                  <option value="">Tạo prompt mới</option>
                 {promptOptions.map((template) => (
                   <option key={template.template_key} value={template.template_key}>
-                    {template.name || template.template_key} - phiên bản {template.version}
-                  </option>
-                ))}
-              </select>
+                      {template.name || template.template_key} - phiên bản {template.version}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <form className="catalog-form" onSubmit={handleSavePrompt}>
-                <input placeholder="Mã prompt" value={promptForm.template_key} onChange={(e) => setPromptForm({ ...promptForm, template_key: e.target.value })} />
-                <input placeholder="Nhóm prompt" value={promptForm.kind} onChange={(e) => setPromptForm({ ...promptForm, kind: e.target.value })} />
-                <input placeholder="Tên prompt" value={promptForm.name} onChange={(e) => setPromptForm({ ...promptForm, name: e.target.value })} />
-                <textarea rows={9} value={promptForm.prompt_body} onChange={(e) => setPromptForm({ ...promptForm, prompt_body: e.target.value })} />
+                <label className="catalog-model-field">
+                  <span>Mã prompt</span>
+                  <input placeholder="Ví dụ: trac_nghiem" value={promptForm.template_key} onChange={(e) => setPromptForm({ ...promptForm, template_key: e.target.value })} />
+                </label>
+                <label className="catalog-model-field">
+                  <span>Nhóm prompt</span>
+                  <input placeholder="QUESTION_TYPE" value={promptForm.kind} onChange={(e) => setPromptForm({ ...promptForm, kind: e.target.value })} />
+                </label>
+                <label className="catalog-model-field">
+                  <span>Tên hiển thị</span>
+                  <input placeholder="Ví dụ: Trắc nghiệm 4 lựa chọn" value={promptForm.name} onChange={(e) => setPromptForm({ ...promptForm, name: e.target.value })} />
+                </label>
+                <label className="catalog-model-field">
+                  <span>Nội dung prompt</span>
+                  <textarea rows={9} value={promptForm.prompt_body} onChange={(e) => setPromptForm({ ...promptForm, prompt_body: e.target.value })} />
+                </label>
                 <button type="submit" disabled={saving}>Lưu phiên bản mới</button>
               </form>
             </div>
             {promptPreview && (
               <div className="prompt-preview">
                 <div className="catalog-card-title-row">
-                  <b>Prompt preview · {promptPreview.length} ký tự</b>
+                  <b>Xem trước prompt · {promptPreview.length} ký tự</b>
                   <span className={`catalog-status ${promptPreview.prompt_source === 'db' ? 'ok' : 'warn'}`}>
-                    {promptPreview.prompt_source}
+                    {promptPreview.prompt_source === 'db' ? 'Nguồn: CSDL' : 'Nguồn: tệp mặc định'}
                   </span>
                 </div>
                 <pre>{promptPreview.rendered_prompt}</pre>
@@ -761,7 +810,7 @@ function CatalogAdminPage() {
                       Sửa
                     </button>
                     <button type="button" onClick={() => handleActivatePrompt(template, !template.is_active)} disabled={saving}>
-                      {template.is_active ? 'Tắt active' : 'Activate'}
+                      {template.is_active ? 'Ngừng dùng' : 'Dùng phiên bản này'}
                     </button>
                   </div>
                 </article>
@@ -769,15 +818,26 @@ function CatalogAdminPage() {
             </div>
           </div>
 
-          <div className="catalog-card">
+          <div className="catalog-card catalog-card--wide catalog-card--split">
             <h2>Bộ tiêu chí đánh giá</h2>
+            <p className="catalog-card-note">Mỗi lần lưu tạo một phiên bản mới và áp dụng ngay phiên bản đó khi AI thẩm định câu hỏi.</p>
             <form className="catalog-form" onSubmit={handleSavePolicy}>
-              <input value={policyForm.policy_name} onChange={(e) => setPolicyForm({ ...policyForm, policy_name: e.target.value })} />
-              <textarea rows={7} value={policyForm.weights} onChange={(e) => setPolicyForm({ ...policyForm, weights: e.target.value })} />
-              <textarea rows={5} value={policyForm.thresholds} onChange={(e) => setPolicyForm({ ...policyForm, thresholds: e.target.value })} />
+              <label className="catalog-model-field">
+                <span>Tên bộ tiêu chí</span>
+                <input value={policyForm.policy_name} onChange={(e) => setPolicyForm({ ...policyForm, policy_name: e.target.value })} />
+              </label>
+              <label className="catalog-model-field">
+                <span>Trọng số (JSON)</span>
+                <textarea rows={7} value={policyForm.weights} onChange={(e) => setPolicyForm({ ...policyForm, weights: e.target.value })} />
+              </label>
+              <label className="catalog-model-field">
+                <span>Ngưỡng điểm (JSON)</span>
+                <textarea rows={5} value={policyForm.thresholds} onChange={(e) => setPolicyForm({ ...policyForm, thresholds: e.target.value })} />
+              </label>
               <button type="submit" disabled={saving}>Lưu phiên bản tiêu chí</button>
             </form>
             <div className="catalog-list">
+              {catalog.evaluation_policies.length === 0 && <p className="catalog-list-empty">Chưa có phiên bản tiêu chí nào được lưu.</p>}
               {catalog.evaluation_policies.map((policy) => (
                 <article className={`catalog-list-item ${policy.is_active ? '' : 'inactive'}`} key={policy._id || `${policy.policy_name}-${policy.version}`}>
                   <div>
@@ -789,7 +849,7 @@ function CatalogAdminPage() {
                       Sửa
                     </button>
                     <button type="button" onClick={() => handleActivatePolicy(policy, !policy.is_active)} disabled={saving}>
-                      {policy.is_active ? 'Tắt active' : 'Activate'}
+                      {policy.is_active ? 'Ngừng dùng' : 'Dùng phiên bản này'}
                     </button>
                   </div>
                 </article>

@@ -5,6 +5,7 @@ import { faClone, faTrashCan } from '@fortawesome/free-solid-svg-icons';
 import { createExam, deleteExam, duplicateExam, listExams } from '../api/exams';
 import { listSubjects } from '../api/catalog';
 import '../css/ExamListPage.css';
+import { notify } from '../utils/notify';
 
 function refId(value) {
   if (!value) return '';
@@ -18,6 +19,8 @@ const STATUS_LABEL = {
   FINALIZED: 'Đã chốt',
   ARCHIVED: 'Lưu trữ',
 };
+
+const LOCKED_STATUSES = new Set(['FINALIZED', 'ARCHIVED']);
 
 function statusKey(status) {
   return String(status || 'DRAFT').toUpperCase();
@@ -61,6 +64,17 @@ function ExamListPage() {
     listSubjects().then(setSubjects).catch(() => {});
   }, []);
 
+  const subjectLabel = (id) => {
+    const subject = subjects.find((item) => (item.id || item._id) === id);
+    return subject ? `${subject.subject_code} · ${subject.subject_name}` : '';
+  };
+
+  const deleteBlockedReason = (exam) => {
+    if (LOCKED_STATUSES.has(statusKey(exam.status))) return 'Đề đã chốt hoặc lưu trữ, không thể xoá';
+    if ((exam.variant_count || 0) > 0) return 'Đề đã có mã đề, hãy xoá mã đề trước';
+    return '';
+  };
+
   const openCreate = () => {
     setName('');
     setExamTitle('');
@@ -77,12 +91,12 @@ function ExamListPage() {
   const handleCreate = async (e) => {
     e.preventDefault();
     if (!name.trim() || !examTitle.trim() || !subjectId) {
-      alert('Vui lòng nhập đầy đủ tên đề thi, tên kỳ thi và môn học.');
+      notify('Vui lòng nhập đầy đủ tên đề thi, tên kỳ thi và môn học.');
       return;
     }
     const questionCountNumber = Number(questionCount);
     if (!Number.isInteger(questionCountNumber) || questionCountNumber < 1 || questionCountNumber > 200) {
-      alert('Số lượng câu hỏi phải là số nguyên từ 1 đến 200.');
+      notify('Số lượng câu hỏi phải là số nguyên từ 1 đến 200.');
       return;
     }
     setSaving(true);
@@ -97,7 +111,7 @@ function ExamListPage() {
       setCreating(false);
       navigate(`/lam-de-thi/${exam.id}`);
     } catch (err) {
-      alert('Tạo đề thi thất bại: ' + err.message);
+      notify('Tạo đề thi thất bại: ' + err.message);
     } finally {
       setSaving(false);
     }
@@ -110,7 +124,7 @@ function ExamListPage() {
       await deleteExam(exam.id);
       await fetchExams();
     } catch (err) {
-      alert('Xoá đề thi thất bại: ' + err.message);
+      notify('Xoá đề thi thất bại: ' + err.message);
     } finally {
       setDeletingId(null);
     }
@@ -122,7 +136,7 @@ function ExamListPage() {
       const duplicate = await duplicateExam(exam.id);
       navigate(`/lam-de-thi/${duplicate.id}`);
     } catch (err) {
-      alert('Nhân bản đề thi thất bại: ' + err.message);
+      notify('Nhân bản đề thi thất bại: ' + err.message);
     } finally {
       setDuplicatingId(null);
     }
@@ -161,7 +175,9 @@ function ExamListPage() {
                       {STATUS_LABEL[statusKey(exam.status)] || exam.status}
                     </span>
                   </div>
-                  <p className="exam-card-meta">{exam.exam_title}</p>
+                  <p className="exam-card-meta">
+                    {[exam.exam_title, subjectLabel(exam.subject_id)].filter(Boolean).join(' · ')}
+                  </p>
                   <div className="exam-card-stats">
                     <span>{exam.question_selected_count ?? exam.questions?.length ?? 0}/{exam.question_count} câu hỏi</span>
                     <span>{exam.variant_count ?? 0}/4 mã đề</span>
@@ -182,8 +198,8 @@ function ExamListPage() {
 	                    <button
 	                      type="button"
 	                      className="icon-btn icon-btn--danger"
-                      title="Xoá"
-                      disabled={deletingId === exam.id}
+                      title={deleteBlockedReason(exam) || 'Xoá'}
+                      disabled={deletingId === exam.id || Boolean(deleteBlockedReason(exam))}
                       onClick={() => handleDelete(exam)}
                     >
                       <FontAwesomeIcon icon={faTrashCan} />

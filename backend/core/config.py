@@ -134,6 +134,8 @@ class Settings(BaseModel):
     demo_admin_password: str = os.getenv("DEMO_ADMIN_PASSWORD", "")
     demo_reviewer_email: str = os.getenv("DEMO_REVIEWER_EMAIL", "reviewer@qbankctu.edu.vn")
     demo_reviewer_password: str = os.getenv("DEMO_REVIEWER_PASSWORD", "")
+    demo_teacher_email: str = os.getenv("DEMO_TEACHER_EMAIL", "teacher@qbankctu.edu.vn")
+    demo_teacher_password: str = os.getenv("DEMO_TEACHER_PASSWORD", "")
     demo_session_secret: str = os.getenv("DEMO_SESSION_SECRET", "")
     demo_session_ttl_hours: int = int(os.getenv("DEMO_SESSION_TTL_HOURS", "8"))
 

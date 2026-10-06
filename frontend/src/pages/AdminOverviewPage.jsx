@@ -52,8 +52,22 @@ const ENTITY_TYPE_LABEL = {
   'subject': 'Môn học',
 };
 
+const PIPELINE_STATUS_LABEL = {
+  NOT_STARTED: 'Chưa chạy',
+  QUEUED: 'Chờ chạy',
+  PROCESSING: 'Đang chạy',
+  COMPLETED: 'Hoàn tất',
+  FAILED: 'Lỗi',
+  CANCELLED: 'Đã hủy',
+};
+
+function pipelineStatusLabel(value) {
+  return PIPELINE_STATUS_LABEL[value] || value || '—';
+}
+
 function formatNumber(value) {
-  return new Intl.NumberFormat('vi-VN').format(value || 0);
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+  return new Intl.NumberFormat('vi-VN').format(value);
 }
 
 function formatDateTime(value) {
@@ -147,7 +161,7 @@ function AdminOverviewPage() {
         key: 'users',
         label: 'Người dùng hoạt động',
         value: users.active,
-        detail: `${formatNumber(users.teachers)} giảng viên · ${formatNumber(users.reviewers)} người duyệt`,
+        detail: `${formatNumber(users.teachers)} giảng viên · ${formatNumber(users.reviewers)} người duyệt${users.pending ? ` · ${formatNumber(users.pending)} chờ kích hoạt` : ''}`,
         icon: faUsers,
       },
       {
@@ -244,7 +258,7 @@ function AdminOverviewPage() {
                 <td>{item.subjects?.map((subject) => subject.name || subject.code || subject.id).join(', ') || 'Chưa gắn học phần'}</td>
                 <td>{({ UPLOADED: 'Đã tải lên', PROCESSING: 'Đang xử lý', READY: 'Sẵn sàng', FAILED: 'Lỗi' })[item.status] || item.status}</td>
                 <td>{item.page_count ?? '—'}</td>
-                <td className="overview-error-cell">{item.error_message || <><span>OCR: {item.pipeline_summary?.ocr_status || '—'}</span><small>Chunk: {item.pipeline_summary?.chunk_status || '—'}</small></>}</td>
+                <td className="overview-error-cell">{item.error_message || <><span>OCR: {pipelineStatusLabel(item.pipeline_summary?.ocr_status)}</span><small>Tách đoạn: {pipelineStatusLabel(item.pipeline_summary?.chunk_status)}</small></>}</td>
                 <td>{formatDateTime(item.updated_at)}</td>
               </tr>)}
             </tbody></table>
@@ -313,7 +327,7 @@ function AdminOverviewPage() {
         <section className="overview-panel">
           <div className="overview-panel-heading">
             <div>
-              <span>Chất lượng (Quality)</span>
+              <span>Chất lượng AI</span>
               <h2>Màu đánh giá</h2>
             </div>
             <FontAwesomeIcon icon={faClipboardCheck} />

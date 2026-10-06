@@ -118,7 +118,7 @@
 
 .jobs-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 150px 190px 170px 140px 140px 135px;
+  grid-template-columns: minmax(180px, 1fr) 160px 170px 190px 140px 140px 120px;
   gap: 16px;
   align-items: end;
   margin-bottom: 24px;
@@ -129,7 +129,7 @@
 }
 
 .jobs-toolbar--audit {
-  grid-template-columns: minmax(220px, 1fr) 210px 170px 170px 170px 160px 160px;
+  grid-template-columns: minmax(220px, 1.4fr) repeat(3, minmax(0, 1fr));
 }
 
 .toolbar-field {
@@ -236,7 +236,7 @@
 
 .jobs-table {
   width: 100%;
-  min-width: 940px;
+  min-width: 800px;
   border-collapse: collapse;
 }
 
@@ -282,7 +282,7 @@
 
 .entity-text,
 .error-cell {
-  max-width: 220px;
+  max-width: 190px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -457,6 +457,7 @@
 
 @media (max-width: 1080px) {
   .jobs-toolbar,
+  .jobs-toolbar--audit,
   .jobs-layout {
     grid-template-columns: 1fr;
   }

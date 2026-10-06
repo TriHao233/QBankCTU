@@ -71,6 +71,7 @@
 .document-subjects { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; }
 .document-subjects span { padding: 5px 8px; border-radius: 7px; background: #f2f4f7; color: #344054; font-size: .72rem; font-weight: 700; }
 .document-subjects em { color: var(--doc-muted); font-size: .78rem; }
+.document-error-line { margin: 0; padding: 7px 10px; border-radius: 8px; background: #fef3f2; color: #b42318; font-size: .76rem; font-weight: 600; }
 .document-card-actions { flex-wrap: wrap; gap: 7px; padding-top: 4px; border-top: 1px solid var(--doc-line); }
 .document-card-actions button { display: inline-flex; align-items: center; gap: 6px; padding: 7px 9px; font-size: .72rem; }
 .document-card-actions button:hover:not(:disabled) { border-color: var(--doc-blue); color: var(--doc-blue); }

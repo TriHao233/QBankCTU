@@ -7,18 +7,22 @@ import {
   faFileLines,
   faMagnifyingGlass,
   faPen,
+  faRotateRight,
   faTrashCan,
   faUpload,
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
 import {
   deleteDocument,
+  listDocumentJobs,
   listDocumentPages,
   listDocuments,
   reindexDocument,
+  retryDocumentJob,
   updateDocument,
 } from '../api/documents';
 import { listSubjects } from '../api/catalog';
+import { canAccessPath } from '../auth/permissions';
 import { AuthContext } from '../context/AuthContext';
 import '../css/DocumentManagePage.css';
 
@@ -171,6 +175,27 @@ function DocumentManagePage() {
     }
   };
 
+  const retryProcessing = async (document) => {
+    setBusyId(document.id);
+    setError('');
+    try {
+      const result = await listDocumentJobs(document.id, { limit: 20 });
+      const retryable = (result.items || []).filter((item) => item.can_retry);
+      const job = retryable.find((item) => item.id === document.latest_error?.job_id) || retryable[0];
+      if (!job) {
+        setError('Không có tác vụ lỗi nào có thể chạy lại cho tài liệu này.');
+        return;
+      }
+      await retryDocumentJob(document.id, job.id);
+      setNotice(`Đã đưa tác vụ ${job.job_type || 'xử lý'} của “${document.title}” vào hàng đợi chạy lại.`);
+      await loadDocuments();
+    } catch (err) {
+      setError(err.message || 'Không thể chạy lại xử lý tài liệu');
+    } finally {
+      setBusyId('');
+    }
+  };
+
   const openPreview = async (document) => {
     setPreview({ document, pages: [] });
     setPreviewLoading(true);
@@ -193,9 +218,11 @@ function DocumentManagePage() {
           <h1>Quản lý tài liệu</h1>
           <p>Quản lý tài liệu đã tải lên, nội dung OCR và phạm vi sử dụng giữa các học phần.</p>
         </div>
-        <button type="button" className="document-primary-btn" onClick={() => navigate('/sinh-cau-hoi')}>
-          <FontAwesomeIcon icon={faUpload} /> Tải tài liệu mới
-        </button>
+        {canAccessPath(user, '/sinh-cau-hoi') && (
+          <button type="button" className="document-primary-btn" onClick={() => navigate('/sinh-cau-hoi')} title="Tài liệu được tải lên ở bước đầu của trang Sinh câu hỏi">
+            <FontAwesomeIcon icon={faUpload} /> Tải tài liệu mới
+          </button>
+        )}
       </header>
 
       <section className="document-stats" aria-label="Thống kê tài liệu">
@@ -229,6 +256,7 @@ function DocumentManagePage() {
           const assignedSubjects = documentSubjectIds(document).map((id) => subjectById.get(id)).filter(Boolean);
           const manageable = canManage(document);
           const canReindex = document.pipeline_summary?.chunk_status === 'COMPLETED';
+          const failed = document.status === 'FAILED';
           return (
             <article className="document-card" key={document.id}>
               <div className="document-card-head">
@@ -248,10 +276,17 @@ function DocumentManagePage() {
                   <span key={idOf(subject)}><FontAwesomeIcon icon={faBook} /> {subject.subject_name}</span>
                 )) : <em>Chưa gắn học phần</em>}
               </div>
+              {failed && (document.latest_error?.message || document.latest_error?.detail) && (
+                <p className="document-error-line">Lỗi xử lý: {document.latest_error.message || document.latest_error.detail}</p>
+              )}
               <div className="document-card-actions">
                 <button type="button" onClick={() => openPreview(document)}><FontAwesomeIcon icon={faFileLines} /> Xem OCR</button>
                 <button type="button" disabled={!manageable} onClick={() => openEdit(document)}><FontAwesomeIcon icon={faPen} /> Chỉnh sửa</button>
-                <button type="button" disabled={!manageable || !canReindex || busyId === document.id} onClick={() => reindex(document)} title={!canReindex ? 'Tài liệu cần chunk thành công trước' : ''}><FontAwesomeIcon icon={faArrowsRotate} /> Re-index</button>
+                {failed ? (
+                  <button type="button" disabled={!manageable || busyId === document.id} onClick={() => retryProcessing(document)}><FontAwesomeIcon icon={faRotateRight} /> Chạy lại xử lý</button>
+                ) : (
+                  <button type="button" disabled={!manageable || !canReindex || busyId === document.id} onClick={() => reindex(document)} title={canReindex ? 'Tạo lại chỉ mục tìm kiếm từ các đoạn đã tách' : 'Tài liệu cần xử lý xong trước khi lập chỉ mục lại'}><FontAwesomeIcon icon={faArrowsRotate} /> Lập chỉ mục lại</button>
+                )}
                 <button type="button" className="danger" disabled={!manageable || busyId === document.id} onClick={() => removeDocument(document)}><FontAwesomeIcon icon={faTrashCan} /> Xóa</button>
               </div>
             </article>

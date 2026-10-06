@@ -135,3 +135,18 @@ def test_admin_sends_one_email_when_submitting_status_with_optional_message(serv
     else:
         service._email_user_status.assert_called_once()
         service._email_user_reply.assert_not_called()
+
+
+def test_reviewer_can_open_support_ticket(service, monkeypatch):
+    from modules.contact.schemas import ContactRequestCreate
+
+    monkeypatch.setattr(service, "_email_admin_new_ticket", lambda *args, **kwargs: None)
+    service.repo.create_request.side_effect = lambda record: record
+    service.repo.next_ticket_sequence.return_value = 7
+    reviewer_id = ObjectId()
+    created = service.create_request(
+        ContactRequestCreate(category="SUPPORT", title=" Cần hỗ trợ ", content="Không mở được hàng duyệt"),
+        user(reviewer_id, "Reviewer"),
+    )
+    assert created["user_id"] == str(reviewer_id)
+    assert created["title"] == "Cần hỗ trợ"

@@ -13,8 +13,19 @@ import {
   faEnvelope,
 } from '@fortawesome/free-solid-svg-icons';
 import { AuthContext } from '../context/AuthContext';
+import { canAccessPath } from '../auth/permissions';
 import { buildFallbackAvatar, normalizeAvatarUrl } from '../utils/avatarUrl';
 import './UserProfileMenu.css';
+
+// Pages reachable by the role but not shown in the header menu.
+const ACCOUNT_LINKS = [
+  { to: '/quan-ly-hoc-phan', label: 'Học phần của tôi', icon: faBook },
+  { to: '/quan-ly-tai-lieu', label: 'Quản lý tài liệu', icon: faFileLines, skipRoles: ['Teacher'] },
+  { to: '/lich-cong-viec', label: 'Lịch công việc', icon: faCalendarCheck, skipRoles: ['Reviewer'] },
+  { to: '/lien-he?tab=all', label: 'Yêu cầu liên hệ', icon: faEnvelope, skipRoles: ['Teacher', 'Reviewer'] },
+  { to: '/nhat-ky-he-thong', label: 'Nhật ký hệ thống', icon: faClockRotateLeft },
+  { to: '/quan-ly-job', label: 'Hàng đợi tác vụ', icon: faListCheck },
+];
 
 const UserProfileMenu = () => {
   const [isOpen, setIsOpen] = useState(false);
@@ -63,7 +74,9 @@ const UserProfileMenu = () => {
   };
   const displayName = user.display_name || 'Người dùng';
   const displayRole = roleLabel[user.role] || user.role || 'Người dùng';
-  const canOpenSettings = user.role === 'Admin';
+  const menuLinks = ACCOUNT_LINKS.filter((link) => (
+    !link.skipRoles?.includes(user.role) && canAccessPath(user, link.to.split('?')[0])
+  ));
   
   // Tự động generate avatar dựa trên tên người dùng
   const avatarUrl = normalizeAvatarUrl(user.profile?.avatar) || buildFallbackAvatar(displayName);
@@ -103,46 +116,12 @@ const UserProfileMenu = () => {
             Hồ sơ cá nhân
           </Link>
 
-          {user.role === 'Teacher' && (
-            <>
-              <Link to="/quan-ly-hoc-phan" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faBook} className="dropdown-icon" />
-                Quản lý học phần
-              </Link>
-              <Link to="/quan-ly-tai-lieu" className="dropdown-item dropdown-item--nested" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faFileLines} className="dropdown-icon" />
-                Quản lý tài liệu
-              </Link>
-              <Link to="/quan-ly" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faListCheck} className="dropdown-icon" />
-                Quản lý câu hỏi
-              </Link>
-            </>
-          )}
-
-          {['Admin', 'Reviewer'].includes(user.role) && (
-            <Link to="/lich-cong-viec" className="dropdown-item" onClick={() => setIsOpen(false)}>
-              <FontAwesomeIcon icon={faCalendarCheck} className="dropdown-icon" />
-              Lịch công việc
+          {menuLinks.map((link) => (
+            <Link key={link.to} to={link.to} className="dropdown-item" onClick={() => setIsOpen(false)}>
+              <FontAwesomeIcon icon={link.icon} className="dropdown-icon" />
+              {link.label}
             </Link>
-          )}
-
-          {canOpenSettings && (
-            <>
-              <Link to="/lien-he?tab=all" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faEnvelope} className="dropdown-icon" />
-                Xem liên hệ
-              </Link>
-              <Link to="/nhat-ky-he-thong" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faClockRotateLeft} className="dropdown-icon" />
-                Lịch sử dùng
-              </Link>
-              <Link to="/quan-ly-job" className="dropdown-item" onClick={() => setIsOpen(false)}>
-                <FontAwesomeIcon icon={faListCheck} className="dropdown-icon" />
-                Tác vụ hệ thống
-              </Link>
-            </>
-          )}
+          ))}
           
           <div className="dropdown-divider"></div>
           

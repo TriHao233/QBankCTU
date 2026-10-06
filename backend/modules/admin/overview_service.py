@@ -221,14 +221,14 @@ class AdminOverviewService:
             },
             {
                 "key": "retryable_jobs",
-                "label": "Job cần xử lý",
+                "label": "Tác vụ cần xử lý",
                 "count": retryable_job_count,
                 "severity": "danger" if retryable_job_count else "neutral",
                 "path": "/quan-ly-job?status=retryable",
             },
             {
                 "key": "long_running_jobs",
-                "label": "Job quá ngưỡng",
+                "label": "Tác vụ quá ngưỡng",
                 "count": long_running_job_count,
                 "severity": "warning" if long_running_job_count else "neutral",
                 "path": "/quan-ly-job?stale_only=true",
@@ -345,6 +345,7 @@ class AdminOverviewService:
             "admins": self._count("users", {"role": "Admin", "is_active": True}),
             "teachers": self._count("users", {"role": "Teacher", "is_active": True}),
             "reviewers": self._count("users", {"role": "Reviewer", "is_active": True}),
+            "pending": self._count("users", {"approval_status": "PENDING"}),
         }
 
     def _question_summary(self) -> dict:
