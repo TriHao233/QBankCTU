@@ -32,7 +32,10 @@ import {
   submitQuestionForReview,
   updateQuestion,
   updateQuestionSharing,
+  transferQuestionOwner,
+  withdrawQuestionSubmission,
 } from '../api/questions';
+import ArchivedQuestionsModal from '../components/ArchivedQuestionsModal';
 import {
   cancelDocumentJob,
   deleteDocument,
@@ -558,6 +561,7 @@ function ManagePage() {
     cloIds: [],
   });
   const [deletingId, setDeletingId] = useState(null);
+  const [archivedOpen, setArchivedOpen] = useState(false);
   const [duplicatingQuestionId, setDuplicatingQuestionId] = useState(null);
   const [deletingDocId, setDeletingDocId] = useState(null);
   const [workflowBusyId, setWorkflowBusyId] = useState(null);
@@ -1202,12 +1206,25 @@ function ManagePage() {
   };
 
   const handleDelete = async (item) => {
-    if (!window.confirm(`Đưa câu hỏi "${item.question_code}" vào lưu trữ? Câu hỏi sẽ bị ẩn khỏi ngân hàng.`)) {
+    let reason = '';
+    if (item.review_status === 'PENDING') {
+      if (user?.role !== 'Admin') {
+        alert('Câu hỏi đang chờ duyệt. Hãy rút lại khỏi hàng đợi trước khi lưu trữ.');
+        return;
+      }
+      reason = (window.prompt(
+        `Câu hỏi "${item.question_code}" đang chờ duyệt. Nhập lý do lưu trữ (Reviewer đang giữ câu sẽ được thông báo):`,
+      ) || '').trim();
+      if (reason.length < 5) {
+        if (reason) alert('Lý do cần ít nhất 5 ký tự.');
+        return;
+      }
+    } else if (!window.confirm(`Đưa câu hỏi "${item.question_code}" vào lưu trữ? Câu hỏi sẽ bị ẩn khỏi ngân hàng.`)) {
       return;
     }
     setDeletingId(item.id);
     try {
-      await deleteQuestion(item.id);
+      await deleteQuestion(item.id, reason);
       await fetchQuestions(searchTerm);
     } catch (error) {
       alert('Xoá câu hỏi thất bại: ' + error.message);
@@ -1236,16 +1253,37 @@ function ManagePage() {
       item,
       sharedScope: item.shared_scope || 'PRIVATE',
       sharedWithUserIds: item.shared_with_user_ids || [],
-      ownerUserId: item.uploaded_by_user_id || '',
+      sharedEditUserIds: item.shared_edit_user_ids || [],
+      ownerUserId: '',
+      transferReason: '',
+    });
+  };
+
+  const toggleSharingEditor = (userId) => {
+    setSharingDraft((current) => {
+      const editors = new Set(current.sharedEditUserIds || []);
+      const viewers = new Set(current.sharedWithUserIds || []);
+      if (editors.has(userId)) {
+        editors.delete(userId);
+      } else {
+        editors.add(userId);
+        viewers.add(userId);
+      }
+      return { ...current, sharedEditUserIds: Array.from(editors), sharedWithUserIds: Array.from(viewers) };
     });
   };
 
   const toggleSharingUser = (userId) => {
     setSharingDraft((current) => {
       const selected = new Set(current.sharedWithUserIds || []);
-      if (selected.has(userId)) selected.delete(userId);
-      else selected.add(userId);
-      return { ...current, sharedWithUserIds: Array.from(selected) };
+      const editors = new Set(current.sharedEditUserIds || []);
+      if (selected.has(userId)) {
+        selected.delete(userId);
+        editors.delete(userId);
+      } else {
+        selected.add(userId);
+      }
+      return { ...current, sharedWithUserIds: Array.from(selected), sharedEditUserIds: Array.from(editors) };
     });
   };
 
@@ -1259,8 +1297,18 @@ function ManagePage() {
       shared_scope: sharingDraft.sharedScope,
     };
     try {
+      if (sharingDraft.ownerUserId && (sharingDraft.transferReason || '').trim().length < 5) {
+        setSharingError('Cần nêu lý do chuyển chủ sở hữu (ít nhất 5 ký tự).');
+        return;
+      }
       if (sharingDraft.kind === 'question') {
-        await updateQuestionSharing(sharingDraft.item.id, payload);
+        await updateQuestionSharing(sharingDraft.item.id, {
+          ...payload,
+          shared_edit_user_ids: sharingDraft.sharedEditUserIds || [],
+        });
+        if (sharingDraft.ownerUserId) {
+          await transferQuestionOwner(sharingDraft.item.id, sharingDraft.ownerUserId, sharingDraft.transferReason.trim());
+        }
         const items = await fetchQuestions(searchTerm);
         const fresh = items.find((question) => question.id === sharingDraft.item.id);
         if (fresh) setSelectedQuestion(fresh);
@@ -1268,6 +1316,7 @@ function ManagePage() {
         await updateDocumentSharing(sharingDraft.item.id, {
           ...payload,
           owner_user_id: sharingDraft.ownerUserId || null,
+          owner_transfer_reason: sharingDraft.ownerUserId ? sharingDraft.transferReason.trim() : null,
         });
         await fetchDocuments();
       }
@@ -1621,12 +1670,35 @@ function ManagePage() {
       alert('Câu hỏi này không còn ở trạng thái có thể gửi duyệt.');
       return;
     }
+    let responseNote = '';
+    if (item.review_status === 'NEEDS_REVISION') {
+      responseNote = (window.prompt(
+        'Câu hỏi chưa được sửa kể từ yêu cầu chỉnh sửa. Nhập ghi chú phản hồi Reviewer (ít nhất 10 ký tự):',
+      ) || '').trim();
+      if (responseNote.length < 10) {
+        if (responseNote) alert('Ghi chú phản hồi cần ít nhất 10 ký tự.');
+        return;
+      }
+    }
     setWorkflowBusyId(item.id);
     try {
-      await submitQuestionForReview(item.id);
+      await submitQuestionForReview(item.id, responseNote);
       await refreshAfterWorkflow('Đã gửi duyệt và tự động đưa câu hỏi vào hàng đợi thẩm định AI.', item);
     } catch (error) {
       alert('Gửi duyệt thất bại: ' + error.message);
+    } finally {
+      setWorkflowBusyId(null);
+    }
+  };
+
+  const handleWithdrawSubmission = async (item) => {
+    if (!window.confirm(`Rút câu hỏi "${item.question_code}" về nháp? Chỉ rút được khi chưa reviewer nào nhận.`)) return;
+    setWorkflowBusyId(item.id);
+    try {
+      await withdrawQuestionSubmission(item.id, item.current_version);
+      await refreshAfterWorkflow('Đã rút câu hỏi về nháp.', item);
+    } catch (error) {
+      alert('Rút lại thất bại: ' + error.message);
     } finally {
       setWorkflowBusyId(null);
     }
@@ -2081,7 +2153,19 @@ function ManagePage() {
                 <b>{counts.NEEDS_REVISION}</b>
                 <span>Cần sửa</span>
               </button>
+              {canEditQuestions && (
+                <button type="button" className="stat-card" onClick={() => setArchivedOpen(true)}>
+                  <b><FontAwesomeIcon icon={faTrashCan} /></b>
+                  <span>Lưu trữ</span>
+                </button>
+              )}
             </div>
+            {archivedOpen && (
+              <ArchivedQuestionsModal
+                onClose={() => setArchivedOpen(false)}
+                onRestored={() => fetchQuestions(searchTerm)}
+              />
+            )}
 
             <div className={`coverage-panel ${coverageOpen ? '' : 'coverage-panel--collapsed'}`}>
               <button
@@ -2560,6 +2644,18 @@ function ManagePage() {
                               onClick={() => handleSubmitForReview(item)}
                             >
                               Gửi duyệt
+                            </button>
+                          )}
+                          {canEditQuestions && item.review_status === 'PENDING'
+                            && item.review_assignment?.status !== 'IN_REVIEW' && (
+                            <button
+                              type="button"
+                              className="mini-action"
+                              title="Rút câu hỏi về nháp khi chưa reviewer nào nhận"
+                              disabled={workflowBusyId === item.id}
+                              onClick={() => handleWithdrawSubmission(item)}
+                            >
+                              Rút lại
                             </button>
                           )}
                           {canReviewQuestions && (
@@ -3083,10 +3179,16 @@ function ManagePage() {
                 <option value="PRIVATE">Riêng tư</option>
                 <option value="SUBJECT">Chia sẻ theo môn</option>
               </select>
+              {sharingDraft.sharedScope === 'SUBJECT' && (
+                <p className="field-hint">
+                  Chỉ giảng viên dạy cùng học phần (do Admin gán hoặc tự tạo học phần) mới thấy. Học phần đang chờ duyệt
+                  chưa thể chia sẻ.
+                </p>
+              )}
             </div>
-            {sharingDraft.kind === 'document' && (
+            {sharingDraft.kind === 'question' && user?.role === 'Admin' && (
               <div className="field-group">
-                <label className="field-label">Chủ sở hữu tài liệu</label>
+                <label className="field-label">Chuyển chủ sở hữu câu hỏi (Admin)</label>
                 <select
                   className="field-select"
                   value={sharingDraft.ownerUserId}
@@ -3102,6 +3204,50 @@ function ManagePage() {
                     </option>
                   ))}
                 </select>
+                {sharingDraft.ownerUserId && (
+                  <input
+                    className="field-input"
+                    placeholder="Lý do chuyển chủ sở hữu"
+                    value={sharingDraft.transferReason}
+                    onChange={(event) => setSharingDraft((current) => ({
+                      ...current,
+                      transferReason: event.target.value,
+                    }))}
+                  />
+                )}
+              </div>
+            )}
+            {sharingDraft.kind === 'document' && user?.role === 'Admin' && (
+              <div className="field-group">
+                <label className="field-label">Chuyển chủ sở hữu tài liệu (Admin)</label>
+                <select
+                  className="field-select"
+                  value={sharingDraft.ownerUserId}
+                  onChange={(event) => setSharingDraft((current) => ({
+                    ...current,
+                    ownerUserId: event.target.value,
+                  }))}
+                >
+                  <option value="">Không đổi owner</option>
+                  {teacherOptions
+                    .filter((teacher) => teacher.id !== sharingDraft.item.uploaded_by_user_id)
+                    .map((teacher) => (
+                      <option key={teacher.id} value={teacher.id}>
+                        {teacher.display_name || teacher.email || teacher.id}
+                      </option>
+                    ))}
+                </select>
+                {sharingDraft.ownerUserId && (
+                  <input
+                    className="field-input"
+                    placeholder="Lý do chuyển chủ sở hữu"
+                    value={sharingDraft.transferReason}
+                    onChange={(event) => setSharingDraft((current) => ({
+                      ...current,
+                      transferReason: event.target.value,
+                    }))}
+                  />
+                )}
               </div>
             )}
             <div className="field-group">
@@ -3118,6 +3264,18 @@ function ManagePage() {
                       <b>{teacher.display_name || teacher.email}</b>
                       {teacher.email}
                     </span>
+                    {sharingDraft.kind === 'question' && (
+                      <span className="sharing-edit-toggle">
+                        <input
+                          type="checkbox"
+                          aria-label="Cho phép sửa"
+                          title="Được sửa và tạo phiên bản mới, không được xoá hay chia sẻ lại"
+                          checked={(sharingDraft.sharedEditUserIds || []).includes(teacher.id)}
+                          onChange={() => toggleSharingEditor(teacher.id)}
+                        />
+                        Cho sửa
+                      </span>
+                    )}
                   </label>
                 ))}
                 {teacherOptions.length === 0 && (

@@ -22,6 +22,7 @@ import {
   publishQuestionToMoodle,
   releaseQuestionReview,
   reviewQuestion,
+  listReviewReasons,
   saveQuestionReviewDraft,
   updateQuestionComment,
 } from '../api/questions';
@@ -43,10 +44,11 @@ import {
   mergeAiSuggestionsIntoDraft,
 } from '../utils/reviewAiSuggestions';
 import { hasEffectivePermission } from '../auth/permissions';
-import { overrideRequired, isAiRunning, selfReviewReasonRequired } from '../utils/reviewDecisionRules';
+import { overrideRequired, isAiRunning, breakGlassReasonRequired, BREAK_GLASS_REASON_MIN } from '../utils/reviewDecisionRules';
 import { shouldRenewLock, renewIntervalMs } from '../utils/reviewLock';
 import { scoreToPercent, percentToScore } from '../utils/reviewPolicy';
 import { assignmentReasonLabel, reviewerFlagLabel } from '../utils/reviewAssignment';
+import { submissionCheckFlags, submissionCheckWarnings, unacknowledgedFlags } from '../utils/submissionChecks';
 import '../css/ReviewQueuePage.css';
 
 const REVIEW_STATUS_LABEL = {
@@ -221,10 +223,12 @@ function defaultReviewDraft(question, decision) {
     questionCode: question.question_code,
     decision,
     overallNote: '',
+    reasonCodes: [],
     overrideReason: '',
     selfReviewReason: '',
     secondaryRequired: false,
     secondaryReason: '',
+    acknowledgedFlags: [],
     checklist: REVIEW_RUBRIC.map((item) => ({
       ...item,
       passed: decision === 'APPROVED',
@@ -257,6 +261,8 @@ function loadReviewDraft(question, decision) {
     return {
       ...fallback,
       ...parsed,
+      // Acknowledgements are not restored: the reviewer confirms the current flags in this session.
+      acknowledgedFlags: [],
       checklist: REVIEW_RUBRIC.map((item) => {
         const savedItem = (parsed.checklist || []).find((entry) => entry.key === item.key);
         return savedItem ? { ...item, ...savedItem } : { ...item, passed: false, note: '' };
@@ -551,6 +557,13 @@ function ReviewQueuePage() {
   const [busyId, setBusyId] = useState('');
   const [bulkBusy, setBulkBusy] = useState(false);
   const [reviewDraft, setReviewDraft] = useState(null);
+  const [reviewReasons, setReviewReasons] = useState([]);
+
+  useEffect(() => {
+    listReviewReasons()
+      .then((result) => setReviewReasons(result.items || []))
+      .catch(() => setReviewReasons([]));
+  }, []);
   const [serverReviewDraft, setServerReviewDraft] = useState(null);
   const [draftSaveState, setDraftSaveState] = useState('');
   const [reviewFormError, setReviewFormError] = useState('');
@@ -577,7 +590,7 @@ function ReviewQueuePage() {
   const lastActivityAt = useRef(Date.now());
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
-  const lockTimeout = reviewPolicy?.lock_timeout_minutes || 30;
+  const lockTimeout = reviewPolicy?.lock_timeout_minutes || 120;
   const lockLostMessage = 'Bạn không còn giữ câu này — người khác đã nhận. Bản nháp đánh giá vẫn được lưu.';
   const applyRenewedQuestion = (fresh) => {
     setSelected((current) => current?.id === fresh.id ? fresh : current);
@@ -586,7 +599,7 @@ function ReviewQueuePage() {
   const renewExpiredReview = async (question) => {
     if (assignmentOf(question).status === 'IN_REVIEW' && isAssignmentMine(question, user) && isReviewLockExpired(assignmentOf(question))) {
       try { const fresh = await renewQuestionReview(question.id); applyRenewedQuestion(fresh); }
-      catch (err) { throw new Error([400, 403, 409].includes(err.status) ? lockLostMessage : err.message); }
+      catch (err) { throw new Error([403, 409].includes(err.status) ? lockLostMessage : err.message); }
     }
   };
   useEffect(() => {
@@ -610,7 +623,10 @@ function ReviewQueuePage() {
       running = true;
       try { const fresh = await renewQuestionReview(question.id); if (!stopped) applyRenewedQuestion(fresh); }
       catch (err) {
-        if (!stopped && [400, 403, 409].includes(err.status)) { stopped = true; window.clearInterval(interval); setError(lockLostMessage); }
+        if (!stopped && [400, 403, 409].includes(err.status)) {
+          stopped = true; window.clearInterval(interval);
+          setError(err.status === 400 && err.message ? err.message : lockLostMessage);
+        }
         else if (!stopped) setError(err.message || 'Không gia hạn được câu. Vui lòng thử lại.');
       } finally { running = false; }
     };
@@ -988,7 +1004,6 @@ function ReviewQueuePage() {
 
   const canReviewQuestion = (question) => {
     if (!question || question.review_status !== 'PENDING') return false;
-    if (user?.role === 'Admin') return true;
     const assignment = assignmentOf(question);
     return (
       assignment.status === 'IN_REVIEW'
@@ -997,8 +1012,6 @@ function ReviewQueuePage() {
   };
 
   const openReviewForm = async (question, decision, { aiEvaluation = null } = {}) => {
-    if (user?.role === 'Admin' && assignmentOf(question).status === 'IN_REVIEW' && !isAssignmentMine(question, user) && !isReviewLockExpired(assignmentOf(question))
-      && !window.confirm(`Câu này đang được ${reviewerLabelForQuestion(question)} xử lý. Bạn vẫn muốn kiểm duyệt thay?`)) return;
     try { await renewExpiredReview(question); } catch (err) { setError(err.message); return; }
     if (!canReviewQuestion(question)) {
       alert('Bạn cần nhận câu hỏi và giữ quyền xử lý còn hiệu lực trước khi kiểm duyệt.');
@@ -1127,9 +1140,25 @@ function ReviewQueuePage() {
   const claimReview = async (question) => {
     setBusyId(question.id);
     try {
-      if (assignmentOf(question).status === 'IN_REVIEW' && isAssignmentMine(question, user)) {
+      const assignment = assignmentOf(question);
+      if (assignment.status === 'IN_REVIEW' && isAssignmentMine(question, user)) {
         const fresh = await renewQuestionReview(question.id); applyRenewedQuestion(fresh);
-      } else { await claimQuestionReview(question.id); await refreshAfterAction(question); }
+      } else {
+        let reason = '';
+        const heldByOther = ['IN_REVIEW', 'ASSIGNED'].includes(assignment.status)
+          && !isAssignmentMine(question, user) && !isReviewLockExpired(assignment);
+        if (heldByOther) {
+          reason = (window.prompt(
+            `Câu này đang được ${reviewerLabelForQuestion(question)} giữ. Nhập lý do tiếp nhận (người đó sẽ được thông báo):`,
+          ) || '').trim();
+          if (reason.length < 5) {
+            if (reason) alert('Lý do tiếp nhận cần ít nhất 5 ký tự.');
+            return;
+          }
+        }
+        await claimQuestionReview(question.id, reason);
+        await refreshAfterAction(question);
+      }
     } catch (err) {
       alert('Nhận câu kiểm duyệt thất bại: ' + err.message);
     } finally {
@@ -1261,6 +1290,10 @@ function ReviewQueuePage() {
       setReviewFormError('Không thể duyệt khi còn tiêu chí “Không đạt”. Hãy chọn Cần sửa hoặc ghi nhận lại tiêu chí.');
       return;
     }
+    if (reviewDraft.decision === 'APPROVED' && unacknowledgedFlags(selected, reviewDraft.acknowledgedFlags).length > 0) {
+      setReviewFormError('Cần đánh dấu đã xem từng cảnh báo tự động trước khi duyệt.');
+      return;
+    }
     const needsOverride = overrideRequired(selected, reviewDraft.decision);
     if (needsOverride && !reviewDraft.overrideReason.trim()) {
       setReviewFormError('Cần ghi lý do khi duyệt câu mà AI đề xuất xem lại.');
@@ -1274,15 +1307,30 @@ function ReviewQueuePage() {
       setReviewFormError('Cần thêm ít nhất một lỗi để giảng viên sửa.');
       return;
     }
-    if (selfReviewReasonRequired(selected, user) && !reviewDraft.selfReviewReason?.trim()) {
-      setReviewFormError('Cần ghi lý do tự duyệt vì bạn là người tạo/sửa câu này.'); return;
+    const reasonCodes = reviewDraft.reasonCodes || [];
+    if (['REJECTED', 'NEEDS_REVISION'].includes(reviewDraft.decision)) {
+      if (reasonCodes.length === 0) {
+        setReviewFormError('Cần chọn ít nhất một lý do theo danh mục chuẩn.');
+        return;
+      }
+      if (reasonCodes.includes('OTHER') && !overallNote) {
+        setReviewFormError('Lý do khác cần ghi rõ trong ghi chú tổng.');
+        return;
+      }
+    }
+    if (breakGlassReasonRequired(selected, user) && (reviewDraft.selfReviewReason?.trim().length || 0) < BREAK_GLASS_REASON_MIN) {
+      setReviewFormError(`Bạn là người tạo/sửa câu này: chỉ được tự duyệt khẩn cấp khi không còn reviewer khác, và phải ghi lý do tối thiểu ${BREAK_GLASS_REASON_MIN} ký tự.`); return;
     }
     if (isAiRunning(selected) && !window.confirm('AI đang đánh giá câu này. Chốt kết quả sẽ dừng lượt đánh giá AI. Tiếp tục?')) return;
     const payload = {
-      ...(selfReviewReasonRequired(selected, user) ? { self_review_reason: reviewDraft.selfReviewReason.trim() } : {}),
+      ...(breakGlassReasonRequired(selected, user) ? { self_review_reason: reviewDraft.selfReviewReason.trim() } : {}),
       expected_version: selected.current_version,
       decision: reviewDraft.decision,
       note: overallNote,
+      reason_codes: reviewDraft.decision === 'APPROVED' ? [] : reasonCodes,
+      acknowledged_flags: reviewDraft.decision === 'APPROVED'
+        ? submissionCheckFlags(selected).map((item) => item.flag).filter((flag) => (reviewDraft.acknowledgedFlags || []).includes(flag))
+        : [],
       review_form: {
         checklist: reviewDraft.checklist.map((item) => ({
           key: item.key,
@@ -1620,7 +1668,7 @@ function ReviewQueuePage() {
         <section className="review-policy-panel">
           <h2>Chính sách duyệt lần 2</h2>
           {policyError && <p className="review-form-error">{policyError}</p>}
-          {reviewPolicy && <p>Thời gian giữ câu: {reviewPolicy.lock_timeout_minutes} phút · Hạn nhận câu được giao: {reviewPolicy.assignment_timeout_hours} giờ</p>}
+          {reviewPolicy && <p>Thời gian giữ câu: {reviewPolicy.lock_timeout_minutes} phút · Giữ tối đa {reviewPolicy.max_held_questions ?? 20} câu, gia hạn tối đa {reviewPolicy.max_lock_renewals ?? 3} lần · Hạn nhận câu được giao: {reviewPolicy.assignment_timeout_hours} giờ</p>}
           {policyDraft && <form onSubmit={savePolicy}>
             <fieldset disabled={user?.role !== 'Admin' || policyBusy}>
               <label><input type="checkbox" checked={Boolean(policyDraft.secondary_on_override)} onChange={(event) => setPolicyDraft({ ...policyDraft, secondary_on_override: event.target.checked })} />Bắt duyệt lần 2 khi người duyệt vẫn duyệt dù AI đề xuất xem lại</label>
@@ -1632,7 +1680,7 @@ function ReviewQueuePage() {
           {reviewPolicy && <p>Cập nhật lần cuối: {formatDate(reviewPolicy.updated_at)}</p>}
           {user?.role === 'Admin' && Boolean(dashboard?.reviewers?.length) && <>
             <h2>Người duyệt</h2><div className="review-reviewers-table-wrap"><table className="review-reviewers-table"><thead><tr>{['Người duyệt', 'Đang giữ', '7 ngày / 30 ngày', 'Tỷ lệ duyệt', 'Duyệt khác AI', 'Khớp AI', 'TB xử lý', 'Học phần', 'Cảnh báo'].map((label) => <th key={label}>{label}</th>)}</tr></thead><tbody>
-              {dashboard.reviewers.map((row) => <tr key={row.user_id}><td>{row.display_name}<small>{row.email}</small></td><td>{row.holding}{row.holding_sla_breached > 0 && <small>{row.holding_sla_breached} quá hạn</small>}</td><td>{row.reviews_7d} / {row.reviews_30d}</td><td>{percent(row.approval_rate)}</td><td>{percent(row.override_rate)}</td><td>{percent(row.ai_agreement_rate)}<small>{row.ai_sample_size} mẫu</small></td><td>{hours(row.average_review_hours)}</td><td>{row.review_subject_ids?.length ? row.review_subject_ids.map((id) => subjectOptionLabel(catalogSubjectById.get(String(id))) || id).join(', ') : 'Mọi học phần'}</td><td>{(row.flags || []).map((flag) => <span className="review-reviewer-flag" key={flag}>{reviewerFlagLabel(flag)}{flag === 'NO_SUBJECTS' && <button type="button" className="btn btn--outline" onClick={() => navigate('/quan-ly-nguoi-dung')}>Gán học phần</button>}</span>)}</td></tr>)}
+              {dashboard.reviewers.map((row) => <tr key={row.user_id}><td>{row.display_name}<small>{row.email}</small></td><td>{row.holding}{row.holding_sla_breached > 0 && <small>{row.holding_sla_breached} quá hạn</small>}</td><td>{row.reviews_7d} / {row.reviews_30d}</td><td>{percent(row.approval_rate)}</td><td>{percent(row.override_rate)}</td><td>{percent(row.ai_agreement_rate)}<small>{row.ai_sample_size} mẫu</small></td><td>{hours(row.average_review_hours)}</td><td>{row.review_subject_ids?.length ? row.review_subject_ids.map((id) => subjectOptionLabel(catalogSubjectById.get(String(id))) || id).join(', ') : 'Chưa gán học phần'}</td><td>{(row.flags || []).map((flag) => <span className="review-reviewer-flag" key={flag}>{reviewerFlagLabel(flag)}{flag === 'NO_SUBJECTS' && <button type="button" className="btn btn--outline" onClick={() => navigate('/quan-ly-nguoi-dung')}>Gán học phần</button>}</span>)}</td></tr>)}
             </tbody></table></div>
           </>}
         </section>
@@ -1705,6 +1753,14 @@ function ReviewQueuePage() {
               <span>Lỗi cần sửa</span>
             </div>
           </div>
+          {(dashboardPerformance.top_reasons || []).length > 0 && (
+            <p className="review-form-muted">
+              Lý do hay gặp (30 ngày):{' '}
+              {dashboardPerformance.top_reasons
+                .map((item) => `${reviewReasons.find((reason) => reason.code === item.code)?.label || item.code} (${item.count})`)
+                .join(' · ')}
+            </p>
+          )}
         </div>
 
         <div className="review-dashboard__group review-dashboard__group--calibration">
@@ -2040,7 +2096,26 @@ function ReviewQueuePage() {
                   <span>Duyệt lần 2</span>
                   <b>{secondaryReviewStatusLabel(selected.secondary_review?.status)}</b>
                 </div>
+                {selected.review_submission?.response_note && (
+                  <div>
+                    <span>
+                      {selected.review_submission.resubmitted_unchanged
+                        ? 'Gửi lại không sửa — phản hồi của tác giả'
+                        : 'Ghi chú của tác giả'}
+                    </span>
+                    <b>{selected.review_submission.response_note}</b>
+                  </div>
+                )}
               </section>
+              {submissionCheckWarnings(selected).length > 0 && (
+                <div className="answer-guardrail-warning" role="note">
+                  <strong>Cảnh báo tự động khi gửi duyệt</strong>
+                  <span>Chỉ là gợi ý để đối chiếu; người duyệt vẫn là người quyết định.</span>
+                  <ul>
+                    {submissionCheckWarnings(selected).map((item) => <li key={item}>{item}</li>)}
+                  </ul>
+                </div>
+              )}
               <nav className="review-detail-tabs" aria-label="Nội dung kiểm duyệt">
                 <button type="button" className={detailView === 'question' ? 'is-active' : ''} onClick={() => setDetailView('question')}>Câu hỏi & đáp án</button>
                 <button type="button" className={detailView === 'source' ? 'is-active' : ''} onClick={() => setDetailView('source')}>Nguồn tham chiếu</button>
@@ -2594,6 +2669,31 @@ function ReviewQueuePage() {
                   ))}
                 </div>
               </div>
+              {reviewDraft.decision !== 'APPROVED' && (
+                <div className="review-form-field">
+                  <span>Lý do theo danh mục chuẩn (chọn ít nhất một)</span>
+                  <div className="review-reason-list">
+                    {reviewReasons.map((reason) => (
+                      <label key={reason.code}>
+                        <input
+                          type="checkbox"
+                          checked={(reviewDraft.reasonCodes || []).includes(reason.code)}
+                          onChange={() => {
+                            const current = reviewDraft.reasonCodes || [];
+                            updateReviewDraft({
+                              reasonCodes: current.includes(reason.code)
+                                ? current.filter((code) => code !== reason.code)
+                                : [...current, reason.code],
+                            });
+                          }}
+                        />
+                        {reason.label}
+                      </label>
+                    ))}
+                    {reviewReasons.length === 0 && <p className="review-form-muted">Không tải được danh mục lý do.</p>}
+                  </div>
+                </div>
+              )}
               <label className="review-form-field">
                 <span>Ghi chú tổng</span>
                 <textarea
@@ -2602,6 +2702,24 @@ function ReviewQueuePage() {
                   rows={4}
                 />
               </label>
+              {reviewDraft.decision === 'APPROVED' && submissionCheckFlags(selected).length > 0 && (
+                <fieldset className="secondary-review-box">
+                  <legend>Xác nhận đã xem từng cảnh báo tự động</legend>
+                  {submissionCheckFlags(selected).map(({ flag, label }) => (
+                    <label key={flag}>
+                      <input
+                        type="checkbox"
+                        checked={(reviewDraft.acknowledgedFlags || []).includes(flag)}
+                        onChange={(event) => {
+                          const current = (reviewDraft.acknowledgedFlags || []).filter((item) => item !== flag);
+                          updateReviewDraft({ acknowledgedFlags: event.target.checked ? [...current, flag] : current });
+                        }}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </fieldset>
+              )}
               {reviewDraft.decision === 'APPROVED' && (
                 <div className="secondary-review-box">
                   <label>
@@ -2622,7 +2740,7 @@ function ReviewQueuePage() {
                   )}
                 </div>
               )}
-              {selfReviewReasonRequired(selected, user) && <label className="review-form-field"><span>Lý do tự duyệt (bạn là người tạo/sửa câu này)</span><textarea required rows={3} value={reviewDraft.selfReviewReason || ''} onChange={(event) => updateReviewDraft({ selfReviewReason: event.target.value })} /></label>}
+              {breakGlassReasonRequired(selected, user) && <label className="review-form-field"><span>Lý do tự duyệt khẩn cấp (bạn là người tạo/sửa câu này; chỉ được chấp nhận khi hệ thống bật chế độ khẩn cấp và không còn reviewer khác; câu duyệt sẽ phải qua vòng 2)</span><textarea required rows={3} value={reviewDraft.selfReviewReason || ''} onChange={(event) => updateReviewDraft({ selfReviewReason: event.target.value })} /></label>}
               {reviewNeedsOverride && (
                 <label className="review-form-field">
                   <span>Lý do vẫn duyệt dù AI đề xuất xem lại</span>

@@ -32,6 +32,24 @@ export function updateExamStatus(examId, status) {
   return apiRequest(`/exams/${examId}/status`, { method: 'POST', body: { status } });
 }
 
+export function reopenExam(examId, reason) {
+  return apiRequest(`/exams/${examId}/reopen`, { method: 'POST', body: { reason } });
+}
+
+export function updateExamSharing(examId, sharedWithUserIds) {
+  return apiRequest(`/exams/${examId}/sharing`, {
+    method: 'PATCH',
+    body: { shared_with_user_ids: sharedWithUserIds },
+  });
+}
+
+export function transferExamOwner(examId, newOwnerUserId, reason) {
+  return apiRequest(`/exams/${examId}/transfer-owner`, {
+    method: 'POST',
+    body: { new_owner_user_id: newOwnerUserId, reason },
+  });
+}
+
 export function deleteExam(examId) {
   return apiRequest(`/exams/${examId}`, { method: 'DELETE' });
 }
@@ -44,8 +62,9 @@ export function getMatrixAvailability(examId) {
   return apiRequest(`/exams/${examId}/matrix/availability`);
 }
 
-export function autoGenerateQuestions(examId) {
-  return apiRequest(`/exams/${examId}/questions/auto-generate`, { method: 'POST' });
+export function autoGenerateQuestions(examId, seed) {
+  const query = Number.isInteger(seed) ? `?seed=${seed}` : '';
+  return apiRequest(`/exams/${examId}/questions/auto-generate${query}`, { method: 'POST' });
 }
 
 export function listExamQuestionPool(examId, {

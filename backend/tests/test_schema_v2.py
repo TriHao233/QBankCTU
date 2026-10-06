@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from bson import ObjectId
 from docx import Document
@@ -68,6 +68,8 @@ from modules.ocr.ocr import extract_docx_pages
 from modules.exams.schemas import (
     AddQuestionsManualRequest,
     ExamMatrixRequest,
+    ExamOwnerTransferRequest,
+    ExamSharingRequest,
     ExamStatusUpdateRequest,
     ExamUpdateRequest,
     ExamVariantCreateRequest,
@@ -87,13 +89,14 @@ from modules.generation.question import _build_retry_prompt, _check_type_format,
 from modules.questions.schemas import (
     QuestionCreateRequest,
     QuestionResponse,
+    QuestionOwnerTransferRequest,
     QuestionSharingRequest,
     QuestionSourceViewerResponse,
     QuestionUpdateRequest,
 )
 from modules.questions import repository as question_repository_module
 from modules.questions import router as question_router_module
-from modules.questions.repository import MongoQuestionRepository, serialize_question
+from modules.questions.repository import MongoQuestionRepository, normalize_sharing_fields, serialize_question
 from modules.questions.service import QuestionService, stable_hash
 from modules.questions.workflow_schemas import (
     AutoAssignRequest,
@@ -162,33 +165,53 @@ class FakeExamRepository:
     def __init__(self, exams=None, variants=None):
         self.exams = {str(exam["_id"]): exam for exam in (exams or [])}
         self.variants = variants or []
+        self.audit_events = []
 
     def create(self, exam):
         self.exams[str(exam["_id"])] = exam
         return exam
 
     def find(self, exam_id):
-        return self.exams.get(str(exam_id))
+        exam = self.exams.get(str(exam_id))
+        return exam if exam and not exam.get("deleted_at") else None
 
-    def list(self, page, page_size, created_by_user_id):
-        items = list(self.exams.values())
+    def list(self, page, page_size, created_by_user_id, *, visible_to_user_id=None):
+        items = [exam for exam in self.exams.values() if not exam.get("deleted_at")]
         if created_by_user_id is not None:
             items = [
                 exam for exam in items
                 if str(exam.get("created_by_user_id")) == str(created_by_user_id)
             ]
+        if visible_to_user_id is not None:
+            items = [
+                exam for exam in items
+                if str(exam.get("created_by_user_id")) == str(visible_to_user_id)
+                or str(visible_to_user_id) in {str(item) for item in exam.get("shared_with_user_ids") or []}
+            ]
         return items, len(items)
 
-    def update(self, exam_id, updates):
+    def update(self, exam_id, updates, *, audit=None, expected_status=None, require_no_variants=False):
         exam = self.find(exam_id)
         if not exam:
             return None
+        if expected_status and str(exam.get("status")).upper() != expected_status:
+            return None
+        if require_no_variants and self.count_variants(exam_id):
+            raise ValueError("Đề thi đã có mã đề")
         exam.update(updates)
         exam["updated_at"] = datetime.now(timezone.utc)
+        if audit:
+            self.audit_events.append(audit)
         return exam
 
-    def delete(self, exam_id):
-        return self.exams.pop(str(exam_id), None) is not None
+    def delete(self, exam_id, deleted_by_user_id=None, *, audit=None):
+        exam = self.find(exam_id)
+        if not exam:
+            return False
+        exam.update(deleted_at=datetime.now(timezone.utc), deleted_by_user_id=deleted_by_user_id)
+        if audit:
+            self.audit_events.append(audit)
+        return True
 
     def count_variants(self, exam_id):
         return len([v for v in self.variants if str(v["exam_id"]) == str(exam_id)])
@@ -211,7 +234,8 @@ class FakeExamVariantRepository:
             if str(variant["exam_id"]) == str(exam_id)
         ]
 
-    def delete(self, variant_id):
+    def delete(self, variant_id, *, audit=None):
+        self.deleted_audit = audit
         return self.variants.pop(str(variant_id), None) is not None
 
 
@@ -222,8 +246,22 @@ class FakeExamQuestionRepository:
     def find_pair(self, question_id):
         return self.pairs.get(str(question_id))
 
+    def find_approved_pair(self, question_id):
+        pair = self.pairs.get(str(question_id))
+        if not pair or str(pair[0].get("approved_version_id")) != str(pair[1]["_id"]):
+            return None
+        if pair[0].get("lifecycle_status") == "ARCHIVED":
+            return None
+        return pair
+
+    def find_archived_pair(self, question_id):
+        pair = self.pairs.get(str(question_id))
+        return pair if pair and pair[0].get("lifecycle_status") == "ARCHIVED" else None
+
     def list(self, page, page_size, review_status, search, **filters):
         pairs = list(self.pairs.values())
+        if filters.get("approved_version_join"):
+            pairs = [pair for pair in pairs if str(pair[0].get("approved_version_id")) == str(pair[1]["_id"])]
         if review_status:
             pairs = [
                 pair for pair in pairs
@@ -319,6 +357,7 @@ def _user_doc(role="Admin", is_active=True):
 class FakeUserRepository:
     def __init__(self, users):
         self.users = {str(user["_id"]): dict(user) for user in users}
+        self.audit_events = []
 
     def find_by_id(self, user_id):
         return self.users.get(str(user_id))
@@ -367,12 +406,17 @@ class FakeUserRepository:
         start = (page - 1) * page_size
         return records[start:start + page_size], total
 
-    def update(self, user_id, fields):
+    def update(self, user_id, fields, *, audit=None):
         user = self.find_by_id(user_id)
         if not user:
             return None
+        if audit and getattr(self, "fail_audit", False):
+            raise RuntimeError("audit store unavailable")
         user.update(fields)
         user["updated_at"] = datetime.now(timezone.utc)
+        event = audit(user) if audit else None
+        if event:
+            self.audit_events.append(event)
         return user
 
     def count_active_admins(self):
@@ -452,6 +496,18 @@ def _matches_query(record, query):
             continue
         if key == "$nor":
             if any(_matches_query(record, item) for item in expected):
+                return False
+            continue
+        if key == "$expr":
+            (operator, (left, right)), = expected.items()
+
+            def operand(value):
+                if isinstance(value, str) and value.startswith("$"):
+                    return (_path_values(record, value[1:]) or [None])[0]
+                return value
+
+            equal = operand(left) == operand(right)
+            if (operator == "$eq" and not equal) or (operator == "$ne" and equal):
                 return False
             continue
         values = _path_values(record, key)
@@ -578,6 +634,9 @@ class InMemoryCollection:
             return None
         for path, value in (update.get("$set") or {}).items():
             self._set_path(record, path, value, filter_query)
+        for path, value in (update.get("$inc") or {}).items():
+            current = _path_values(record, path)
+            self._set_path(record, path, (current[0] if current else 0) + value, filter_query)
         for path, value in (update.get("$push") or {}).items():
             record.setdefault(path, []).append(value)
         return record
@@ -884,22 +943,34 @@ class SchemaV2Tests(unittest.TestCase):
                 review_form={"overall_note": "Cần sửa đáp án."},
             )
 
+        form = {
+            "overall_note": "Cần sửa trước khi duyệt.",
+            "revision_issues": [
+                {
+                    "title": "Đáp án chưa khớp nguồn",
+                    "severity": "HIGH",
+                    "detail": "Nguồn nói FIFO nhưng đáp án chọn Stack.",
+                    "page_number": 2,
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValidationError, "danh mục chuẩn"):
+            ReviewCreateRequest(expected_version=1, decision="NEEDS_REVISION", review_form=form)
+        with self.assertRaisesRegex(ValidationError, "không hợp lệ"):
+            ReviewCreateRequest(expected_version=1, decision="NEEDS_REVISION", review_form=form,
+                                reason_codes=["MADE_UP"])
+        with self.assertRaisesRegex(ValidationError, "Lý do khác"):
+            ReviewCreateRequest(expected_version=1, decision="NEEDS_REVISION", reason_codes=["OTHER"],
+                                review_form={**form, "overall_note": ""})
         payload = ReviewCreateRequest(
             expected_version=1,
             decision="NEEDS_REVISION",
-            review_form={
-                "overall_note": "Cần sửa trước khi duyệt.",
-                "revision_issues": [
-                    {
-                        "title": "Đáp án chưa khớp nguồn",
-                        "severity": "HIGH",
-                        "detail": "Nguồn nói FIFO nhưng đáp án chọn Stack.",
-                        "page_number": 2,
-                    }
-                ],
-            },
+            review_form=form,
+            reason_codes=["wrong_answer", "NOT_GROUNDED", "WRONG_ANSWER"],
         )
         self.assertEqual(payload.review_form.revision_issues[0].severity, "HIGH")
+        self.assertEqual(payload.reason_codes, ["WRONG_ANSWER", "NOT_GROUNDED"])
+        self.assertEqual(ReviewCreateRequest(expected_version=1, decision="APPROVED").reason_codes, [])
 
     def test_review_assignment_request_allows_admin_unassign(self):
         payload = ReviewAssignmentRequest(reviewer_user_id=None, note="unassign")
@@ -981,6 +1052,8 @@ class SchemaV2Tests(unittest.TestCase):
             "current_version_id": version_id,
             "current_version": 1,
             "created_by_user_id": ObjectId(),
+            "review_status": "PENDING",
+            "subject_id": ObjectId(),
         }
         version = {
             "_id": version_id,
@@ -1051,6 +1124,9 @@ class SchemaV2Tests(unittest.TestCase):
 
             def find_subject(self, _subject_id):
                 return None
+
+            def reviewer_subject_ids(self, _user_id):
+                return [question["subject_id"]]
 
         references = References()
         service = QuestionService(repository=PairRepository(), references=references)
@@ -1183,9 +1259,19 @@ class SchemaV2Tests(unittest.TestCase):
         for initial_status in ("DRAFT", "NEEDS_REVISION"):
             repository = SubmitRepository(initial_status)
             service = QuestionService(repository=repository, references=object())
+            note = ""
+            if initial_status == "NEEDS_REVISION":
+                # Unchanged resubmission needs a reply to the reviewer.
+                for short in ("", "ok"):
+                    with self.assertRaises(ValueError):
+                        service.submit_for_review(str(repository.question["_id"]), teacher, response_note=short)
+                note = "Đáp án A đúng theo giáo trình trang 12"
 
-            submitted = service.submit_for_review(str(repository.question["_id"]), teacher)
+            submitted = service.submit_for_review(str(repository.question["_id"]), teacher, response_note=note)
             submitted_again = service.submit_for_review(str(repository.question["_id"]), teacher)
+            if note:
+                self.assertEqual(submitted["review_submission"]["response_note"], note)
+                self.assertTrue(submitted["review_submission"]["resubmitted_unchanged"])
 
             self.assertEqual(submitted["review_status"], "PENDING")
             self.assertEqual(submitted["submitted_by_user_id"], str(teacher.id))
@@ -1220,7 +1306,7 @@ class SchemaV2Tests(unittest.TestCase):
                     "current_version": 2,
                 }
 
-            def submit_for_review(self, _question_id, _current_user, notifications=None):
+            def submit_for_review(self, _question_id, _current_user, notifications=None, response_note=""):
                 return {
                     "id": question_id,
                     "review_status": "PENDING",
@@ -1498,15 +1584,24 @@ class SchemaV2Tests(unittest.TestCase):
             def find_pair(self, _question_id):
                 return question, version
 
-            def update_sharing(self, _question_id, fields):
+            def update_sharing(self, _question_id, fields, *, audit=None):
                 self.fields = fields
-                question.update(fields)
+                self.audit = audit
+                question.update(normalize_sharing_fields(fields))
                 return question, version
+
+            def archive(self, _question_id, *, audit=None, **_kwargs):
+                question["lifecycle_status"] = "ARCHIVED"
+                return True
 
         repository = SharingRepository()
         service = QuestionService(repository=repository, references=object())
 
         self.assertEqual(service.get(str(question_id), shared_teacher)["id"], str(question_id))
+        with self.assertRaises(PermissionError):
+            service.update_sharing(
+                str(question_id), QuestionSharingRequest(shared_with_user_ids=[]), shared_teacher,
+            )
         with self.assertRaises(PermissionError):
             service.update(
                 str(question_id),
@@ -1514,13 +1609,46 @@ class SchemaV2Tests(unittest.TestCase):
                 shared_teacher.id,
                 actor_role="Teacher",
             )
-        updated = service.update_sharing(
-            str(question_id),
-            QuestionSharingRequest(shared_with_user_ids=[str(shared_teacher.id)], shared_scope="SUBJECT"),
-            owner,
-        )
+        subject_wide = QuestionSharingRequest(shared_with_user_ids=[str(shared_teacher.id)], shared_scope="SUBJECT")
+        with self.assertRaisesRegex(ValueError, "đã được duyệt"):
+            service.update_sharing(str(question_id), subject_wide, owner)
+        question["approved_version_id"] = version_id
+        updated = service.update_sharing(str(question_id), subject_wide, owner)
         self.assertEqual(updated["shared_scope"], "SUBJECT")
         self.assertEqual(repository.fields["shared_scope"], "SUBJECT")
+        self.assertEqual(repository.audit["action"], "question.sharing_update")
+
+        editor = _current_user("Teacher")
+        updated = service.update_sharing(
+            str(question_id),
+            QuestionSharingRequest(shared_with_user_ids=[str(shared_teacher.id)],
+                                   shared_edit_user_ids=[str(editor.id)]),
+            owner,
+        )
+        self.assertEqual(updated["shared_edit_user_ids"], [str(editor.id)])
+        # Editors are added to the view list so reads and listings include them.
+        self.assertIn(str(editor.id), updated["shared_with_user_ids"])
+        service._ensure_write_access((question, version), editor)
+        with self.assertRaises(PermissionError):
+            service._ensure_write_access((question, version), shared_teacher)
+        # An editor who authored the current version still cannot archive or reshare.
+        version["created_by_user_id"] = editor.id
+        with self.assertRaises(PermissionError):
+            service.archive(str(question_id), editor)
+        with self.assertRaises(PermissionError):
+            service.update_sharing(str(question_id), QuestionSharingRequest(), editor)
+
+        admin = _current_user("Admin")
+        transfer = QuestionOwnerTransferRequest(new_owner_user_id=str(editor.id), reason="Bàn giao học phần")
+        with patch("modules.questions.service.get_database", return_value=None), \
+                patch("modules.questions.service.users_by_ids",
+                      return_value=[{"_id": editor.id, "role": "Teacher"}]):
+            with self.assertRaises(PermissionError):
+                service.transfer_owner(str(question_id), transfer, owner)
+            moved = service.transfer_owner(str(question_id), transfer, admin)
+        self.assertEqual(question["created_by_user_id"], editor.id)
+        self.assertEqual(moved["shared_edit_user_ids"], [])
+        self.assertEqual(repository.audit["action"], "question.owner_transferred")
 
     def test_question_create_with_explicit_permission_still_checks_document_access(self):
         owner = _current_user("Teacher")
@@ -1599,6 +1727,7 @@ class SchemaV2Tests(unittest.TestCase):
         other_reviewer = _current_user("Reviewer")
         question_id = ObjectId()
         version_id = ObjectId()
+        subject_id = ObjectId()
         now = datetime.now(timezone.utc)
         version = {
             "_id": version_id,
@@ -1644,6 +1773,7 @@ class SchemaV2Tests(unittest.TestCase):
             "quality_summary": {"overall_score": 0.91, "color": "GREEN"},
             "review_assignment": {"status": "UNASSIGNED"},
             "latest_review_id": None,
+            "subject_id": subject_id,
             "created_by_user_id": teacher.id,
             "created_at": now,
             "updated_at": now,
@@ -1656,8 +1786,9 @@ class SchemaV2Tests(unittest.TestCase):
                 self.question_versions = InMemoryCollection([version])
                 self.users = InMemoryCollection(
                     [
-                        {"_id": reviewer.id, "role": "Reviewer", "is_active": True},
-                        {"_id": other_reviewer.id, "role": "Reviewer", "is_active": True},
+                        {"_id": reviewer.id, "role": "Reviewer", "is_active": True, "review_subject_ids": [subject_id]},
+                        {"_id": other_reviewer.id, "role": "Reviewer", "is_active": True,
+                         "review_subject_ids": [subject_id]},
                     ]
                 )
                 self.question_reviews = InMemoryCollection()
@@ -1721,12 +1852,156 @@ class SchemaV2Tests(unittest.TestCase):
             ["QUESTION_REVIEW_ASSIGNED", "QUESTION_REVIEW_CLAIMED", "QUESTION_APPROVED"],
         )
 
+    def test_reviewer_hold_cap_and_renewal_cap(self):
+        reviewer = _current_user("Reviewer")
+        author = ObjectId()
+        subject_id = ObjectId()
+        now = datetime.now(timezone.utc)
+        held_question, held_version = _pending_question_pair(
+            "Q-HELD", subject_id, now, author, now,
+            review_assignment={"status": "IN_REVIEW", "reviewer_user_id": reviewer.id,
+                               "lock_expires_at": now + timedelta(hours=1)},
+        )
+        target, target_version = _pending_question_pair("Q-NEW", subject_id, now, author, now)
+
+        class Db:
+            questions = InMemoryCollection([held_question, target])
+            question_versions = InMemoryCollection([held_version, target_version])
+            users = InMemoryCollection([{"_id": reviewer.id, "role": "Reviewer", "is_active": True,
+                                         "review_subject_ids": [subject_id]}])
+            audit_logs = InMemoryCollection()
+
+        service = QuestionWorkflowService(Db())
+        with (
+            patch.object(settings, "review_max_held_questions", 1),
+            patch.object(settings, "review_max_lock_renewals", 2),
+        ):
+            with self.assertRaisesRegex(ValueError, "tối đa 1 câu"):
+                service.claim_review(str(target["_id"]), reviewer)
+
+            renewed = [service.renew_review(str(held_question["_id"]), reviewer) for _ in range(2)]
+            with self.assertRaisesRegex(ValueError, "tối đa 2 lần"):
+                service.renew_review(str(held_question["_id"]), reviewer)
+
+        self.assertEqual(renewed[-1]["review_assignment"]["renewal_count"], 2)
+
+    def _question_service_db(self, *pairs):
+        class Db:
+            questions = InMemoryCollection([question for question, _version in pairs])
+            question_versions = InMemoryCollection([version for _question, version in pairs])
+            audit_logs = InMemoryCollection()
+        return Db()
+
+    def test_withdraw_pending_question_only_while_unclaimed(self):
+        teacher = _current_user("Teacher")
+        now = datetime.now(timezone.utc)
+        free, free_version = _pending_question_pair("Q-FREE", ObjectId(), now, teacher.id, now)
+        claimed, claimed_version = _pending_question_pair(
+            "Q-CLAIMED", ObjectId(), now, teacher.id, now,
+            review_assignment={"status": "IN_REVIEW", "reviewer_user_id": ObjectId(),
+                               "lock_expires_at": now + timedelta(hours=1)},
+        )
+        db = self._question_service_db((free, free_version), (claimed, claimed_version))
+        service = QuestionService(MongoQuestionRepository(db), references=None)
+        with patch.object(question_repository_module, "mongo_transaction", lambda: nullcontext(None)):
+            withdrawn = service.withdraw_submission(str(free["_id"]), 1, teacher)
+            with self.assertRaises(PermissionError):
+                service.withdraw_submission(str(claimed["_id"]), 1, teacher)
+
+        self.assertEqual(withdrawn["review_status"], "DRAFT")
+        self.assertEqual(db.questions.find_one({"_id": claimed["_id"]})["review_status"], "PENDING")
+        self.assertEqual([event["action"] for event in db.audit_logs.records], ["question.submission_withdrawn"])
+
+    def test_restore_archived_question_keeps_approved_version_and_requires_owner(self):
+        teacher = _current_user("Teacher")
+        now = datetime.now(timezone.utc)
+        question, version = _pending_question_pair("Q-ARCH", ObjectId(), now, teacher.id, now)
+        question.update(lifecycle_status="ARCHIVED", archived_at=now, review_status="APPROVED",
+                        approved_version_id=version["_id"])
+        db = self._question_service_db((question, version))
+        service = QuestionService(MongoQuestionRepository(db), references=None)
+        with patch.object(question_repository_module, "mongo_transaction", lambda: nullcontext(None)):
+            with self.assertRaises(LookupError):
+                service.restore(str(question["_id"]), _current_user("Teacher"))
+            listed = service.list_archived(1, 20, teacher)
+            restored = service.restore(str(question["_id"]), teacher)
+
+        self.assertEqual(listed["total"], 1)
+        self.assertEqual(restored["lifecycle_status"], "ACTIVE")
+        self.assertEqual(restored["review_status"], "APPROVED")
+        self.assertEqual(str(restored["approved_version_id"]), str(version["_id"]))
+        self.assertEqual(db.audit_logs.records[-1]["action"], "question.restored")
+
+    def test_unclaimed_pending_questions_escalate_to_admins_then_requeue(self):
+        now = datetime.now(timezone.utc)
+        admin_id, reviewer_id = ObjectId(), ObjectId()
+        late, late_version = _pending_question_pair(
+            "Q-LATE", ObjectId(), now - timedelta(hours=80), ObjectId(), now,
+        )
+        stale, stale_version = _pending_question_pair(
+            "Q-STALE", ObjectId(), now - timedelta(days=8), ObjectId(), now,
+            review_assignment={"status": "ASSIGNED", "reviewer_user_id": reviewer_id, "lock_expires_at": None},
+        )
+
+        class Db:
+            questions = InMemoryCollection([late, stale])
+            question_versions = InMemoryCollection([late_version, stale_version])
+            users = InMemoryCollection([{"_id": admin_id, "role": "Admin", "is_active": True}])
+            notifications = InMemoryCollection()
+            audit_logs = InMemoryCollection()
+
+        db = Db()
+        service = QuestionWorkflowService(db)
+        with patch.object(question_workflow_module, "mongo_transaction", lambda: nullcontext(None)):
+            first = service.escalate_overdue_reviews(now)
+            second = service.escalate_overdue_reviews(now)
+
+        self.assertEqual(first, {"notified": 1, "requeued": 1})
+        self.assertEqual(second, {"notified": 1, "requeued": 0})
+        requeued = db.questions.find_one({"_id": stale["_id"]})
+        self.assertEqual(requeued["review_assignment"]["status"], "UNASSIGNED")
+        self.assertEqual(requeued["review_assignment"]["release_reason"], "escalation_requeued")
+        escalated = [item for item in db.notifications.records if item["type"] == "QUESTION_REVIEW_ESCALATED"]
+        self.assertEqual({str(item["entity"]["id"]) for item in escalated}, {str(late["_id"]), str(stale["_id"])})
+
+    def test_escalation_batch_skips_questions_already_handled(self):
+        now = datetime.now(timezone.utc)
+        admin_id = ObjectId()
+        handled_at = now - timedelta(hours=90)
+        handled, handled_version = _pending_question_pair(
+            "Q-HANDLED", ObjectId(), handled_at, ObjectId(), now,
+        )
+        handled["review_escalation"] = {"submitted_at": handled_at, "notified_at": now - timedelta(hours=10)}
+        newer, newer_version = _pending_question_pair(
+            "Q-NEWER", ObjectId(), now - timedelta(hours=80), ObjectId(), now,
+        )
+
+        class Db:
+            questions = InMemoryCollection([handled, newer])
+            question_versions = InMemoryCollection([handled_version, newer_version])
+            users = InMemoryCollection([{"_id": admin_id, "role": "Admin", "is_active": True}])
+            notifications = InMemoryCollection()
+            audit_logs = InMemoryCollection()
+
+        db = Db()
+        service = QuestionWorkflowService(db)
+        with (
+            patch.object(question_workflow_module, "mongo_transaction", lambda: nullcontext(None)),
+            patch.object(question_workflow_module, "SLA_REMINDER_BATCH_SIZE", 1),
+        ):
+            result = service.escalate_overdue_reviews(now)
+
+        self.assertEqual(result, {"notified": 1, "requeued": 0})
+        escalated = [item for item in db.notifications.records if item["type"] == "QUESTION_REVIEW_ESCALATED"]
+        self.assertEqual({str(item["entity"]["id"]) for item in escalated}, {str(newer["_id"])})
+
     def test_secondary_review_requires_a_different_reviewer_and_comments_notify_mentions(self):
         teacher = _current_user("Teacher")
         reviewer = _current_user("Reviewer")
         second_reviewer = _current_user("Reviewer")
         question_id = ObjectId()
         version_id = ObjectId()
+        subject_id = ObjectId()
         now = datetime.now(timezone.utc)
         version = {
             "_id": version_id,
@@ -1768,6 +2043,7 @@ class SchemaV2Tests(unittest.TestCase):
             "quality_summary": {"overall_score": 0.9, "color": "GREEN"},
             "review_assignment": {"status": "UNASSIGNED"},
             "latest_review_id": None,
+            "subject_id": subject_id,
             "created_by_user_id": teacher.id,
             "created_at": now,
             "updated_at": now,
@@ -1781,8 +2057,9 @@ class SchemaV2Tests(unittest.TestCase):
                 self.users = InMemoryCollection(
                     [
                         {"_id": teacher.id, "role": "Teacher", "is_active": True},
-                        {"_id": reviewer.id, "role": "Reviewer", "is_active": True},
-                        {"_id": second_reviewer.id, "role": "Reviewer", "is_active": True},
+                        {"_id": reviewer.id, "role": "Reviewer", "is_active": True, "review_subject_ids": [subject_id]},
+                        {"_id": second_reviewer.id, "role": "Reviewer", "is_active": True,
+                         "review_subject_ids": [subject_id]},
                     ]
                 )
                 self.question_reviews = InMemoryCollection()
@@ -1845,6 +2122,7 @@ class SchemaV2Tests(unittest.TestCase):
     def _review_guard_fixture(self, *, author, users, **question_fields):
         question_id = ObjectId()
         version_id = ObjectId()
+        subject_id = question_fields.pop("subject_id", ObjectId())
         now = datetime.now(timezone.utc)
         version = {
             "_id": version_id,
@@ -1857,7 +2135,7 @@ class SchemaV2Tests(unittest.TestCase):
             "created_by_user_id": author.id,
             "generated_by_model_id": None,
             "classification": {
-                "subject": {"id": None},
+                "subject": {"id": subject_id},
                 "chapter": {"id": None},
                 "assessment_type": "TRAC_NGHIEM",
                 "bloom": {"level": 2},
@@ -1886,6 +2164,7 @@ class SchemaV2Tests(unittest.TestCase):
             "quality_summary": {"overall_score": 0.9, "color": "GREEN"},
             "review_assignment": {"status": "UNASSIGNED"},
             "latest_review_id": None,
+            "subject_id": subject_id,
             "created_by_user_id": author.id,
             "created_at": now,
             "updated_at": now,
@@ -1898,7 +2177,10 @@ class SchemaV2Tests(unittest.TestCase):
                 self.questions = InMemoryCollection([question])
                 self.question_versions = InMemoryCollection([version])
                 self.users = InMemoryCollection(
-                    [{"_id": user.id, "role": user.role, "is_active": True} for user in users]
+                    [
+                        {"_id": user.id, "role": user.role, "is_active": True, "review_subject_ids": [subject_id]}
+                        for user in users
+                    ]
                 )
                 self.question_reviews = InMemoryCollection()
                 self.evaluation_jobs = InMemoryCollection()
@@ -1977,6 +2259,87 @@ class SchemaV2Tests(unittest.TestCase):
         renewed, review = self._with_workflow_service(db, scenario)
         self.assertEqual(renewed["review_assignment"]["status"], "IN_REVIEW")
         self.assertEqual(review["decision"], "APPROVED")
+
+    def test_admin_must_claim_and_takeover_needs_reason(self):
+        admin = _current_user("Admin")
+        teacher = _current_user("Teacher")
+        reviewer = _current_user("Reviewer")
+        db, question_id, _ = self._review_guard_fixture(author=teacher, users=[admin, teacher, reviewer])
+
+        def scenario(service):
+            with self.assertRaises(PermissionError):
+                service.review(str(question_id), ReviewCreateRequest(expected_version=1, decision="APPROVED"), admin)
+            service.claim_review(str(question_id), reviewer)
+            with self.assertRaises(PermissionError):
+                service.review(str(question_id), ReviewCreateRequest(expected_version=1, decision="APPROVED"), admin)
+            with self.assertRaises(ValueError):
+                service.claim_review(str(question_id), admin)
+            with self.assertRaises(ValueError):
+                service.claim_review(str(question_id), admin, reason="gấp")
+            claimed = service.claim_review(str(question_id), admin, reason="Reviewer nghỉ phép")
+            review = service.review(
+                str(question_id), ReviewCreateRequest(expected_version=1, decision="APPROVED"), admin,
+            )
+            return claimed, review
+
+        claimed, review = self._with_workflow_service(db, scenario)
+        self.assertEqual(claimed["review_assignment"]["reviewer_user_id"], str(admin.id))
+        self.assertEqual(review["decision"], "APPROVED")
+        taken = [item for item in db.audit_logs.records if item["action"] == "QUESTION_REVIEW_TAKEN_OVER"]
+        self.assertEqual(len(taken), 1)
+        self.assertIn(
+            reviewer.id,
+            [item["recipient_user_id"] for item in db.notifications.records
+             if item["type"] == "QUESTION_REVIEW_TAKEN_OVER"],
+        )
+
+    def test_reclaim_does_not_reset_renewal_counter(self):
+        teacher = _current_user("Teacher")
+        reviewer = _current_user("Reviewer")
+        db, question_id, _ = self._review_guard_fixture(author=teacher, users=[teacher, reviewer])
+
+        def scenario(service):
+            service.claim_review(str(question_id), reviewer)
+            service.renew_review(str(question_id), reviewer)
+            service.release_review(str(question_id), reviewer)
+            return service.claim_review(str(question_id), reviewer)
+
+        reclaimed = self._with_workflow_service(db, scenario)
+        stored = db.questions.find_one({"_id": question_id})["review_assignment"]
+        self.assertEqual(stored["renewal_count"], 1)
+        self.assertEqual(reclaimed["review_assignment"]["status"], "IN_REVIEW")
+
+    def test_approving_flagged_question_requires_acknowledging_every_flag(self):
+        teacher = _current_user("Teacher")
+        reviewer = _current_user("Reviewer")
+        db, question_id, _ = self._review_guard_fixture(author=teacher, users=[teacher, reviewer])
+        db.questions.find_one({"_id": question_id})["review_submission"] = {
+            "submitted_at": datetime.now(timezone.utc),
+            "checks": {"flags": ["weak_grounding", "near_duplicate"], "warnings": []},
+        }
+
+        def scenario(service):
+            service.claim_review(str(question_id), reviewer)
+            for acknowledged in ([], ["weak_grounding"]):
+                with self.assertRaisesRegex(ValueError, "near_duplicate"):
+                    service.review(
+                        str(question_id),
+                        ReviewCreateRequest(expected_version=1, decision="APPROVED", acknowledged_flags=acknowledged),
+                        reviewer,
+                    )
+            return service.review(
+                str(question_id),
+                ReviewCreateRequest(
+                    expected_version=1, decision="APPROVED",
+                    acknowledged_flags=["near_duplicate", " weak_grounding "],
+                ),
+                reviewer,
+            )
+
+        self._with_workflow_service(db, scenario)
+        self.assertEqual(db.questions.find_one({"_id": question_id})["review_status"], "APPROVED")
+        stored_review = db.question_reviews.find_one({"question_id": question_id})
+        self.assertEqual(stored_review["acknowledged_flags"], ["weak_grounding", "near_duplicate"])
 
     def test_reopening_approved_question_keeps_primary_reviewer_out_of_secondary(self):
         admin = _current_user("Admin")
@@ -2086,43 +2449,49 @@ class SchemaV2Tests(unittest.TestCase):
         reviewer = _current_user("Reviewer")
         db, question_id, _ = self._review_guard_fixture(author=admin, users=[admin, reviewer])
 
-        def admin_scenario(service):
-            with self.assertRaises(PermissionError):
-                service.review(
-                    str(question_id),
-                    ReviewCreateRequest(expected_version=1, decision="APPROVED"),
-                    admin,
-                )
+        reason = "Không còn người duyệt khác phụ trách học phần"
+
+        def self_review(service, **fields):
             return service.review(
                 str(question_id),
-                ReviewCreateRequest(
-                    expected_version=1,
-                    decision="APPROVED",
-                    override={"applied": True, "reason": "Không còn người duyệt khác"},
-                ),
+                ReviewCreateRequest(expected_version=1, decision="APPROVED", **fields),
                 admin,
             )
 
-        review = self._with_workflow_service(db, admin_scenario)
-        self.assertTrue(review["override"]["applied"])
+        def admin_scenario(service):
+            # Break-glass disabled: neither a reason nor an override lets the author decide.
+            for fields in ({}, {"self_review_reason": reason},
+                           {"override": {"applied": True, "reason": "Không còn người duyệt khác"}}):
+                with self.assertRaises(PermissionError):
+                    self_review(service, **fields)
 
-        # Cách mới: Admin tự duyệt bằng lý do riêng, không bị tính là "duyệt khác AI".
-        db, question_id, _ = self._review_guard_fixture(author=admin, users=[admin, reviewer])
-        review = self._with_workflow_service(
-            db,
-            lambda service: service.review(
-                str(question_id),
-                ReviewCreateRequest(
-                    expected_version=1,
-                    decision="APPROVED",
-                    self_review_reason="Không còn người duyệt khác phụ trách học phần",
-                ),
-                admin,
-            ),
-        )
-        self.assertFalse(review["override"]["applied"])
-        self.assertEqual(review["self_review_reason"], "Không còn người duyệt khác phụ trách học phần")
-        self.assertEqual(db.audit_logs.records[-1]["metadata"]["self_review_reason"], review["self_review_reason"])
+        self._with_workflow_service(db, admin_scenario)
+
+        original_break_glass = settings.admin_self_review_break_glass
+        settings.admin_self_review_break_glass = True
+        try:
+            # Another eligible reviewer exists, so break-glass is refused.
+            with self.assertRaises(PermissionError):
+                self._with_workflow_service(db, lambda service: self_review(service, self_review_reason=reason))
+
+            db, question_id, _ = self._review_guard_fixture(author=admin, users=[admin])
+            with self.assertRaises(ValueError):
+                self._with_workflow_service(db, lambda service: self_review(service, self_review_reason="gấp"))
+            with self.assertRaises(PermissionError):
+                # Break-glass still requires holding the claim.
+                self._with_workflow_service(db, lambda service: self_review(service, self_review_reason=reason))
+            self._with_workflow_service(db, lambda service: service.claim_review(str(question_id), admin))
+            review = self._with_workflow_service(db, lambda service: self_review(service, self_review_reason=reason))
+        finally:
+            settings.admin_self_review_break_glass = original_break_glass
+        self.assertTrue(review["break_glass"])
+        self.assertEqual(review["self_review_reason"], reason)
+        self.assertEqual(review["resulting_status"], "PENDING")
+        stored = db.questions.find_one({"_id": question_id})
+        self.assertEqual(stored["secondary_review"]["status"], "AWAITING_SECONDARY")
+        self.assertIsNone(stored["approved_version_id"])
+        self.assertEqual(stored["break_glass_review"]["reason"], reason)
+        self.assertIn("QUESTION_BREAK_GLASS_REVIEW", [item["action"] for item in db.audit_logs.records])
 
         teacher = _current_user("Teacher")
         db, question_id, _ = self._review_guard_fixture(
@@ -2444,8 +2813,8 @@ class SchemaV2Tests(unittest.TestCase):
         teacher = ObjectId()
         subject_ctdl, subject_mmt = ObjectId(), ObjectId()
         specialist = ObjectId()  # CTDL only
-        generalist_a = ObjectId()  # any subject
-        generalist_b = ObjectId()  # any subject, but authored one question
+        generalist_a = ObjectId()  # MMT only
+        generalist_b = ObjectId()  # MMT only, but authored one question
         inactive = ObjectId()
 
         def question(code, subject_id, minutes_ago, *, author=teacher, **extra):
@@ -2478,8 +2847,10 @@ class SchemaV2Tests(unittest.TestCase):
                     [
                         {"_id": specialist, "role": "Reviewer", "is_active": True, "display_name": "CTDL",
                          "review_subject_ids": [subject_ctdl]},
-                        {"_id": generalist_a, "role": "Reviewer", "is_active": True, "display_name": "A"},
-                        {"_id": generalist_b, "role": "Reviewer", "is_active": True, "display_name": "B"},
+                        {"_id": generalist_a, "role": "Reviewer", "is_active": True, "display_name": "A",
+                         "review_subject_ids": [subject_mmt]},
+                        {"_id": generalist_b, "role": "Reviewer", "is_active": True, "display_name": "B",
+                         "review_subject_ids": [subject_mmt]},
                         {"_id": inactive, "role": "Reviewer", "is_active": False, "display_name": "Off"},
                     ]
                 )
@@ -2576,8 +2947,12 @@ class SchemaV2Tests(unittest.TestCase):
         by_code = {item["question_code"]: item["reviewer_user_id"] for item in with_admins["assigned"]}
         self.assertEqual(by_code["Q-CTDL"], str(specialist))
         self.assertEqual(by_code["Q-MMT"], str(admin_reviewer))
-        # The Admin authored this one, so it goes to the other generalist.
-        self.assertEqual(by_code["Q-MMT-ADMIN"], str(generalist))
+        # The Admin authored this one and the reviewer without subjects reviews nothing.
+        self.assertNotIn("Q-MMT-ADMIN", by_code)
+        self.assertEqual(
+            {item["question_code"]: item["reason"] for item in with_admins["skipped"]},
+            {"Q-MMT-ADMIN": "NO_ELIGIBLE_REVIEWER"},
+        )
 
     def test_review_policy_forces_secondary_review_and_notifies_teacher(self):
         admin = _current_user("Admin")
@@ -2849,6 +3224,118 @@ class SchemaV2Tests(unittest.TestCase):
                 (other_reviewer_doc["_id"], "reviewer_role_removed"),
             ],
         )
+
+    def test_removing_reviewer_subject_releases_held_questions_in_that_subject(self):
+        admin_doc = _user_doc("Admin", True)
+        kept, removed = ObjectId(), ObjectId()
+        reviewer_doc = {**_user_doc("Reviewer", True), "review_subject_ids": [kept, removed]}
+        calls = []
+        service = UserService(
+            FakeUserRepository([admin_doc, reviewer_doc]),
+            FakeIdentityGateway(),
+            FakeSessions(),
+            release_review_assignments=lambda user_id, actor, reason, subject_ids=None: (
+                calls.append((user_id, reason, subject_ids)) or 0
+            ),
+        )
+        actor = _current_user("Admin", admin_doc["_id"])
+        service.update_admin(
+            str(reviewer_doc["_id"]), UserAdminUpdateRequest(review_subject_ids=[str(kept)]), actor,
+        )
+        self.assertEqual(calls, [(reviewer_doc["_id"], "reviewer_subject_removed", [str(removed)])])
+
+    def test_release_assignments_for_reviewer_respects_subject_filter(self):
+        teacher = _current_user("Teacher")
+        reviewer = _current_user("Reviewer")
+        db, question_id, _ = self._review_guard_fixture(author=teacher, users=[teacher, reviewer])
+
+        def scenario(service):
+            service.claim_review(str(question_id), reviewer)
+            untouched = service.release_assignments_for_reviewer(
+                reviewer.id, None, "reviewer_subject_removed", subject_ids=[str(ObjectId())],
+            )
+            subject_id = db.questions.find_one({"_id": question_id})["subject_id"]
+            released = service.release_assignments_for_reviewer(
+                reviewer.id, None, "reviewer_subject_removed", subject_ids=[str(subject_id)],
+            )
+            return untouched, released
+
+        untouched, released = self._with_workflow_service(db, scenario)
+        self.assertEqual((untouched, released), (0, 1))
+        self.assertEqual(db.questions.find_one({"_id": question_id})["review_assignment"]["status"], "UNASSIGNED")
+
+    def test_user_service_cancels_generation_jobs_when_user_is_deactivated(self):
+        admin_doc = _user_doc("Admin", True)
+        teacher_doc = _user_doc("Teacher", True)
+        other_teacher_doc = _user_doc("Teacher", True)
+        cancelled = []
+        service = UserService(
+            FakeUserRepository([admin_doc, teacher_doc, other_teacher_doc]),
+            FakeIdentityGateway(),
+            FakeSessions(),
+            cancel_generation_jobs=lambda user_id: cancelled.append(user_id) or 2,
+        )
+        actor = _current_user("Admin", admin_doc["_id"])
+
+        service.deactivate(str(teacher_doc["_id"]), actor)
+        service.update_admin(str(other_teacher_doc["_id"]), UserAdminUpdateRequest(is_active=False), actor)
+        service.update_admin(str(admin_doc["_id"]), UserAdminUpdateRequest(display_name="Admin mới"), actor)
+
+        self.assertEqual(cancelled, [teacher_doc["_id"], other_teacher_doc["_id"]])
+
+    def test_role_change_and_deactivation_write_audit_with_the_update(self):
+        admin_doc = _user_doc("Admin", True)
+        teacher_doc = _user_doc("Teacher", True)
+        repository = FakeUserRepository([admin_doc, teacher_doc])
+        service = UserService(repository, FakeIdentityGateway(), FakeSessions())
+        actor = _current_user("Admin", admin_doc["_id"])
+
+        service.update_admin(str(teacher_doc["_id"]), UserAdminUpdateRequest(role="Reviewer"), actor)
+        service.deactivate(str(teacher_doc["_id"]), actor)
+
+        self.assertEqual([event["action"] for event in repository.audit_events],
+                         ["user.admin_update", "user.deactivate"])
+        self.assertEqual(repository.audit_events[0]["after"]["role"], "Reviewer")
+
+    def test_failed_required_audit_aborts_deactivation_and_restores_firebase(self):
+        admin_doc = _user_doc("Admin", True)
+        teacher_doc = _user_doc("Teacher", True)
+        repository = FakeUserRepository([admin_doc, teacher_doc])
+        repository.fail_audit = True
+        identity = FakeIdentityGateway()
+        cancelled = []
+        service = UserService(repository, identity, FakeSessions(),
+                              cancel_generation_jobs=lambda user_id: cancelled.append(user_id) or 0)
+
+        with self.assertRaises(RuntimeError):
+            service.deactivate(str(teacher_doc["_id"]), _current_user("Admin", admin_doc["_id"]))
+
+        self.assertTrue(repository.find_by_id(teacher_doc["_id"])["is_active"])
+        self.assertEqual(identity.disabled_calls[-1], (teacher_doc["firebase_uid"], False))
+        self.assertEqual(cancelled, [])
+
+    def test_exam_finalize_and_delete_carry_required_audit(self):
+        subject_id = ObjectId()
+        owner = _current_user("Teacher", ObjectId())
+        exam = {
+            "_id": ObjectId(), "name": "Đề 1", "exam_title": "Đề 1", "subject_id": subject_id,
+            "question_count": 0, "header": {}, "matrix": [], "questions": [], "status": "READY",
+            "created_by_user_id": owner.id, "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        repository = FakeExamRepository([exam])
+        service = ExamService(repository, FakeExamQuestionRepository())
+        service._validate_ready_payload = lambda _exam, _actor=None: None
+
+        service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="FINALIZED"), owner)
+
+        self.assertEqual(repository.audit_events[-1]["action"], "exam.finalized")
+        self.assertEqual(repository.audit_events[-1]["after"], {"status": "FINALIZED"})
+
+        draft = {**exam, "_id": ObjectId(), "status": "DRAFT"}
+        repository.create(draft)
+        service.delete_exam(str(draft["_id"]), owner)
+        self.assertEqual(repository.audit_events[-1]["action"], "exam.deleted")
 
     def test_auto_evaluation_requires_expected_version(self):
         with self.assertRaises(ValidationError):
@@ -4344,7 +4831,7 @@ class SchemaV2Tests(unittest.TestCase):
         exam = _exam_doc(owner.id)
         service = ExamService(FakeExamRepository([exam]), question_repository=None)
 
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.get_exam(str(exam["_id"]), other_teacher)
 
         result = service.get_exam(str(exam["_id"]), owner)
@@ -4386,7 +4873,7 @@ class SchemaV2Tests(unittest.TestCase):
 
         service = DocumentService(FakeDocumentJobRepository())
 
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.list_jobs(str(document_id), other_teacher)
 
         result = service.list_jobs(str(document_id), owner)
@@ -4431,7 +4918,8 @@ class SchemaV2Tests(unittest.TestCase):
             def find_by_id(self, _document_id):
                 return self.document
 
-            def update(self, _document_id, fields):
+            def update(self, _document_id, fields, *, audit=None):
+                self.audit = audit
                 normalized = dict(fields)
                 if normalized.get("owner_user_id"):
                     normalized["uploaded_by_user_id"] = ObjectId(normalized.pop("owner_user_id"))
@@ -4465,12 +4953,36 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(shared["shared_scope"], "SUBJECT")
         self.assertEqual(service.get(str(document_id), shared_teacher)["id"], str(document_id))
 
-        transferred = service.update_sharing(
+        # Re-sending the current owner is not a transfer, so the owner may still save sharing.
+        service.update_sharing(
             str(document_id),
-            DocumentSharingRequest(owner_user_id=str(new_owner.id)),
-            admin,
+            DocumentSharingRequest(owner_user_id=str(owner.id), shared_with_user_ids=[str(shared_teacher.id)],
+                                   shared_scope="SUBJECT"),
+            owner,
         )
+        self.assertEqual(repository.audit["action"], "document.sharing_update")
+
+        transfer = DocumentSharingRequest(
+            owner_user_id=str(new_owner.id),
+            shared_with_user_ids=[str(shared_teacher.id), str(new_owner.id)],
+            shared_scope="SUBJECT",
+        )
+        with self.assertRaisesRegex(ValueError, "lý do"):
+            service.update_sharing(str(document_id), transfer, admin)
+        transfer.owner_transfer_reason = "Giảng viên cũ nghỉ"
+        with patch("modules.documents.service.users_by_ids", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "Người nhận"):
+                service.update_sharing(str(document_id), transfer, admin)
+        with patch("modules.documents.service.users_by_ids", return_value=[{"_id": new_owner.id, "role": "Reviewer"}]):
+            with self.assertRaisesRegex(ValueError, "giảng viên"):
+                service.update_sharing(str(document_id), transfer, admin)
+        with patch("modules.documents.service.users_by_ids", return_value=[{"_id": new_owner.id, "role": "Teacher"}]):
+            transferred = service.update_sharing(str(document_id), transfer, admin)
         self.assertEqual(transferred["uploaded_by_user_id"], str(new_owner.id))
+        self.assertEqual(transferred["shared_with_user_ids"], [str(shared_teacher.id)])
+        self.assertEqual(repository.audit["action"], "document.owner_transfer")
+        self.assertEqual(repository.audit["metadata"]["reason"], "Giảng viên cũ nghỉ")
+        self.assertEqual(repository.audit["before"]["uploaded_by_user_id"], owner.id)
 
     def test_document_pages_enforce_document_ownership(self):
         owner = _current_user("Teacher")
@@ -4509,7 +5021,7 @@ class SchemaV2Tests(unittest.TestCase):
         repository = FakeDocumentPageRepository()
         service = DocumentService(repository)
 
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.list_pages(str(document_id), other_teacher)
 
         result = service.list_pages(str(document_id), owner)
@@ -4557,7 +5069,7 @@ class SchemaV2Tests(unittest.TestCase):
         service = DocumentService(repository)
         payload = DocumentPageUpdateRequest(cleaned_text="new OCR")
 
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.update_page(str(document_id), str(page_id), payload, other_teacher)
 
         result = service.update_page(str(document_id), str(page_id), payload, owner)
@@ -4672,20 +5184,24 @@ class SchemaV2Tests(unittest.TestCase):
         background_tasks = FakeBackgroundTasks()
         service = DocumentService(FakeDocumentActionRepository())
 
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.retry_job(str(document_id), str(failed_job_id), background_tasks, other_teacher)
+        with self.assertRaisesRegex(ValueError, "đang có job chạy"):
+            service.retry_job(str(document_id), str(failed_job_id), background_tasks, owner)
 
-        retried = service.retry_job(str(document_id), str(failed_job_id), background_tasks, owner)
-        self.assertEqual(retried["job"]["attempt_no"], 2)
-        self.assertEqual(retried["job"]["status"], "QUEUED")
-        self.assertEqual(background_tasks.tasks[0]["kwargs"]["document_id"], str(document_id))
-
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.cancel_job(str(document_id), str(active_job_id), other_teacher)
 
         cancelled = service.cancel_job(str(document_id), str(active_job_id), owner)
         self.assertEqual(cancelled["job"]["status"], "CANCELLED")
         self.assertIn("Cancelled by Teacher", cancelled["job"]["error"]["message"])
+
+        retried = service.retry_job(str(document_id), str(failed_job_id), background_tasks, owner)
+        self.assertEqual(retried["job"]["attempt_no"], 2)
+        self.assertEqual(retried["job"]["status"], "QUEUED")
+        self.assertEqual(background_tasks.tasks[0]["kwargs"]["document_id"], str(document_id))
+        with self.assertRaisesRegex(ValueError, "đang có job chạy"):
+            service.retry_job(str(document_id), str(failed_job_id), background_tasks, owner)
 
     def test_document_chunk_job_retry_uses_failed_job_config(self):
         owner = _current_user("Teacher")
@@ -4731,12 +5247,16 @@ class SchemaV2Tests(unittest.TestCase):
             def find_job(self, job_id):
                 return self.jobs.get(str(job_id))
 
+            def list_jobs(self, _document_id, *, limit=20):
+                return list(self.jobs.values())[:limit]
+
         repository = FakeChunkRetryRepository()
         captured = {}
 
-        def fake_queue_chunk_retry(background_tasks, document_id, config):
+        def fake_queue_chunk_retry(background_tasks, document_id, config, *, promote_actor=None):
             captured["document_id"] = document_id
             captured["config"] = config
+            captured["promote_actor"] = promote_actor
             repository.jobs[str(new_job_id)] = {
                 "_id": new_job_id,
                 "document_id": ObjectId(document_id),
@@ -4770,8 +5290,44 @@ class SchemaV2Tests(unittest.TestCase):
 
         self.assertEqual(captured["document_id"], str(document_id))
         self.assertEqual(captured["config"]["chunk_size"], 700)
+        self.assertEqual(captured["promote_actor"], owner.email or str(owner.id))
         self.assertEqual(result["job"]["id"], str(new_job_id))
         self.assertTrue(result["job"]["can_cancel"])
+
+    def test_document_retry_requires_latest_job_and_caps_owner_retries(self):
+        owner = _current_user("Teacher")
+        admin = _current_user("Admin")
+        document_id = ObjectId()
+
+        def job(attempt, status="FAILED"):
+            return {"_id": ObjectId(), "document_id": document_id, "document_version": 1,
+                    "job_type": "OCR", "attempt_no": attempt, "status": status}
+
+        class FakeRetryGuardRepository:
+            def __init__(self, jobs):
+                self.jobs = {str(item["_id"]): item for item in jobs}
+
+            def find_by_id(self, _document_id):
+                return {"_id": document_id, "uploaded_by_user_id": owner.id, "current_version": 1}
+
+            def find_job(self, job_id):
+                return self.jobs.get(str(job_id))
+
+            def list_jobs(self, _document_id, *, limit=20):
+                return list(self.jobs.values())[:limit]
+
+        old, latest = job(1), job(2)
+        service = DocumentService(FakeRetryGuardRepository([old, latest]))
+        with self.assertRaisesRegex(ValueError, "lần chạy mới hơn"):
+            service.retry_job(str(document_id), str(old["_id"]), None, owner)
+
+        fourth = job(4)
+        service = DocumentService(FakeRetryGuardRepository([job(1), job(2), job(3), fourth]))
+        with self.assertRaisesRegex(PermissionError, "quản trị viên"):
+            service.retry_job(str(document_id), str(fourth["_id"]), None, owner)
+        service._ensure_retry_allowed(
+            {"_id": document_id}, fourth, admin,
+        )
 
     def test_cancel_chunk_job_marks_chunk_set_and_pending_embeddings_cancelled(self):
         document_id = ObjectId()
@@ -4937,7 +5493,7 @@ class SchemaV2Tests(unittest.TestCase):
         try:
             chunking_module.queue_document_reindex = fake_queue_document_reindex
             service = DocumentService(repository)
-            with self.assertRaises(PermissionError):
+            with self.assertRaises(LookupError):
                 service.reindex(str(document_id), FakeBackgroundTasks(), other_teacher)
 
             result = service.reindex(str(document_id), FakeBackgroundTasks(), owner)
@@ -5031,6 +5587,7 @@ class SchemaV2Tests(unittest.TestCase):
         question = {
             "_id": question_id,
             "question_code": "Q-1",
+            "created_by_user_id": owner.id,
             "current_version": 1,
             "current_version_id": version_id,
             "approved_version_id": version_id,
@@ -5260,6 +5817,37 @@ class SchemaV2Tests(unittest.TestCase):
 
         self.assertIsNotNone(repository.find(exam["_id"]))
 
+    def test_owner_delete_exam_is_soft_and_hides_exam(self):
+        owner = _current_user("Teacher")
+        exam = _exam_doc(owner.id)
+        repository = FakeExamRepository([exam])
+        service = ExamService(repository, FakeExamQuestionRepository())
+
+        service.delete_exam(str(exam["_id"]), owner)
+
+        stored = repository.exams[str(exam["_id"])]
+        self.assertIsNotNone(stored["deleted_at"])
+        self.assertEqual(str(stored["deleted_by_user_id"]), str(owner.id))
+        self.assertIsNone(repository.find(exam["_id"]))
+        with self.assertRaises(LookupError):
+            service.get_exam(str(exam["_id"]), owner)
+
+    def test_exam_work_requires_teaching_the_subject(self):
+        owner = _current_user("Teacher")
+        exam = _exam_doc(owner.id)
+        service = ExamService(FakeExamRepository([exam]), FakeExamQuestionRepository())
+
+        with patch("modules.users.store.teaching_subject_ids", return_value=set()):
+            with self.assertRaises(PermissionError):
+                service.duplicate_exam(str(exam["_id"]), owner)
+            with self.assertRaises(PermissionError):
+                service.add_questions_manual(
+                    str(exam["_id"]), AddQuestionsManualRequest(question_ids=[str(ObjectId())]), owner,
+                )
+        with patch("modules.users.store.teaching_subject_ids", return_value={str(exam["subject_id"])}):
+            self.assertEqual(service.duplicate_exam(str(exam["_id"]), owner)["status"], "DRAFT")
+
+    @patch("modules.exams.service.ensure_teaches_subjects", new=lambda *args, **kwargs: None)
     def test_duplicate_exam_creates_editable_draft_without_variants(self):
         owner = _current_user("Teacher")
         exam = _exam_doc(owner.id)
@@ -5371,15 +5959,16 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(result["page_size"], 15)
         self.assertEqual(result["total"], 0)
         call = question_repository.calls[0]
-        self.assertEqual(call["review_status"], "APPROVED")
+        self.assertIsNone(call["review_status"])
         self.assertEqual(call["search"], "queue")
         self.assertEqual(call["filters"]["question_type"], "trac_nghiem")
         self.assertEqual(call["filters"]["bloom_level"], 2)
         self.assertEqual(call["filters"]["subject_id"], str(exam["subject_id"]))
         self.assertEqual(call["filters"]["chapter_id"], str(chapter_id))
         self.assertEqual(call["filters"]["difficulty"], "de")
-        self.assertEqual(call["filters"]["owner_user_id"], owner.id)
-        self.assertTrue(call["filters"]["approved_current_only"])
+        self.assertEqual(call["filters"]["visible_to_user_id"], owner.id)
+        self.assertEqual(call["filters"]["shared_subject_ids"], [str(exam["subject_id"])])
+        self.assertTrue(call["filters"]["approved_version_join"])
 
     def test_exam_question_pool_hides_stale_approved_versions(self):
         owner = _current_user("Teacher")
@@ -5432,6 +6021,42 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(result["total"], 1)
         self.assertEqual([item["id"] for item in result["items"]], [str(usable["_id"])])
 
+    @patch("modules.exams.service.ensure_teaches_subjects", new=lambda *args, **kwargs: None)
+    def test_exam_keeps_approved_version_while_question_is_edited(self):
+        owner = _current_user("Teacher")
+        exam = _exam_doc(owner.id)
+        question_id, approved_id, draft_id = ObjectId(), ObjectId(), ObjectId()
+        now = datetime.now(timezone.utc)
+        question = {
+            "_id": question_id, "question_code": "Q-EDIT", "current_version": 2, "created_by_user_id": owner.id,
+            "current_version_id": draft_id, "approved_version_id": approved_id,
+            "lifecycle_status": "ACTIVE", "evaluation_status": "NOT_STARTED",
+            "review_status": "PENDING", "publication_status": "NOT_PUBLISHED",
+            "quality_summary": {}, "review_assignment": {"status": "UNASSIGNED"},
+            "latest_review_id": None, "created_at": now, "updated_at": now,
+        }
+        approved = {
+            "_id": approved_id, "question_id": question_id, "version": 1, "document_id": None,
+            "content": "Queue uses FIFO", "question_data": {"options": {"A": "FIFO"}, "correct_answer": "A"},
+            "classification": {"subject": {"id": exam["subject_id"]}}, "clos": [], "sources": [],
+            "content_hash": "hash-v1",
+        }
+        service = ExamService(FakeExamRepository([exam]), FakeExamQuestionRepository([(question, approved)]))
+
+        pool = service.question_pool(str(exam["_id"]), owner)
+        self.assertEqual([item["current_version_id"] for item in pool["items"]], [str(draft_id)])
+        self.assertEqual(pool["items"][0]["content"], "Queue uses FIFO")
+        updated = service.add_questions_manual(
+            str(exam["_id"]), AddQuestionsManualRequest(question_ids=[str(question_id)]), owner,
+        )
+        self.assertEqual(updated["questions"][0]["version_id"], str(approved_id))
+        ready = service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="READY"), owner)
+        self.assertEqual(ready["status"], "READY")
+
+        question["approved_version_id"] = None
+        with self.assertRaises(ValueError):
+            service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="FINALIZED"), owner)
+
     def test_variant_creation_requires_finalized_exam(self):
         owner = _current_user("Teacher")
         exam = _exam_doc(owner.id)
@@ -5466,6 +6091,186 @@ class SchemaV2Tests(unittest.TestCase):
         )
         self.assertEqual(result["exam_code"], "A01")
 
+    @staticmethod
+    def _approved_exam_question(exam, owner_id, code="Q-1"):
+        question_id, version_id = ObjectId(), ObjectId()
+        question = {
+            "_id": question_id, "question_code": code, "created_by_user_id": owner_id,
+            "current_version": 1, "current_version_id": version_id, "approved_version_id": version_id,
+            "lifecycle_status": "ACTIVE", "review_status": "APPROVED", "evaluation_status": "PASSED",
+            "publication_status": "NOT_PUBLISHED",
+            "created_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc),
+        }
+        version = {
+            "_id": version_id, "question_id": question_id, "created_by_user_id": owner_id,
+            "content": f"{code} content", "content_hash": f"hash-{code}",
+            "question_data": {"options": {"A": "x", "B": "y", "C": "z", "D": "w"}, "correct_answer": "A"},
+            "classification": {"subject": {"id": exam["subject_id"]}},
+        }
+        ref = {"question_id": question_id, "version_id": version_id,
+               "content_snapshot": {"question_code": code, "content": version["content"],
+                                    "question_data": version["question_data"]}}
+        return question, version, ref
+
+    def test_reopen_finalized_exam_requires_owner_reason_and_no_variants(self):
+        owner = _current_user("Teacher")
+        admin = _current_user("Admin")
+        exam = _exam_doc(owner.id)
+        exam["status"] = "FINALIZED"
+        exam["finalized_snapshot"] = {"questions": [], "created_at": datetime.now(timezone.utc)}
+        repository = FakeExamRepository([exam])
+        service = ExamService(repository, FakeExamQuestionRepository())
+
+        with self.assertRaises(ValueError):
+            service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="DRAFT"), owner)
+        with self.assertRaises(PermissionError):
+            service.reopen_exam(str(exam["_id"]), "Sửa câu 3 sai đáp án", admin)
+        repository.variants.append({"_id": ObjectId(), "exam_id": exam["_id"]})
+        with self.assertRaises(ValueError):
+            service.reopen_exam(str(exam["_id"]), "Sửa câu 3 sai đáp án", owner)
+        repository.variants.clear()
+        with self.assertRaises(ValueError):
+            service.reopen_exam(str(exam["_id"]), "   ", owner)
+
+        reopened = service.reopen_exam(str(exam["_id"]), "Sửa câu 3 sai đáp án", owner)
+
+        self.assertEqual(reopened["status"], "DRAFT")
+        self.assertIsNone(exam["finalized_snapshot"])
+        self.assertEqual(exam["voided_snapshots"][0]["void_reason"], "Sửa câu 3 sai đáp án")
+        self.assertEqual(reopened["reopen_history"][0]["reason"], "Sửa câu 3 sai đáp án")
+        self.assertEqual(repository.audit_events[-1]["action"], "exam.reopened")
+
+    def test_publish_needs_a_variant_and_freezes_variants(self):
+        owner = _current_user("Teacher")
+        exam = _exam_doc(owner.id)
+        exam["status"] = "FINALIZED"
+        exams = FakeExamRepository([exam])
+        service = ExamService(exams, FakeExamQuestionRepository())
+        variants = FakeExamVariantRepository()
+        variant_service = ExamVariantService(exams, variants)
+
+        with self.assertRaises(ValueError):
+            service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="PUBLISHED"), owner)
+        variant = {"_id": ObjectId(), "exam_id": exam["_id"], "exam_code": "A01", "questions": [],
+                   "answer_key": {}, "created_at": datetime.now(timezone.utc)}
+        variants.create(variant)
+        exams.variants.append(variant)
+
+        published = service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="PUBLISHED"), owner)
+
+        self.assertEqual(published["status"], "PUBLISHED")
+        self.assertIsNotNone(published["published_at"])
+        self.assertEqual(exams.audit_events[-1]["action"], "exam.published")
+        with self.assertRaises(ValueError):
+            variant_service.create_variant(str(exam["_id"]), ExamVariantCreateRequest(exam_code="B02"), owner)
+        with self.assertRaises(ValueError):
+            variant_service.delete_variant(str(exam["_id"]), str(variant["_id"]), owner)
+        with self.assertRaises(ValueError):
+            service.reopen_exam(str(exam["_id"]), "Phát hiện lỗi", owner)
+        archived = service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="ARCHIVED"), owner)
+        self.assertEqual(archived["status"], "ARCHIVED")
+
+    def test_draft_exam_item_flags_block_finalize(self):
+        owner = _current_user("Teacher")
+        exam = _exam_doc(owner.id)
+        exam["question_count"] = 3
+        archived_q, archived_v, archived_ref = self._approved_exam_question(exam, owner.id, "Q-ARC")
+        changed_q, changed_v, changed_ref = self._approved_exam_question(exam, owner.id, "Q-VER")
+        revoked_q, revoked_v, revoked_ref = self._approved_exam_question(exam, owner.id, "Q-ACC")
+        exam["questions"] = [archived_ref, changed_ref, revoked_ref]
+        service = ExamService(
+            FakeExamRepository([exam]),
+            FakeExamQuestionRepository([(archived_q, archived_v), (changed_q, changed_v), (revoked_q, revoked_v)]),
+        )
+        archived_q["lifecycle_status"] = "ARCHIVED"
+        changed_ref["version_id"] = ObjectId()
+        other = ObjectId()
+        revoked_q["created_by_user_id"] = other
+        revoked_v["created_by_user_id"] = other
+
+        flags = {item["question_code"]: item["flags"] for item in service.get_exam(str(exam["_id"]), owner)["item_flags"]}
+
+        self.assertEqual(flags, {"Q-ARC": ["archived_item"], "Q-VER": ["version_changed"],
+                                 "Q-ACC": ["access_revoked"]})
+        with self.assertRaisesRegex(ValueError, "gắn cờ"):
+            service.update_status(str(exam["_id"]), ExamStatusUpdateRequest(status="READY"), owner)
+        revoked_q["shared_with_user_ids"] = [owner.id]
+        flags = service.get_exam(str(exam["_id"]), owner)["item_flags"]
+        self.assertNotIn("Q-ACC", {item["question_code"] for item in flags})
+
+    def test_exam_selection_and_variant_shuffle_reproduce_from_seed(self):
+        owner = _current_user("Teacher")
+        exam = _exam_doc(owner.id)
+        exam["question_count"] = 3
+        exam["matrix"] = [{"chapter_id": None, "cognitive_level": "nhan_biet", "difficulty": "de", "count": 3}]
+        pairs = []
+        for index in range(8):
+            question, version, _ref = self._approved_exam_question(exam, owner.id, f"Q-{index}")
+            pairs.append((question, version))
+        service = ExamService(FakeExamRepository([exam]), FakeExamQuestionRepository(pairs))
+
+        with patch.object(service, "_assert_teaches_subject", lambda *_args: None):
+            first = service.auto_generate_pool(str(exam["_id"]), owner, seed=42)
+            again = service.auto_generate_pool(str(exam["_id"]), owner, seed=42)
+            unseeded = service.auto_generate_pool(str(exam["_id"]), owner)
+
+        self.assertEqual(first["selection_seed"], 42)
+        self.assertEqual([item["question_id"] for item in first["questions"]],
+                         [item["question_id"] for item in again["questions"]])
+        self.assertIsInstance(unseeded["selection_seed"], int)
+
+        exam["status"] = "FINALIZED"
+        exam["finalized_snapshot"] = {"questions": exam["questions"]}
+        variants = FakeExamVariantRepository()
+        variant_service = ExamVariantService(FakeExamRepository([exam]), variants)
+        one = variant_service.create_variant(str(exam["_id"]), ExamVariantCreateRequest(exam_code="A", seed=7), owner)
+        two = variant_service.create_variant(str(exam["_id"]), ExamVariantCreateRequest(exam_code="B", seed=7), owner)
+        self.assertEqual(one["shuffle_seed"], 7)
+        self.assertEqual(one["answer_key"], two["answer_key"])
+        self.assertEqual([q["question_id"] for q in one["questions"]], [q["question_id"] for q in two["questions"]])
+
+    def test_shared_exam_is_view_only_and_owner_transfer_is_admin_only(self):
+        owner = _current_user("Teacher")
+        viewer = _current_user("Teacher")
+        admin = _current_user("Admin")
+        exam = _exam_doc(owner.id)
+        repository = FakeExamRepository([exam])
+        service = ExamService(repository, FakeExamQuestionRepository())
+        active_users = {viewer.id: {"_id": viewer.id, "role": "Teacher"}}
+
+        def fake_users(_db, ids, active_only=False):
+            return [active_users[item] for item in ids if item in active_users]
+
+        with patch("modules.exams.service.get_database", return_value=None), \
+                patch("modules.exams.service.users_by_ids", side_effect=fake_users):
+            with self.assertRaises(LookupError):
+                service.get_exam(str(exam["_id"]), viewer)
+            with self.assertRaises(ValueError):
+                service.update_sharing(str(exam["_id"]), ExamSharingRequest(shared_with_user_ids=[str(ObjectId())]),
+                                       owner)
+            shared = service.update_sharing(str(exam["_id"]),
+                                            ExamSharingRequest(shared_with_user_ids=[str(viewer.id)]), owner)
+            self.assertEqual(shared["shared_with_user_ids"], [str(viewer.id)])
+            self.assertEqual(repository.audit_events[-1]["action"], "exam.sharing_update")
+
+            view = service.get_exam(str(exam["_id"]), viewer)
+            self.assertFalse(view["can_edit"])
+            self.assertEqual([item["id"] for item in service.list_exams(1, 20, viewer)["items"]], [str(exam["_id"])])
+            with self.assertRaises(PermissionError):
+                service.update_exam(str(exam["_id"]), ExamUpdateRequest(name="Đổi tên"), viewer)
+            with self.assertRaises(PermissionError):
+                service.update_sharing(str(exam["_id"]), ExamSharingRequest(shared_with_user_ids=[]), viewer)
+
+            transfer = ExamOwnerTransferRequest(new_owner_user_id=str(viewer.id), reason="Giảng viên nghỉ hưu")
+            with self.assertRaises(PermissionError):
+                service.transfer_owner(str(exam["_id"]), transfer, owner)
+            moved = service.transfer_owner(str(exam["_id"]), transfer, admin)
+
+        self.assertEqual(moved["created_by_user_id"], str(viewer.id))
+        self.assertEqual(moved["shared_with_user_ids"], [])
+        self.assertEqual(repository.audit_events[-1]["action"], "exam.owner_transferred")
+        self.assertEqual(repository.audit_events[-1]["metadata"]["reason"], "Giảng viên nghỉ hưu")
+
     def test_variant_preview_enforces_exam_ownership(self):
         owner = _current_user("Teacher")
         other_teacher = _current_user("Teacher")
@@ -5483,7 +6288,7 @@ class SchemaV2Tests(unittest.TestCase):
             FakeExamVariantRepository([variant]),
         )
 
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(LookupError):
             service.build_preview(str(exam["_id"]), str(variant["_id"]), other_teacher)
 
     def test_exam_ownership_is_enforced_across_mutation_and_variant_methods(self):
@@ -5543,8 +6348,65 @@ class SchemaV2Tests(unittest.TestCase):
         ]
 
         for call in [*exam_method_calls, *variant_method_calls]:
-            with self.assertRaises(PermissionError):
+            with self.assertRaises(LookupError):
                 call()
+
+    def _exported_exam_fixture(self):
+        owner = _current_user("Teacher")
+        viewer = _current_user("Teacher")
+        exam = {**_exam_doc(owner.id), "status": "FINALIZED", "shared_with_user_ids": [ObjectId(viewer.id)]}
+        snapshot = {"content": "Câu 1?", "question_data": {
+            "options": {"A": "x", "B": "y"}, "correct_answer": "A", "explanation": "Vì x",
+        }}
+        variant = {
+            "_id": ObjectId(), "exam_id": exam["_id"], "exam_code": "A01",
+            "questions": [{"order": 1, "question_id": ObjectId(), "content_snapshot": snapshot}],
+            "answer_key": {"q": "A"}, "created_at": datetime.now(timezone.utc),
+        }
+        exams = FakeExamRepository([exam], variants=[variant])
+        variants = FakeExamVariantRepository([variant])
+        return owner, viewer, exam, variant, exams, variants
+
+    def test_shared_viewer_gets_watermarked_preview_without_answers(self):
+        owner, viewer, exam, variant, exams, variants = self._exported_exam_fixture()
+        service = ExamVariantService(exams, variants)
+
+        with self.assertRaises(PermissionError):
+            service.export_access(str(exam["_id"]), str(variant["_id"]), "de_dapan", viewer)
+        _exam, preview, official = service.export_access(str(exam["_id"]), str(variant["_id"]), "de", viewer)
+        self.assertFalse(official)
+        question_data = preview["questions"][0]["content_snapshot"]["question_data"]
+        self.assertNotIn("correct_answer", question_data)
+        self.assertNotIn("explanation", question_data)
+        shown = service.get_variant(str(exam["_id"]), str(variant["_id"]), viewer)
+        self.assertEqual(shown["answer_key"], {})
+        self.assertNotIn("correct_answer", shown["questions"][0]["content_snapshot"]["question_data"])
+        self.assertEqual(variant["answer_key"], {"q": "A"})
+
+        _exam, full, official = service.export_access(str(exam["_id"]), str(variant["_id"]), "de_dapan", owner)
+        self.assertTrue(official)
+        self.assertEqual(full["questions"][0]["content_snapshot"]["question_data"]["correct_answer"], "A")
+
+    def test_official_export_is_recorded_and_blocks_variant_delete(self):
+        owner, _viewer, exam, variant, exams, variants = self._exported_exam_fixture()
+        service = ExamVariantService(exams, variants)
+
+        service.record_official_export(exam, variant, export_type="de", file_format="pdf", current_user=owner)
+
+        self.assertIsNotNone(exam["official_exported_at"])
+        self.assertEqual(exams.audit_events[-1]["action"], "exam.official_exported")
+        with self.assertRaisesRegex(ValueError, "xuất bản chính thức"):
+            service.delete_variant(str(exam["_id"]), str(variant["_id"]), owner)
+        self.assertIn(str(variant["_id"]), variants.variants)
+
+    def test_variant_delete_before_export_is_audited(self):
+        owner, _viewer, exam, variant, exams, variants = self._exported_exam_fixture()
+        service = ExamVariantService(exams, variants)
+
+        service.delete_variant(str(exam["_id"]), str(variant["_id"]), owner)
+
+        self.assertNotIn(str(variant["_id"]), variants.variants)
+        self.assertEqual(variants.deleted_audit["action"], "exam.variant_deleted")
 
     def test_cannot_deactivate_last_active_admin(self):
         admin_doc = _user_doc("Admin", True)
@@ -5878,6 +6740,49 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(changed["after"]["subject_name"], "CTDL mới")
         self.assertEqual(db.audit_logs.records[3]["entity"]["id"], ObjectId(chapter_id))
         self.assertEqual(db.audit_logs.records[5]["entity"]["id"], ObjectId(clo_id))
+
+    def test_teacher_subject_waits_for_admin_approval_and_stays_private(self):
+        db = FakeCatalogDatabase()
+        service = CatalogService(db)
+        owner = _current_user("Teacher")
+        other = _current_user("Teacher")
+        admin = _current_user("Admin")
+
+        created = service.create_subject(SubjectPayload(subject_code="ML", subject_name="Học máy"), owner)
+        self.assertEqual(created["approval_status"], "PENDING_APPROVAL")
+        self.assertEqual([item["id"] for item in service.list_subjects(owner)], [created["id"]])
+        self.assertEqual(service.list_subjects(other), [])
+        self.assertEqual(len(service.list_subjects(admin)), 1)
+        with self.assertRaises(LookupError):
+            service.update_subject(created["id"], SubjectUpdatePayload(subject_name="Khác"), other)
+        with self.assertRaises(PermissionError):
+            service.approve_subject(created["id"], owner)
+
+        rejected = service.reject_subject(created["id"], "Trùng học phần có sẵn", admin)
+        self.assertEqual(rejected["approval_status"], "REJECTED")
+        self.assertEqual(rejected["approval_reason"], "Trùng học phần có sẵn")
+        self.assertEqual(service.list_subjects(other), [])
+        with self.assertRaises(ValueError):
+            service.approve_subject(created["id"], admin)
+
+        resubmitted = service.resubmit_subject(created["id"], owner)
+        self.assertEqual(resubmitted["approval_status"], "PENDING_APPROVAL")
+        approved = service.approve_subject(created["id"], admin)
+        self.assertEqual(approved["approval_status"], "APPROVED")
+        self.assertEqual(len(service.list_subjects(other)), 1)
+
+        actions = [item["action"] for item in db.audit_logs.records]
+        self.assertEqual(actions, [
+            "catalog.subject_create", "catalog.subject_reject",
+            "catalog.subject_resubmit", "catalog.subject_approve",
+        ])
+
+    def test_admin_created_subject_is_approved_immediately(self):
+        service = CatalogService(FakeCatalogDatabase())
+        created = service.create_subject(
+            SubjectPayload(subject_code="CSDL", subject_name="Cơ sở dữ liệu"), _current_user("Admin"),
+        )
+        self.assertEqual(created["approval_status"], "APPROVED")
 
     def test_ai_prompt_and_evaluation_policy_audit_tracks_versions_without_secrets(self):
         db = FakeCatalogDatabase()
@@ -6717,14 +7622,18 @@ class SchemaV2Tests(unittest.TestCase):
         chunk_job_id = ObjectId()
         chunk_set_id = ObjectId()
         fresh_generation_id = ObjectId()
+        stale_generation_id = ObjectId()
+        queued_generation_id = ObjectId()
 
         class FakeRecoveryDatabase:
             def __init__(self):
                 self.generation_jobs = InMemoryCollection(
                     [
-                        {"_id": ObjectId(), "status": "processing", "updated_at": old},
-                        {"_id": ObjectId(), "status": "queued", "updated_at": old},
-                        {"_id": fresh_generation_id, "status": "processing", "updated_at": fresh},
+                        {"_id": stale_generation_id, "status": "processing", "updated_at": old,
+                         "lease_expires_at": old, "attempt_count": 1, "max_attempts": 3},
+                        {"_id": queued_generation_id, "status": "queued", "updated_at": old},
+                        {"_id": fresh_generation_id, "status": "processing", "updated_at": fresh,
+                         "lease_expires_at": now + timedelta(minutes=5)},
                     ]
                 )
                 self.evaluation_jobs = InMemoryCollection(
@@ -6784,9 +7693,11 @@ class SchemaV2Tests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            {"generation_failed": 2, "evaluation_stale": 1, "document_failed": 1},
+            {"generation_requeued": 1, "evaluation_stale": 1, "document_failed": 1},
         )
         self.assertEqual(db.generation_jobs.find_one({"_id": fresh_generation_id})["status"], "processing")
+        self.assertEqual(db.generation_jobs.find_one({"_id": stale_generation_id})["status"], "queued")
+        self.assertEqual(db.generation_jobs.find_one({"_id": queued_generation_id})["status"], "queued")
         self.assertEqual(db.evaluation_jobs.find_one({"_id": evaluation_job_id})["status"], "STALE")
         question = db.questions.find_one({"_id": question_id})
         self.assertEqual(question["evaluation_status"], "STALE")
@@ -7222,13 +8133,13 @@ class SchemaV2Tests(unittest.TestCase):
             bloom_level=BloomLevel.HIEU,
             question_plan=[
                 {"question_type": QuestionType.TRAC_NGHIEM, "bloom_level": BloomLevel.HIEU, "num_questions": 3},
-                {"question_type": QuestionType.DUNG_SAI, "bloom_level": BloomLevel.PHAN_TICH, "num_questions": 4},
+                {"question_type": QuestionType.DUNG_SAI, "bloom_level": BloomLevel.VAN_DUNG, "num_questions": 4},
             ],
             instruction="Tập trung vào cây nhị phân tìm kiếm.",
         )
 
         self.assertEqual(sum(item.num_questions for item in req.effective_plan()), 7)
-        self.assertEqual(req.effective_plan()[1].bloom_level, BloomLevel.PHAN_TICH)
+        self.assertEqual(req.effective_plan()[1].bloom_level, BloomLevel.VAN_DUNG)
         self.assertEqual(req.instruction, "Tập trung vào cây nhị phân tìm kiếm.")
 
     def test_generation_request_rejects_oversized_plan(self):
@@ -7237,8 +8148,8 @@ class SchemaV2Tests(unittest.TestCase):
                 document_id="507f1f77bcf86cd799439011",
                 bloom_level=BloomLevel.HIEU,
                 question_plan=[
-                    {"question_type": QuestionType.TRAC_NGHIEM, "num_questions": 4},
-                    {"question_type": QuestionType.DUNG_SAI, "num_questions": 4},
+                    {"question_type": QuestionType.TRAC_NGHIEM, "num_questions": 26},
+                    {"question_type": QuestionType.DUNG_SAI, "num_questions": 25},
                 ],
             )
 

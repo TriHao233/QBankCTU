@@ -9,7 +9,7 @@ from bson import ObjectId
 from psycopg.types.json import Jsonb
 
 from core.postgres import postgres_connection
-from modules.dictionary.constants import DEFAULT_CORE_KEYWORDS
+from modules.dictionary.constants import DICTIONARY_CATEGORY, DICTIONARY_NAME
 
 
 def _now() -> datetime:
@@ -23,7 +23,7 @@ def _keyword_id(dictionary_id: str, status: str, keyword: str) -> str:
 
 
 class PostgresDictionaryRepository:
-    def init_default_dictionary(self, course_id: str = "it_fundamentals") -> None:
+    def init_default_dictionary(self, course_id: str) -> None:
         with postgres_connection() as conn:
             if conn.execute("SELECT 1 FROM legacy_dictionaries WHERE course_id=%s", (course_id,)).fetchone():
                 return
@@ -32,34 +32,25 @@ class PostgresDictionaryRepository:
         payload = {
             "_id": dictionary_id,
             "course_id": course_id,
-            "name": "Từ điển Công nghệ Thông tin Căn bản",
-            "category": "tech_keywords",
+            "name": DICTIONARY_NAME,
+            "category": DICTIONARY_CATEGORY,
             "is_active": True,
-            "core_keywords": list(DEFAULT_CORE_KEYWORDS),
+            "core_keywords": [],
             "learned_keywords": [],
             "pending_keywords": [],
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
         }
         with postgres_connection() as conn:
-            with conn.transaction():
-                inserted = conn.execute("""
-                    INSERT INTO legacy_dictionaries
-                        (id, course_id, name, category, is_active, payload, created_at, updated_at)
-                    VALUES (%s,%s,%s,%s,true,%s,%s,%s)
-                    ON CONFLICT (course_id) DO NOTHING RETURNING id
-                """, (dictionary_id, course_id, payload["name"], payload["category"],
-                      Jsonb(payload), now, now)).fetchone()
-                if not inserted:
-                    return
-                for keyword in DEFAULT_CORE_KEYWORDS:
-                    conn.execute("""
-                        INSERT INTO keywords (id, subject_id, keyword, status, payload)
-                        VALUES (%s,NULL,%s,'CORE',%s)
-                    """, (_keyword_id(dictionary_id, "CORE", keyword), keyword,
-                          Jsonb({"course_id": course_id, "dictionary_id": dictionary_id})))
+            conn.execute("""
+                INSERT INTO legacy_dictionaries
+                    (id, course_id, name, category, is_active, payload, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,true,%s,%s,%s)
+                ON CONFLICT (course_id) DO NOTHING
+            """, (dictionary_id, course_id, payload["name"], payload["category"],
+                  Jsonb(payload), now, now))
 
-    def get_active_keywords(self, course_id: str = "it_fundamentals") -> list[str]:
+    def get_active_keywords(self, course_id: str) -> list[str]:
         self.init_default_dictionary(course_id)
         with postgres_connection() as conn:
             dictionary = conn.execute("""

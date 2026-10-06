@@ -105,3 +105,15 @@ test('effective reviewer permissions respect revokes and retain legacy fallback'
   assert.equal(hasEffectivePermission({ role: 'Reviewer' }, 'reviews.manage'), true);
   assert.equal(hasEffectivePermission(null, 'reviews.manage'), false);
 });
+test('revoked permissions close pages even when the role matches', () => {
+  const teacherWithoutGenerate = {
+    role: 'Teacher',
+    permissions: ROLE_DEFAULT_PERMISSIONS.Teacher.filter((key) => key !== 'questions.generate'),
+  };
+  assert.equal(canAccessPath(teacherWithoutGenerate, '/sinh-cau-hoi'), false);
+  assert.equal(canAccessPath(teacherWithoutGenerate, '/quan-ly'), true);
+  assert.equal(canAccessPath({ role: 'Reviewer', permissions: [] }, '/kiem-duyet'), false);
+  assert.equal(canAccessPath({ role: 'Reviewer', permissions: [] }, '/lich-cong-viec'), true);
+  assert.equal(canAccessPath({ role: 'Teacher' }, '/sinh-cau-hoi'), true);
+  assert.equal(canAccessPath({ role: 'Admin', permissions: [] }, '/kiem-duyet'), true);
+});

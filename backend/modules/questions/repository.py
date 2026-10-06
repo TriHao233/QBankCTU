@@ -8,11 +8,13 @@ from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.database import Database
 
+from core.audit import write_audit_event
 from core.bootstrap import SCHEMA_VERSION
 from core.config import settings
 from core.database import mongo_transaction
 from modules.catalog.postgres_subject_repository import subject_record
 from modules.documents.store import get_document_repository
+from modules.users.store import find_user_record
 
 
 def utc_now() -> datetime:
@@ -26,6 +28,73 @@ def object_id(value: str | ObjectId, field_name: str = "id") -> ObjectId:
         return ObjectId(value)
     except Exception as exc:
         raise ValueError(f"{field_name} không hợp lệ") from exc
+
+
+SHARING_ID_LIST_FIELDS = ("shared_with_user_ids", "shared_edit_user_ids")
+
+
+def normalize_sharing_fields(fields: dict) -> dict:
+    normalized = dict(fields)
+    for key in SHARING_ID_LIST_FIELDS:
+        if key in normalized:
+            normalized[key] = [object_id(item, key[:-1]) for item in normalized.get(key) or []]
+    if normalized.get("created_by_user_id") is not None:
+        normalized["created_by_user_id"] = object_id(normalized["created_by_user_id"], "created_by_user_id")
+    return normalized
+
+
+REVIEW_IN_PROGRESS = "REVIEW_IN_PROGRESS"
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _empty_assignment() -> dict:
+    return {
+        "status": "UNASSIGNED", "reviewer_user_id": None, "assigned_by_user_id": None,
+        "assigned_at": None, "claimed_at": None, "lock_expires_at": None,
+        "last_released_at": None, "release_reason": None,
+    }
+
+
+def review_claim_active(question: dict, now: datetime) -> bool:
+    assignment = question.get("review_assignment") or {}
+    if question.get("review_status") != "PENDING" or assignment.get("status") != "IN_REVIEW":
+        return False
+    expires_at = _aware(assignment.get("lock_expires_at"))
+    return expires_at is None or expires_at > _aware(now)
+
+
+def review_fields_after_edit(question: dict, now: datetime, review_submission: dict | None) -> dict:
+    """Review state of a question after its author saves a new version.
+
+    Every edit returns the question to DRAFT, so a PENDING question leaves the queue
+    and must be resubmitted through the submission checks; a reviewer's active claim
+    blocks the edit. A standing two-reviewer requirement survives the edit and
+    restarts from its first review.
+    """
+    if review_claim_active(question, now):
+        raise RuntimeError(REVIEW_IN_PROGRESS)
+    secondary = question.get("secondary_review") or {}
+    sticky_secondary = {}
+    if secondary.get("required") and secondary.get("status") in {"REQUESTED", "AWAITING_SECONDARY"}:
+        sticky_secondary = {
+            **secondary, "status": "REQUESTED", "primary_review_id": None,
+            "primary_reviewer_user_id": None, "secondary_review_id": None, "completed_at": None,
+        }
+    return {
+        "review_status": "DRAFT", "review_assignment": _empty_assignment(),
+        "review_submission": {}, "secondary_review": sticky_secondary,
+    }
+
+
+def _subject_oids(values) -> list:
+    return [ObjectId(str(item)) for item in values or () if ObjectId.is_valid(str(item))]
 
 
 def json_safe(value):
@@ -110,6 +179,7 @@ def serialize_question(question: dict, version: dict) -> dict:
             "quality_summary": question.get("quality_summary") or {},
             "review_assignment": question.get("review_assignment") or {"status": "UNASSIGNED"},
             "shared_with_user_ids": question.get("shared_with_user_ids") or [],
+            "shared_edit_user_ids": question.get("shared_edit_user_ids") or [],
             "shared_scope": question.get("shared_scope") or "PRIVATE",
             "secondary_review": question.get("secondary_review") or {},
             "latest_review_id": question.get("latest_review_id"),
@@ -121,6 +191,10 @@ def serialize_question(question: dict, version: dict) -> dict:
 
 class QuestionRepository(Protocol):
     def find_pair(self, question_id: str | ObjectId) -> tuple[dict, dict] | None: ...
+
+    def find_approved_pair(self, question_id: str | ObjectId) -> tuple[dict, dict] | None: ...
+
+    def reviewer_has_decided(self, question_id: str | ObjectId, reviewer_user_id: ObjectId) -> bool: ...
 
     def list(
         self,
@@ -145,7 +219,11 @@ class QuestionRepository(Protocol):
         creator_user_id: ObjectId | None = None,
         owner_user_id: ObjectId | None = None,
         visible_to_user_id: ObjectId | None = None,
+        shared_subject_ids=None,
+        include_shared: bool = True,
         approved_current_only: bool = False,
+        approved_version_join: bool = False,
+        reviewer_scope=None,
         waiting_since: datetime | None = None,
         overdue_at: datetime | None = None,
         override_only: bool = False,
@@ -179,11 +257,13 @@ class QuestionRepository(Protocol):
         review_submission: dict | None = None,
     ) -> tuple[dict, dict] | None: ...
 
-    def archive(self, question_id: str | ObjectId) -> bool: ...
+    def archive(self, question_id: str | ObjectId, *, audit: dict | None = None,
+                expected_review_status: str | None = None, extra_fields: dict | None = None) -> bool: ...
 
     def list_versions(self, question_id: str | ObjectId) -> list[dict]: ...
 
-    def update_sharing(self, question_id: str | ObjectId, fields: dict) -> tuple[dict, dict] | None: ...
+    def update_sharing(self, question_id: str | ObjectId, fields: dict, *,
+                       audit: dict | None = None) -> tuple[dict, dict] | None: ...
 
 
 class QuestionReferenceRepository(Protocol):
@@ -214,10 +294,16 @@ class QuestionReferenceRepository(Protocol):
 
     def find_subject(self, subject_id: ObjectId) -> dict | None: ...
 
+    def reviewer_subject_ids(self, user_id: ObjectId) -> list: ...
+
 
 class MongoQuestionReferenceRepository:
     def __init__(self, database: Database):
         self.db = database
+
+    def reviewer_subject_ids(self, user_id: ObjectId) -> list:
+        record = find_user_record(self.db, user_id) or {}
+        return list(record.get("review_subject_ids") or [])
 
     def find_chunk(self, chunk_id: ObjectId) -> dict | None:
         return self.db.document_chunks.find_one({"_id": chunk_id})
@@ -316,6 +402,28 @@ class MongoQuestionRepository:
             raise RuntimeError("Question aggregate bị thiếu current version")
         return question, version
 
+    def reviewer_has_decided(self, question_id: str | ObjectId, reviewer_user_id: ObjectId) -> bool:
+        return self.db.question_reviews.find_one(
+            {"question_id": object_id(question_id, "question_id"), "reviewer_user_id": reviewer_user_id},
+            {"_id": 1},
+        ) is not None
+
+    def find_approved_pair(self, question_id: str | ObjectId) -> tuple[dict, dict] | None:
+        """The question with its last approved version, independent of newer drafts."""
+        question = self.db.questions.find_one(
+            {
+                "_id": object_id(question_id, "question_id"),
+                "schema_version": SCHEMA_VERSION,
+                "lifecycle_status": "ACTIVE",
+            }
+        )
+        if not question or not question.get("approved_version_id"):
+            return None
+        version = self.db.question_versions.find_one(
+            {"_id": question["approved_version_id"], "question_id": question["_id"]}
+        )
+        return (question, version) if version else None
+
     def list(
         self,
         page: int,
@@ -339,7 +447,11 @@ class MongoQuestionRepository:
         creator_user_id: ObjectId | None = None,
         owner_user_id: ObjectId | None = None,
         visible_to_user_id: ObjectId | None = None,
+        shared_subject_ids=None,
+        include_shared: bool = True,
         approved_current_only: bool = False,
+        approved_version_join: bool = False,
+        reviewer_scope=None,
         waiting_since: datetime | None = None,
         overdue_at: datetime | None = None,
         override_only: bool = False,
@@ -420,7 +532,7 @@ class MongoQuestionRepository:
             {
                 "$lookup": {
                     "from": "question_versions",
-                    "localField": "current_version_id",
+                    "localField": "approved_version_id" if approved_version_join else "current_version_id",
                     "foreignField": "_id",
                     "as": "version",
                 }
@@ -441,20 +553,51 @@ class MongoQuestionRepository:
                     "$match": {
                         "$or": [
                             {"created_by_user_id": owner_user_id},
-                            {"version.created_by_user_id": owner_user_id},
+                            {"created_by_user_id": None, "version.created_by_user_id": owner_user_id},
                         ]
                     }
                 }
             )
+        def shared_clauses(uid) -> list[dict]:
+            if not include_shared:
+                return []
+            return [
+                {"shared_with_user_ids": uid},
+                {"shared_scope": "SUBJECT", "approved_version_id": {"$ne": None},
+                 "subject_id": {"$in": _subject_oids(shared_subject_ids)}},
+            ]
+
         if visible_to_user_id is not None:
             pipeline.append(
                 {
                     "$match": {
                         "$or": [
                             {"created_by_user_id": visible_to_user_id},
-                            {"version.created_by_user_id": visible_to_user_id},
-                            {"shared_with_user_ids": visible_to_user_id},
-                            {"shared_scope": "SUBJECT"},
+                            {"created_by_user_id": None, "version.created_by_user_id": visible_to_user_id},
+                            *shared_clauses(visible_to_user_id),
+                        ]
+                    }
+                }
+            )
+        if reviewer_scope is not None:
+            uid = reviewer_scope.user_id
+            reviewed_ids = self.db.question_reviews.distinct("question_id", {"reviewer_user_id": uid})
+            pending_scope: dict = {
+                "review_status": "PENDING",
+                "subject_id": {"$in": _subject_oids(reviewer_scope.subject_ids)},
+            }
+            pipeline.append(
+                {
+                    "$match": {
+                        "$or": [
+                            {"created_by_user_id": uid},
+                            {"created_by_user_id": None, "version.created_by_user_id": uid},
+                            *shared_clauses(uid),
+                            {"review_assignment.reviewer_user_id": uid},
+                            {"secondary_review.primary_reviewer_user_id": uid},
+                            {"secondary_review.secondary_reviewer_user_id": uid},
+                            pending_scope,
+                            {"_id": {"$in": reviewed_ids}},
                         ]
                     }
                 }
@@ -615,26 +758,12 @@ class MongoQuestionRepository:
             "current_version": expected_version + 1,
             "current_version_id": new_version["_id"],
             "evaluation_status": "NOT_STARTED",
-            # Editing always creates a draft version.  A new version must be
-            # submitted explicitly instead of silently re-entering review.
-            "review_status": "DRAFT",
             "publication_status": (
                 "STALE"
                 if question["publication_status"] == "PUBLISHED"
                 else question["publication_status"]
             ),
-            "review_assignment": {
-                "status": "UNASSIGNED",
-                "reviewer_user_id": None,
-                "assigned_by_user_id": None,
-                "assigned_at": None,
-                "claimed_at": None,
-                "lock_expires_at": None,
-                "last_released_at": None,
-                "release_reason": None,
-            },
-            "review_submission": {},
-            "secondary_review": {},
+            **review_fields_after_edit(question, now, review_submission),
             "quality_summary": {},
             "subject_id": (
                 ((new_version.get("classification") or {}).get("subject") or {}).get("id")
@@ -648,11 +777,20 @@ class MongoQuestionRepository:
                     "_id": question["_id"],
                     "current_version": expected_version,
                     "lifecycle_status": "ACTIVE",
+                    # A reviewer claiming between our read and this write wins.
+                    "$nor": [{
+                        "review_status": "PENDING",
+                        "review_assignment.status": "IN_REVIEW",
+                        "review_assignment.lock_expires_at": {"$gt": now},
+                    }],
                 },
                 {"$set": aggregate_fields},
                 session=session,
             )
             if not result.modified_count:
+                latest = self.db.questions.find_one({"_id": question["_id"]}) or {}
+                if review_claim_active(latest, now):
+                    raise RuntimeError(REVIEW_IN_PROGRESS)
                 raise RuntimeError("VERSION_CONFLICT")
         updated = self.db.questions.find_one({"_id": question["_id"]})
         return updated, new_version
@@ -698,23 +836,116 @@ class MongoQuestionRepository:
             return None
         return self.find_pair(question_oid)
 
-    def archive(self, question_id: str | ObjectId) -> bool:
+    def archive(self, question_id: str | ObjectId, *, audit: dict | None = None,
+                expected_review_status: str | None = None, extra_fields: dict | None = None) -> bool:
         now = utc_now()
-        result = self.db.questions.update_one(
-            {
-                "_id": object_id(question_id, "question_id"),
-                "schema_version": SCHEMA_VERSION,
-                "lifecycle_status": "ACTIVE",
-            },
-            {
-                "$set": {
-                    "lifecycle_status": "ARCHIVED",
-                    "archived_at": now,
-                    "updated_at": now,
-                }
-            },
-        )
+        query = {
+            "_id": object_id(question_id, "question_id"),
+            "schema_version": SCHEMA_VERSION,
+            "lifecycle_status": "ACTIVE",
+        }
+        if expected_review_status is not None:
+            query["review_status"] = expected_review_status
+        with mongo_transaction() as session:
+            result = self.db.questions.update_one(
+                query,
+                {
+                    "$set": {
+                        **(extra_fields or {}),
+                        "lifecycle_status": "ARCHIVED",
+                        "archived_at": now,
+                        "updated_at": now,
+                    }
+                },
+                session=session,
+            )
+            if result.matched_count == 1 and audit:
+                write_audit_event(self.db, session=session, **audit)
         return result.matched_count == 1
+
+    def _with_current_version(self, question: dict | None) -> tuple[dict, dict] | None:
+        if not question:
+            return None
+        version = self.db.question_versions.find_one({"_id": question["current_version_id"]})
+        return (question, version) if version else None
+
+    def find_archived_pair(self, question_id: str | ObjectId) -> tuple[dict, dict] | None:
+        return self._with_current_version(self.db.questions.find_one({
+            "_id": object_id(question_id, "question_id"),
+            "schema_version": SCHEMA_VERSION,
+            "lifecycle_status": "ARCHIVED",
+        }))
+
+    def list_archived(self, page: int, page_size: int,
+                      owner_user_id: ObjectId | None) -> tuple[list[tuple[dict, dict]], int]:
+        match: dict = {"schema_version": SCHEMA_VERSION, "lifecycle_status": "ARCHIVED"}
+        if owner_user_id is not None:
+            match["created_by_user_id"] = owner_user_id
+        total = self.db.questions.count_documents(match)
+        questions = self.db.questions.find(match).sort("updated_at", -1).skip((page - 1) * page_size).limit(page_size)
+        pairs = [pair for pair in (self._with_current_version(item) for item in questions) if pair]
+        return pairs, total
+
+    def restore(self, question_id: str | ObjectId, *, audit: dict | None = None) -> tuple[dict, dict] | None:
+        now = utc_now()
+        question_oid = object_id(question_id, "question_id")
+        with mongo_transaction() as session:
+            question = self.db.questions.find_one(
+                {"_id": question_oid, "schema_version": SCHEMA_VERSION, "lifecycle_status": "ARCHIVED"},
+                session=session,
+            )
+            if not question:
+                return None
+            updates: dict = {"lifecycle_status": "ACTIVE", "archived_at": None, "updated_at": now}
+            if question.get("review_status") == "PENDING":
+                updates["review_assignment"] = {
+                    "status": "UNASSIGNED", "reviewer_user_id": None, "assigned_by_user_id": None,
+                    "assigned_at": None, "claimed_at": None, "lock_expires_at": None,
+                    "last_released_at": now, "release_reason": "restored",
+                }
+            restored = self.db.questions.find_one_and_update(
+                {"_id": question_oid, "lifecycle_status": "ARCHIVED"},
+                {"$set": updates},
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+            if restored and audit:
+                write_audit_event(self.db, session=session, **audit)
+        return self._with_current_version(restored)
+
+    def withdraw_submission(self, question_id: str | ObjectId, *, expected_version_id: ObjectId,
+                            fields: dict, audit: dict | None = None) -> tuple[dict, dict] | None:
+        question_oid = object_id(question_id, "question_id")
+        now = utc_now()
+        with mongo_transaction() as session:
+            updated = self.db.questions.find_one_and_update(
+                {
+                    "_id": question_oid,
+                    "schema_version": SCHEMA_VERSION,
+                    "lifecycle_status": "ACTIVE",
+                    "review_status": "PENDING",
+                    "current_version_id": expected_version_id,
+                    "secondary_review.status": {"$ne": "AWAITING_SECONDARY"},
+                    "$nor": [{
+                        "review_assignment.status": "IN_REVIEW",
+                        "review_assignment.lock_expires_at": {"$gt": now},
+                    }],
+                },
+                {"$set": fields},
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+            if updated and audit:
+                write_audit_event(self.db, session=session, **audit)
+        if updated:
+            return self._with_current_version(updated)
+        current = self.find_pair(question_oid)
+        if not current:
+            return None
+        question, version = current
+        if version["_id"] != expected_version_id or question.get("review_status") != "PENDING":
+            raise RuntimeError("VERSION_CONFLICT")
+        raise PermissionError("Reviewer đã nhận câu hỏi này hoặc đã có kết quả duyệt lần đầu nên không thể rút lại")
 
     def list_versions(self, question_id: str | ObjectId) -> list[dict]:
         question_oid = object_id(question_id, "question_id")
@@ -730,26 +961,27 @@ class MongoQuestionRepository:
             )
         )
 
-    def update_sharing(self, question_id: str | ObjectId, fields: dict) -> tuple[dict, dict] | None:
-        normalized = dict(fields)
-        if "shared_with_user_ids" in normalized:
-            normalized["shared_with_user_ids"] = [
-                object_id(user_id, "shared_with_user_id")
-                for user_id in normalized.get("shared_with_user_ids") or []
-            ]
+    def update_sharing(self, question_id: str | ObjectId, fields: dict, *,
+                       audit: dict | None = None) -> tuple[dict, dict] | None:
+        """Sharing/ownership fields; ``audit`` is written in the same transaction."""
+        normalized = normalize_sharing_fields(fields)
         normalized["updated_at"] = utc_now()
-        question = self.db.questions.find_one_and_update(
-            {
-                "_id": object_id(question_id, "question_id"),
-                "schema_version": SCHEMA_VERSION,
-                "lifecycle_status": "ACTIVE",
-            },
-            {"$set": normalized},
-            return_document=ReturnDocument.AFTER,
-        )
-        if not question:
-            return None
-        version = self.db.question_versions.find_one({"_id": question["current_version_id"]})
-        if not version:
-            raise RuntimeError("Question aggregate bị thiếu current version")
+        with mongo_transaction() as session:
+            question = self.db.questions.find_one_and_update(
+                {
+                    "_id": object_id(question_id, "question_id"),
+                    "schema_version": SCHEMA_VERSION,
+                    "lifecycle_status": "ACTIVE",
+                },
+                {"$set": normalized},
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+            if not question:
+                return None
+            version = self.db.question_versions.find_one({"_id": question["current_version_id"]}, session=session)
+            if not version:
+                raise RuntimeError("Question aggregate bị thiếu current version")
+            if audit:
+                write_audit_event(self.db, session=session, **audit)
         return question, version

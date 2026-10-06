@@ -1072,6 +1072,25 @@
   padding: 8px 10px;
 }
 
+.review-reason-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 12px;
+}
+
+.review-reason-list label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: #13253f;
+}
+
+.review-form-field .review-reason-list input {
+  width: auto;
+  padding: 0;
+}
+
 .review-form-field textarea,
 .review-issue-row textarea {
   resize: vertical;

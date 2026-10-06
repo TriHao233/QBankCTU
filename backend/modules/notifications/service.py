@@ -198,9 +198,20 @@ class NotificationService:
         review: dict,
         actor_user_id: ObjectId,
     ) -> dict | None:
-        recipient = self._question_owner(question, version)
-        if recipient is None or recipient == actor_user_id:
-            return None
+        """Notify the owner and, when someone else submitted it (a shared editor), the submitter too."""
+        owner = self._question_owner(question, version)
+        submitter = (question.get("review_submission") or {}).get("submitted_by_user_id")
+        by_key = {}
+        for item in (owner, submitter):
+            if item is not None and str(item) != str(actor_user_id):
+                by_key.setdefault(str(item), item)
+        recipients = list(by_key.values())
+        created = [self._review_decision_notice(recipient, question, version, review, actor_user_id)
+                   for recipient in recipients]
+        return next((item for item in created if item), None)
+
+    def _review_decision_notice(self, recipient, question: dict, version: dict, review: dict,
+                                actor_user_id: ObjectId) -> dict | None:
         decision = review.get("decision") or "PENDING"
         label = {
             "APPROVED": "đã được duyệt",
@@ -267,7 +278,8 @@ class NotificationService:
                 self.db.exams.find(
                     {
                         "questions.question_id": question_oid,
-                        "status": {"$nin": ["FINALIZED", "ARCHIVED", "finalized", "archived"]},
+                        "status": {"$nin": ["FINALIZED", "PUBLISHED", "ARCHIVED", "finalized", "published", "archived"]},
+                        "deleted_at": None,
                     },
                     {"name": 1, "created_by_user_id": 1},
                 )
@@ -282,7 +294,8 @@ class NotificationService:
                 actor_user_id=actor_user_id,
                 type="EXAM_QUESTION_NEEDS_REVIEW",
                 title=f"{question_code} trong đề \"{exam.get('name', '')}\" đã bị sửa",
-                body="Câu hỏi đã duyệt vừa được chỉnh sửa nên phải duyệt lại; đề chưa thể chốt với câu này.",
+                body=("Câu hỏi đã duyệt vừa được chỉnh sửa. Đề vẫn dùng phiên bản đã duyệt; "
+                      "bản sửa chỉ dùng được sau khi duyệt lại và chọn lại vào đề."),
                 link=f"/lam-de-thi/{exam['_id']}",
                 entity=json_safe({"type": "EXAM", "id": exam["_id"], "question_id": question_oid}),
             )
@@ -309,6 +322,53 @@ class NotificationService:
             type="QUESTION_REVIEW_ASSIGNED",
             title=f"{question_code} được phân công kiểm duyệt",
             body="Admin đã phân công câu hỏi này cho bạn.",
+            link=f"/kiem-duyet?questionId={question['_id']}",
+            entity=self._question_entity(question, version),
+        )
+
+    def notify_review_taken_over(
+        self,
+        *,
+        question: dict,
+        version: dict,
+        reviewer_user_id: str | ObjectId | None,
+        actor_user_id: ObjectId,
+        reason: str,
+        archived: bool = False,
+    ) -> dict | None:
+        """An admin took (or archived) a question the reviewer was holding."""
+        if reviewer_user_id is None or reviewer_user_id == actor_user_id:
+            return None
+        question_code = question.get("question_code", "Câu hỏi")
+        action = "lưu trữ" if archived else "tiếp nhận"
+        return self.create(
+            recipient_user_id=reviewer_user_id,
+            actor_user_id=actor_user_id,
+            type="QUESTION_REVIEW_TAKEN_OVER",
+            title=f"{question_code} đã được Admin {action}",
+            body=f"Câu hỏi bạn đang giữ để duyệt đã được Admin {action}. Lý do: {reason}",
+            link=f"/kiem-duyet?questionId={question['_id']}",
+            entity=self._question_entity(question, version),
+        )
+
+    def notify_pending_question_edited(
+        self,
+        *,
+        question: dict,
+        version: dict,
+        actor_user_id: ObjectId,
+    ) -> dict | None:
+        """The author changed a question still waiting in the review queue."""
+        reviewer_user_id = (question.get("review_assignment") or {}).get("reviewer_user_id")
+        if reviewer_user_id is None or reviewer_user_id == actor_user_id:
+            return None
+        question_code = question.get("question_code", "Câu hỏi")
+        return self.create(
+            recipient_user_id=reviewer_user_id,
+            actor_user_id=actor_user_id,
+            type="QUESTION_EDITED_DURING_REVIEW",
+            title=f"{question_code} vừa được tác giả cập nhật",
+            body=f"Câu hỏi vẫn chờ bạn duyệt, nay ở phiên bản {version.get('version')}. Hãy đọc lại bản mới.",
             link=f"/kiem-duyet?questionId={question['_id']}",
             entity=self._question_entity(question, version),
         )
@@ -441,6 +501,13 @@ def safe_notify_review_assigned(**kwargs) -> None:
         NotificationService(kwargs.pop("database")).notify_review_assigned(**kwargs)
     except Exception as exc:
         logger.warning("Failed to notify review assignment: %s", exc)
+
+
+def safe_notify_review_taken_over(**kwargs) -> None:
+    try:
+        NotificationService(kwargs.pop("database")).notify_review_taken_over(**kwargs)
+    except Exception as exc:
+        logger.warning("Failed to notify review takeover: %s", exc)
 
 
 def safe_notify_question_submitted(**kwargs) -> None:

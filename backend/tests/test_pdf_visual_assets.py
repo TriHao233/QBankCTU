@@ -1,6 +1,4 @@
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 from pypdf import PdfWriter
@@ -9,12 +7,6 @@ from pypdf.generic import DecodedStreamObject, NameObject
 from modules.documents.ingest.models import ParseContext
 from modules.documents.ingest.parsers.pdf import PdfParser
 from modules.documents.ingest.quality import validate_parsed_document
-
-
-@pytest.fixture(params=["docling", "easyocr"])
-def ocr_engine(request):
-    with patch("modules.documents.ingest.parsers.pdf.settings", SimpleNamespace(pdf_ocr_engine=request.param)):
-        yield request.param
 
 
 def _parse_vector_pdf(tmp_path: Path, structured_blocks: list[dict], text: str = ""):
@@ -45,7 +37,7 @@ def _parse_vector_pdf(tmp_path: Path, structured_blocks: list[dict], text: str =
 
 
 @pytest.mark.parametrize("matched_text", [False, True])
-def test_ocr_visuals_without_xobjects_keep_distinct_pdf_region_assets(tmp_path, matched_text, ocr_engine):
+def test_docling_visuals_without_xobjects_keep_distinct_pdf_region_assets(tmp_path, matched_text):
     content = "Source drawing with explanatory text." if matched_text else ""
     parsed = _parse_vector_pdf(tmp_path, [
         {"block_type": "image", "content": content,
@@ -65,7 +57,6 @@ def test_ocr_visuals_without_xobjects_keep_distinct_pdf_region_assets(tmp_path, 
         assert asset.storage_uri == parsed.source_uri
         assert asset.provenance.document_id == parsed.document_id
         assert asset.provenance.page_number == 1
-        assert asset.provenance.extractor == ocr_engine
         assert asset.provenance.bbox == block.provenance.bbox
         assert asset.provenance.raw_ref.startswith(f"{parsed.source_uri}#page=1&bbox=")
         assert asset.validation_status == "needs_review"
@@ -80,7 +71,7 @@ def test_ocr_visuals_without_xobjects_keep_distinct_pdf_region_assets(tmp_path, 
     None, [1, 2, 3], ["bad", 2, 3, 4], [1, 2, 1, 4], [1, 2, 3, 2],
     [3, 2, 1, 4], [1, 2, float("inf"), 4], [1, float("nan"), 3, 4],
 ])
-def test_visual_without_xobject_or_valid_region_still_fails_quality_gate(tmp_path, bbox, ocr_engine):
+def test_visual_without_xobject_or_valid_region_still_fails_quality_gate(tmp_path, bbox):
     parsed = _parse_vector_pdf(tmp_path, [{"block_type": "image", "content": "", "bbox": bbox}])
 
     report = validate_parsed_document(parsed)
@@ -89,7 +80,7 @@ def test_visual_without_xobject_or_valid_region_still_fails_quality_gate(tmp_pat
     assert parsed.assets == []
 
 
-def test_ocr_top_left_region_preserves_coordinate_origin(tmp_path, ocr_engine):
+def test_docling_top_left_region_preserves_coordinate_origin(tmp_path):
     parsed = _parse_vector_pdf(tmp_path, [{
         "block_type": "image", "content": "",
         "bbox": {"l": 10, "b": 100, "r": 110, "t": 20, "coord_origin": "TOPLEFT"},

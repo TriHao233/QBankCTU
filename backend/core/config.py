@@ -39,6 +39,7 @@ class Settings(BaseModel):
         "DEMO_MODE",
         os.getenv("APP_ENV", "production").strip().lower() == "demo",
     )
+    allow_public_registration: bool = _env_bool("ALLOW_PUBLIC_REGISTRATION", False)
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
 
@@ -110,12 +111,18 @@ class Settings(BaseModel):
     generation_batch_size: int = int(os.getenv("GENERATION_BATCH_SIZE", "3"))
     ollama_generation_batch_size: int = int(os.getenv("OLLAMA_GENERATION_BATCH_SIZE", "1"))
     gemini_max_concurrency: int = int(os.getenv("GEMINI_MAX_CONCURRENCY", "5"))
-    review_lock_timeout_minutes: int = int(os.getenv("REVIEW_LOCK_TIMEOUT_MINUTES", "30"))
+    review_lock_timeout_minutes: int = int(os.getenv("REVIEW_LOCK_TIMEOUT_MINUTES", "120"))
+    review_max_held_questions: int = int(os.getenv("REVIEW_MAX_HELD_QUESTIONS", "20"))
+    review_max_lock_renewals: int = int(os.getenv("REVIEW_MAX_LOCK_RENEWALS", "3"))
+    review_escalation_hours: int = int(os.getenv("REVIEW_ESCALATION_HOURS", "72"))
+    review_requeue_days: int = int(os.getenv("REVIEW_REQUEUE_DAYS", "7"))
     # Admin assignments reserve a question for the assigned reviewer much longer
     # than an interactive review lock; after this window other reviewers may claim.
     review_assignment_timeout_hours: int = int(os.getenv("REVIEW_ASSIGNMENT_TIMEOUT_HOURS", "72"))
     # A pending question is late once it has waited this long since submission.
     review_sla_hours: int = int(os.getenv("REVIEW_SLA_HOURS", "48"))
+    # Emergency-only: lets an Admin review their own question when no other reviewer is eligible.
+    admin_self_review_break_glass: bool = _env_bool("ADMIN_SELF_REVIEW_BREAK_GLASS", False)
     review_sla_reminder_interval_seconds: float = float(
         os.getenv("REVIEW_SLA_REMINDER_INTERVAL_SECONDS", "900")
     )
@@ -129,11 +136,13 @@ class Settings(BaseModel):
     firebase_credentials_path: str = os.getenv(
         "FIREBASE_CREDENTIALS_PATH", str(BASE_DIR / "firebase-service-account.json")
     )
-    firebase_project_id: str = os.getenv("FIREBASE_PROJECT_ID", "nckh-e6817").strip()
+    firebase_project_id: str = os.getenv("FIREBASE_PROJECT_ID", "nckh-c0ef6").strip()
     demo_admin_email: str = os.getenv("DEMO_ADMIN_EMAIL", "admin@qbankctu.edu.vn")
     demo_admin_password: str = os.getenv("DEMO_ADMIN_PASSWORD", "")
     demo_reviewer_email: str = os.getenv("DEMO_REVIEWER_EMAIL", "reviewer@qbankctu.edu.vn")
     demo_reviewer_password: str = os.getenv("DEMO_REVIEWER_PASSWORD", "")
+    demo_teacher_email: str = os.getenv("DEMO_TEACHER_EMAIL", "teacher@qbankctu.edu.vn")
+    demo_teacher_password: str = os.getenv("DEMO_TEACHER_PASSWORD", "")
     demo_session_secret: str = os.getenv("DEMO_SESSION_SECRET", "")
     demo_session_ttl_hours: int = int(os.getenv("DEMO_SESSION_TTL_HOURS", "8"))
 
@@ -202,8 +211,7 @@ class Settings(BaseModel):
         os.getenv("LEXICAL_FALLBACK_DISTANCE_THRESHOLD", "0.55")
     )
 
-    # Docling is the default PDF OCR/layout engine; EASYOCR remains selectable explicitly.
-    pdf_ocr_engine: str = os.getenv("PDF_OCR_ENGINE", "docling").strip().lower()
+    # Docling OCR/layout (the only PDF OCR engine)
     docling_url: str = os.getenv("DOCLING_URL", "http://localhost:5001").rstrip("/")
     docling_timeout: int = int(os.getenv("DOCLING_TIMEOUT", "600"))
     docling_poll_seconds: float = float(os.getenv("DOCLING_POLL_SECONDS", "0.5"))
@@ -217,22 +225,6 @@ class Settings(BaseModel):
     docling_table_mode: str = os.getenv("DOCLING_TABLE_MODE", "accurate").strip().lower()
     docling_do_table_structure: bool = _env_bool("DOCLING_DO_TABLE_STRUCTURE", True)
     docling_include_images: bool = _env_bool("DOCLING_INCLUDE_IMAGES", True)
-
-    # EasyOCR + PDFium retained for the existing setup and comparison tests.
-    easyocr_languages: list[str] = [
-        language.strip()
-        for language in os.getenv("EASYOCR_LANGUAGES", "vi,en").split(",")
-        if language.strip()
-    ]
-    easyocr_gpu: bool = _env_bool("EASYOCR_GPU", True)
-    easyocr_batch_size: int = int(os.getenv("EASYOCR_BATCH_SIZE", "2"))
-    easyocr_render_scale: float = float(os.getenv("EASYOCR_RENDER_SCALE", "2.0"))
-    easyocr_min_confidence: float = float(os.getenv("EASYOCR_MIN_CONFIDENCE", "0.20"))
-    easyocr_model_storage_directory: str = os.getenv(
-        "EASYOCR_MODEL_STORAGE_DIRECTORY", "./data/easyocr_models"
-    )
-    easyocr_download_enabled: bool = _env_bool("EASYOCR_DOWNLOAD_ENABLED", True)
-    easyocr_unload_after_use: bool = _env_bool("EASYOCR_UNLOAD_AFTER_USE", True)
 
     pdf_text_fast_path_enabled: bool = _env_bool("PDF_TEXT_FAST_PATH_ENABLED", True)
     pdf_text_fast_path_min_coverage: float = float(os.getenv("PDF_TEXT_FAST_PATH_MIN_COVERAGE", "0.98"))
@@ -256,6 +248,10 @@ class Settings(BaseModel):
     upload_dir: str = os.getenv("UPLOAD_DIR", "./data/uploads")
     ocr_output_dir: str = os.getenv("OCR_OUTPUT_DIR", "./data/ocr_outputs")
     raw_artifact_compression: str = os.getenv("RAW_ARTIFACT_COMPRESSION", "gzip").strip().lower()
+    # Share of extracted pages/units that must contain text; 0 disables the document-level gate.
+    document_min_text_unit_ratio: float = float(os.getenv("DOCUMENT_MIN_TEXT_UNIT_RATIO", "0.8"))
+    auto_chunk_after_extraction: bool = _env_bool("AUTO_CHUNK_AFTER_EXTRACTION", True)
+    auto_promote_reprocessed_lineage: bool = _env_bool("AUTO_PROMOTE_REPROCESSED_LINEAGE", True)
     artifact_hot_retention_days: int = int(os.getenv("ARTIFACT_HOT_RETENTION_DAYS", "30"))
     artifact_cold_retention_days: int = int(os.getenv("ARTIFACT_COLD_RETENTION_DAYS", "365"))
     artifact_cold_dir: str = os.getenv("ARTIFACT_COLD_DIR", "./data/artifact_archive")

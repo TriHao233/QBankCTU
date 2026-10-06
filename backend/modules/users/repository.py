@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Callable, Protocol
 
 from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.database import Database
 
+from core.audit import write_audit_event
 from core.bootstrap import SCHEMA_VERSION
+from core.database import mongo_transaction
 from core.dependencies import DEFAULT_ROLE_PERMISSIONS, effective_permissions
+
+AuditBuilder = Callable[[dict], "dict | None"]
 
 
 def utc_now() -> datetime:
@@ -22,6 +26,24 @@ def object_id(value: str | ObjectId) -> ObjectId:
         return ObjectId(value)
     except Exception as exc:
         raise ValueError("ID người dùng không hợp lệ") from exc
+
+
+class UnverifiedEmailLinkError(PermissionError):
+    """An unverified Firebase email cannot claim a profile bound to another identity."""
+
+    def __init__(self) -> None:
+        super().__init__("Email chưa được xác minh nên không thể liên kết với hồ sơ đã có")
+
+
+class ProfileNotProvisionedError(PermissionError):
+    """The Firebase identity has no application profile and self-provisioning is disabled."""
+
+    def __init__(self) -> None:
+        super().__init__("Tài khoản chưa được cấp quyền truy cập hệ thống")
+
+
+def has_verified_email(claims: dict) -> bool:
+    return bool(claims.get("email")) and claims.get("email_verified") is True
 
 
 def serialize_user(user: dict) -> dict:
@@ -49,6 +71,7 @@ def serialize_user(user: dict) -> dict:
             DEFAULT_ROLE_PERMISSIONS.get(user["role"], set()) - set(effective_permissions(user))
         ),
         "review_subject_ids": [str(item) for item in user.get("review_subject_ids") or []],
+        "teaching_subject_ids": [str(item) for item in user.get("teaching_subject_ids") or []],
         "profile": profile,
         "is_active": user.get("is_active", True),
         "created_at": user["created_at"],
@@ -69,11 +92,11 @@ class UserRepository(Protocol):
 
     def create(self, data: dict) -> dict: ...
 
-    def sync_identity(self, claims: dict) -> dict: ...
+    def sync_identity(self, claims: dict, *, allow_create: bool = True) -> dict: ...
 
     def list(self, page: int, page_size: int, role: str | None, search: str | None) -> tuple[list[dict], int]: ...
 
-    def update(self, user_id: str | ObjectId, fields: dict) -> dict | None: ...
+    def update(self, user_id: str | ObjectId, fields: dict, *, audit: AuditBuilder | None = None) -> dict | None: ...
 
     def count_active_admins(self) -> int: ...
 
@@ -113,7 +136,7 @@ class MongoUserRepository:
         result = self.collection.insert_one(record)
         return self.collection.find_one({"_id": result.inserted_id})
 
-    def sync_identity(self, claims: dict) -> dict:
+    def sync_identity(self, claims: dict, *, allow_create: bool = True) -> dict:
         now = utc_now()
         firebase_uid = claims["uid"]
         email = (claims.get("email") or f"{firebase_uid}@firebase.local").lower()
@@ -121,12 +144,18 @@ class MongoUserRepository:
         avatar = claims.get("picture") or ""
         profile_defaults = {"school": "", "address": "", "avatar": ""}
         profile_overlay = {"avatar": avatar} if avatar else {}
-        identity_filter = (
-            {"$or": [{"firebase_uid": firebase_uid}, {"email": email}]}
-            if claims.get("email")
-            else {"firebase_uid": firebase_uid}
-        )
-        return self.collection.find_one_and_update(
+        if has_verified_email(claims):
+            identity_filter = {"$or": [{"firebase_uid": firebase_uid}, {"email": email}]}
+        else:
+            if claims.get("email") and self.collection.find_one(
+                {"email": email, "firebase_uid": {"$ne": firebase_uid}},
+                {"_id": 1},
+            ):
+                raise UnverifiedEmailLinkError()
+            identity_filter = {"firebase_uid": firebase_uid}
+        if not allow_create and self.collection.find_one(identity_filter, {"_id": 1}) is None:
+            raise ProfileNotProvisionedError()
+        user = self.collection.find_one_and_update(
             identity_filter,
             [
                 {
@@ -150,9 +179,12 @@ class MongoUserRepository:
                     }
                 }
             ],
-            upsert=True,
+            upsert=allow_create,
             return_document=ReturnDocument.AFTER,
         )
+        if user is None:
+            raise ProfileNotProvisionedError()
+        return user
 
     def list(
         self,
@@ -178,13 +210,20 @@ class MongoUserRepository:
         )
         return records, total
 
-    def update(self, user_id: str | ObjectId, fields: dict) -> dict | None:
+    def update(self, user_id: str | ObjectId, fields: dict, *, audit: AuditBuilder | None = None) -> dict | None:
+        """``audit`` builds the event from the updated record; it is written in the same transaction."""
         fields = {**fields, "updated_at": utc_now()}
-        return self.collection.find_one_and_update(
-            {"_id": object_id(user_id)},
-            {"$set": fields},
-            return_document=ReturnDocument.AFTER,
-        )
+        with mongo_transaction() as session:
+            updated = self.collection.find_one_and_update(
+                {"_id": object_id(user_id)},
+                {"$set": fields},
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+            event = audit(updated) if updated is not None and audit else None
+            if event:
+                write_audit_event(self.db, session=session, **event)
+        return updated
 
     def count_active_admins(self) -> int:
         return self.collection.count_documents({"role": "Admin", "is_active": True})

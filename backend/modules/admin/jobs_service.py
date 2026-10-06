@@ -18,6 +18,7 @@ from modules.catalog.postgres_subject_repository import subject_records
 from modules.documents.repository import RETRYABLE_DOCUMENT_JOB_TYPES
 from modules.documents.service import DocumentService
 from modules.documents.store import get_document_repository
+from modules.generation.job_outcome import generation_job_outcome
 from modules.generation.mongodb import create_generation_job, get_generation_job
 from modules.questions.workflow_service import QuestionWorkflowService
 
@@ -550,6 +551,7 @@ class AdminJobService:
             "id": str(job["_id"]),
             "type": "Generation",
             "status": status,
+            "outcome": generation_job_outcome(job),
             "actor_user_id": job.get("requested_by_user_id"),
             "entity": {"type": "document", "id": request.get("document_id"), "label": request.get("document_id")},
             "progress": None,
@@ -770,7 +772,7 @@ class AdminJobService:
         if generation_store is not None:
             result = generation_store.cancel(
                 _parse_object_id(job_id, "job_id"),
-                message=f"Cancelled by admin {current_user.email}", stage="failed",
+                message=f"Cancelled by admin {current_user.email}", stage="failed", reason=None,
             )
             if not result:
                 raise ValueError("Job không ở trạng thái có thể hủy")

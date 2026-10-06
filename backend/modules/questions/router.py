@@ -10,18 +10,22 @@ from core.dependencies import (
     CurrentUser,
     require_bank_sharing,
     require_question_author,
+    require_roles,
     require_teacher_reviewer_or_admin,
 )
 from modules.questions.schemas import (
     QuestionCreateRequest,
     QuestionListResponse,
     QuestionResponse,
+    QuestionOwnerTransferRequest,
     QuestionSharingRequest,
     QuestionSourceViewerResponse,
+    QuestionSubmitRequest,
     QuestionVersionResponse,
     QuestionUpdateRequest,
 )
 from modules.documents.storage import storage_for_provider
+from modules.questions.repository import REVIEW_IN_PROGRESS
 from modules.questions.service import QuestionService, get_question_service
 from modules.notifications.service import (
     NotificationService,
@@ -61,6 +65,29 @@ def _collect_notifications(workflow_service: QuestionWorkflowService, build) -> 
             logger.warning("Failed to prepare question notifications: %s", exc)
             outbox.clear()
     return outbox
+
+
+def _after_pending_question_edited(question_id: str, question: dict, current_user: CurrentUser,
+                                   workflow_service: QuestionWorkflowService) -> None:
+    """A question edited while PENDING keeps its place in the queue: re-run AI and tell its reviewer."""
+    try:
+        workflow_service.enqueue_auto_evaluation(
+            question_id,
+            expected_version=question["current_version"],
+            requested_by_user_id=current_user.id,
+            evaluator_model_code=settings.evaluation_model_provider,
+            trigger="PENDING_EDIT",
+        )
+    except Exception:
+        logger.exception("Could not enqueue evaluation after editing pending question %s", question_id)
+    try:
+        pair = workflow_service.questions.find_pair(question_id)
+        if pair:
+            NotificationService(workflow_service.db).notify_pending_question_edited(
+                question=pair[0], version=pair[1], actor_user_id=current_user.id,
+            )
+    except Exception as exc:
+        logger.warning("Failed to notify reviewer about edited pending question: %s", exc)
 
 
 @router.get("", response_model=QuestionListResponse)
@@ -151,8 +178,63 @@ def create_question(
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/archived", response_model=QuestionListResponse)
+def list_archived_questions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: CurrentUser = Depends(require_question_author),
+    service: QuestionService = Depends(get_question_service),
+):
+    return service.list_archived(page, page_size, current_user)
+
+
+def _raise_question_error(exc: Exception):
+    if isinstance(exc, RuntimeError) and str(exc) == "VERSION_CONFLICT":
+        raise HTTPException(status_code=409, detail="Câu hỏi đã được cập nhật bởi người khác") from exc
+    if isinstance(exc, PermissionError):
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if isinstance(exc, LookupError):
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise exc
+
+
+@router.post("/{question_id}/restore", response_model=QuestionResponse)
+def restore_question(
+    question_id: str,
+    current_user: CurrentUser = Depends(require_question_author),
+    service: QuestionService = Depends(get_question_service),
+):
+    try:
+        question = service.restore(question_id, current_user)
+    except Exception as exc:
+        _raise_question_error(exc)
+    if not question:
+        raise HTTPException(status_code=404, detail="Không tìm thấy câu hỏi đã lưu trữ")
+    return question
+
+
+@router.post("/{question_id}/withdraw", response_model=QuestionResponse)
+def withdraw_question_submission(
+    question_id: str,
+    expected_version: int | None = Query(None, ge=1),
+    current_user: CurrentUser = Depends(require_question_author),
+    service: QuestionService = Depends(get_question_service),
+):
+    try:
+        question = service.withdraw_submission(question_id, expected_version, current_user)
+    except Exception as exc:
+        _raise_question_error(exc)
+    if not question:
+        raise HTTPException(status_code=404, detail="Không tìm thấy câu hỏi")
+    return question
 
 
 @router.get("/{question_id}", response_model=QuestionResponse)
@@ -165,6 +247,8 @@ def get_question(
         question = service.get(question_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not question:
@@ -186,6 +270,8 @@ def duplicate_question(
         question = service.duplicate(question_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not question:
@@ -203,6 +289,8 @@ def list_question_versions(
         versions = service.versions(question_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if versions is None:
@@ -220,6 +308,8 @@ def get_question_sources(
         sources = service.source_viewer(question_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not sources:
@@ -237,6 +327,8 @@ def get_question_source_pdf(
         artifact = service.source_pdf_artifact(question_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not artifact:
@@ -287,15 +379,24 @@ def update_question(
     except RuntimeError as exc:
         if str(exc) == "VERSION_CONFLICT":
             raise HTTPException(status_code=409, detail="Câu hỏi đã được cập nhật bởi người khác") from exc
+        if str(exc) == REVIEW_IN_PROGRESS:
+            raise HTTPException(status_code=409, detail={
+                "code": REVIEW_IN_PROGRESS,
+                "message": "Reviewer đang duyệt câu hỏi này; chờ họ quyết định hoặc trả lại rồi sửa.",
+            }) from exc
         raise
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not question:
         raise HTTPException(status_code=404, detail="Không tìm thấy câu hỏi")
-    # The edit created a new version, so open exams pinned to the old one can
-    # no longer be finalized until it is reviewed and re-selected.
+    if question.get("review_status") == "PENDING":
+        _after_pending_question_edited(question_id, question, current_user, workflow_service)
+        question = service.get(question_id, current_user) or question
+    # Open exams keep the approved version; warn their owners that a newer draft exists.
     if outbox is None:
         safe_notify_exam_owners_question_reopened(
             database=workflow_service.db,
@@ -317,8 +418,26 @@ def update_question_sharing(
         question = service.update_sharing(question_id, payload, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not question:
+        raise HTTPException(status_code=404, detail="Không tìm thấy câu hỏi")
+    return question
+
+
+@router.post("/{question_id}/transfer-owner", response_model=QuestionResponse)
+def transfer_question_owner(
+    question_id: str,
+    payload: QuestionOwnerTransferRequest,
+    current_user: CurrentUser = Depends(require_roles("Admin")),
+    service: QuestionService = Depends(get_question_service),
+):
+    try:
+        question = service.transfer_owner(question_id, payload, current_user)
+    except Exception as exc:
+        _raise_question_error(exc)
     if not question:
         raise HTTPException(status_code=404, detail="Không tìm thấy câu hỏi")
     return question
@@ -330,6 +449,7 @@ def submit_question_for_review(
     current_user: CurrentUser = Depends(require_question_author),
     service: QuestionService = Depends(get_question_service),
     workflow_service: QuestionWorkflowService = Depends(get_workflow_service),
+    payload: QuestionSubmitRequest | None = None,
 ):
     try:
         previous_question = service.get(question_id, current_user)
@@ -341,7 +461,10 @@ def submit_question_for_review(
                 actor_user_id=current_user.id,
             ),
         )
-        question = service.submit_for_review(question_id, current_user, notifications=outbox)
+        question = service.submit_for_review(
+            question_id, current_user, notifications=outbox,
+            response_note=payload.response_note if payload else "",
+        )
         if question:
             if (
                 previous_review_status != "PENDING"
@@ -388,6 +511,8 @@ def submit_question_for_review(
         raise
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not question:
@@ -398,14 +523,29 @@ def submit_question_for_review(
 @router.delete("/{question_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_question(
     question_id: str,
+    reason: str | None = Query(None, max_length=500),
     current_user: CurrentUser = Depends(require_question_author),
     service: QuestionService = Depends(get_question_service),
+    workflow_service: QuestionWorkflowService = Depends(get_workflow_service),
 ):
+    def notify_displaced(question, version, reviewer_user_id, archive_reason):
+        workflow_service.notify_takeover(
+            question, version, reviewer_user_id, current_user, archive_reason, archived=True,
+        )
+
     try:
-        deleted = service.archive(question_id, current_user)
+        deleted = service.archive(
+            question_id, current_user, reason=reason, on_reviewer_displaced=notify_displaced,
+        )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        if str(exc) == "VERSION_CONFLICT":
+            raise HTTPException(status_code=409, detail="Trạng thái câu hỏi vừa thay đổi, vui lòng tải lại") from exc
+        raise
     if not deleted:
         raise HTTPException(status_code=404, detail="Không tìm thấy câu hỏi")

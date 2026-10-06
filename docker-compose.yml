@@ -1,3 +1,19 @@
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: 1
+          capabilities: [gpu]
+
+x-backend-depends-on: &backend-depends-on
+  docling:
+    condition: service_healthy
+  mongodb:
+    condition: service_healthy
+  postgres:
+    condition: service_healthy
+
 services:
   backend:
     image: nckh-backend:docling
@@ -14,9 +30,23 @@ services:
       - ./backend/data:/app/data
       # Cache mô hình HuggingFace (bge-m3) để không phải tải lại mỗi lần chạy docker
       - huggingface_cache:/root/.cache/huggingface
+      # Mount nóng một số file backend: sửa code không cần build lại image.
+      - ./backend/modules/dictionary/dictionary.py:/app/modules/dictionary/dictionary.py:ro
+      - ./backend/core/config.py:/app/core/config.py:ro
+      - ./backend/core/bootstrap.py:/app/core/bootstrap.py:ro
+      - ./backend/core/job_recovery.py:/app/core/job_recovery.py:ro
+      - ./backend/modules/generation/llm:/app/modules/generation/llm:ro
+      - ./backend/modules/generation/generate.py:/app/modules/generation/generate.py:ro
+      - ./backend/modules/generation/mongodb.py:/app/modules/generation/mongodb.py:ro
+      - ./backend/modules/generation/schemas.py:/app/modules/generation/schemas.py:ro
+      - ./backend/modules/generation/postprocessing.py:/app/modules/generation/postprocessing.py:ro
+      - ./backend/modules/generation/question.py:/app/modules/generation/question.py:ro
+      - ./backend/modules/generation/prompt_builder.py:/app/modules/generation/prompt_builder.py:ro
+      - ./backend/prompts:/app/prompts:ro
+      - ./backend/modules/questions/workflow_service.py:/app/modules/questions/workflow_service.py:ro
+      - ./backend/modules/catalog/service.py:/app/modules/catalog/service.py:ro
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
-    environment:
-      PDF_OCR_ENGINE: docling
+    environment: &backend-env
       DOCLING_URL: http://docling:5001
       DOCLING_OCR_PRESET: tesseract
       DOCLING_OCR_LANGUAGES: vie
@@ -25,30 +55,22 @@ services:
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-nckh}:${POSTGRES_PASSWORD:-nckh_local_dev_only}@postgres:5432/${POSTGRES_DB:-nckh}
       REQUIRE_MONGO_TRANSACTIONS: "true"
       FIREBASE_CREDENTIALS_PATH: /app/firebase-service-account.json
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       ANONYMIZED_TELEMETRY: "false"
       OLLAMA_GENERATE_URL: ${OLLAMA_GENERATE_URL:-http://host.docker.internal:11434/api/generate}
       OLLAMA_MAX_CONCURRENCY: ${OLLAMA_MAX_CONCURRENCY:-1}
-      EASYOCR_GPU: ${EASYOCR_GPU:-false}
-      EASYOCR_LANGUAGES: ${EASYOCR_LANGUAGES:-vi,en}
-      EASYOCR_BATCH_SIZE: ${EASYOCR_BATCH_SIZE:-2}
-      EASYOCR_MODEL_STORAGE_DIRECTORY: /app/data/easyocr_models
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-    depends_on:
-      docling:
-        condition: service_healthy
-      mongodb:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+    deploy: *gpu
+    depends_on: *backend-depends-on
     restart: unless-stopped
 
   mongodb:
     image: mongo:7.0
     container_name: nckh-mongodb
     ports:
-      - "${MONGO_HOST_PORT:-27018}:27017"
+      - "${MONGO_HOST_PORT:-27017}:27017"
     volumes:
       - mongodb_data:/data/db
     command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--quiet"]
@@ -96,29 +118,25 @@ services:
       - ./backend/firebase-service-account.json:/app/firebase-service-account.json:ro
       - ./backend/data:/app/data
       - huggingface_cache:/root/.cache/huggingface
+      - ./backend/core/config.py:/app/core/config.py:ro
+      - ./backend/core/bootstrap.py:/app/core/bootstrap.py:ro
+      - ./backend/core/job_recovery.py:/app/core/job_recovery.py:ro
+      - ./backend/modules/generation/llm:/app/modules/generation/llm:ro
+      - ./backend/modules/generation/generate.py:/app/modules/generation/generate.py:ro
+      - ./backend/modules/generation/mongodb.py:/app/modules/generation/mongodb.py:ro
+      - ./backend/modules/generation/schemas.py:/app/modules/generation/schemas.py:ro
+      - ./backend/modules/generation/postprocessing.py:/app/modules/generation/postprocessing.py:ro
+      - ./backend/modules/generation/question.py:/app/modules/generation/question.py:ro
+      - ./backend/modules/generation/prompt_builder.py:/app/modules/generation/prompt_builder.py:ro
+      - ./backend/prompts:/app/prompts:ro
+      - ./backend/modules/questions/workflow_service.py:/app/modules/questions/workflow_service.py:ro
+      - ./backend/modules/catalog/service.py:/app/modules/catalog/service.py:ro
     command: ["python", "-m", "workers.run"]
-    environment:
-      PDF_OCR_ENGINE: docling
-      DOCLING_URL: http://docling:5001
-      DOCLING_OCR_PRESET: tesseract
-      DOCLING_OCR_LANGUAGES: vie
-      DOCLING_TIMEOUT: "600"
-      MONGO_URI: mongodb://mongodb:27017/?replicaSet=rs0
-      POSTGRES_DSN: postgresql://${POSTGRES_USER:-nckh}:${POSTGRES_PASSWORD:-nckh_local_dev_only}@postgres:5432/${POSTGRES_DB:-nckh}
-      REQUIRE_MONGO_TRANSACTIONS: "true"
-      FIREBASE_CREDENTIALS_PATH: /app/firebase-service-account.json
-      ANONYMIZED_TELEMETRY: "false"
-      OLLAMA_GENERATE_URL: ${OLLAMA_GENERATE_URL:-http://host.docker.internal:11434/api/generate}
-      OLLAMA_MAX_CONCURRENCY: ${OLLAMA_MAX_CONCURRENCY:-1}
+    environment: *backend-env
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    depends_on:
-      docling:
-        condition: service_healthy
-      mongodb:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+    deploy: *gpu
+    depends_on: *backend-depends-on
     restart: unless-stopped
     logging: *service-logging
 
@@ -131,9 +149,10 @@ services:
     ports:
       - "127.0.0.1:5001:5001"
     environment:
-      DOCLING_DEVICE: cpu
-      DOCLING_NUM_THREADS: "4"
-      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "1"
+      # Shares the GPU with Ollama (~1.7 GB VRAM); set DOCLING_DEVICE=cpu to free it.
+      DOCLING_DEVICE: ${DOCLING_DEVICE:-cuda}
+      DOCLING_NUM_THREADS: ${DOCLING_NUM_THREADS:-4}
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: ${DOCLING_WORKERS:-1}
       HF_HOME: /var/cache/docling/huggingface
       XDG_CACHE_HOME: /var/cache/docling
       TMPDIR: /var/cache/docling/tmp
@@ -153,8 +172,29 @@ services:
       timeout: 10s
       start_period: 90s
       retries: 20
+    deploy: *gpu
     restart: unless-stopped
     logging: *service-logging
+
+  frontend-dev:
+    image: node:20-alpine
+    container_name: nckh-frontend-dev
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5177"
+    ports:
+      - "5177:5177"
+    volumes:
+      - ./frontend:/app
+      - frontend_dev_node_modules:/app/node_modules
+    environment:
+      VITE_API_BASE_URL: /api/v1
+      VITE_API_PROXY_TARGET: http://backend:8000
+      VITE_DEMO_MODE: ${VITE_DEMO_MODE:-true}
+      VITE_PIPELINE_3D: ${VITE_PIPELINE_3D:-false}
+      VITE_USE_POLLING: "true"
+    depends_on:
+      - backend
+    restart: unless-stopped
 
   frontend:
     profiles: ["prod"]
@@ -177,3 +217,4 @@ volumes:
   mongodb_data:
   postgres_data:
   huggingface_cache:
+  frontend_dev_node_modules:

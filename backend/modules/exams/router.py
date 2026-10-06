@@ -1,16 +1,27 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from core.config import settings
-from core.dependencies import CurrentUser, require_exam_manager
-from modules.exams.pdf_service import VALID_EXPORT_TYPES, render_exam_docx, render_exam_pdf
+from core.dependencies import CurrentUser, require_exam_manager, require_roles
+from modules.exams.pdf_service import (
+    PREVIEW_WATERMARK,
+    VALID_EXPORT_TYPES,
+    render_exam_docx,
+    render_exam_pdf,
+)
 from modules.exams.schemas import (
+    MAX_SEED,
     AddQuestionsManualRequest,
     ExamCreateRequest,
     ExamQuestionPoolResponse,
     ExamListResponse,
     ExamMatrixRequest,
+    ExamOwnerTransferRequest,
     ExamPreviewResponse,
+    ExamReopenRequest,
     ExamResponse,
+    ExamSharingRequest,
     ExamStatusUpdateRequest,
     ExamUpdateRequest,
     ExamVariantCreateRequest,
@@ -44,7 +55,7 @@ def create_exam(
     service: ExamService = Depends(get_exam_service),
 ):
     try:
-        return service.create_exam(payload, current_user.id)
+        return service.create_exam(payload, current_user.id, actor=current_user)
     except Exception as exc:
         _translate(exc)
 
@@ -109,6 +120,45 @@ def update_exam_status(
 ):
     try:
         return service.update_status(exam_id, payload, current_user)
+    except Exception as exc:
+        _translate(exc)
+
+
+@router.post("/{exam_id}/reopen", response_model=ExamResponse)
+def reopen_exam(
+    exam_id: str,
+    payload: ExamReopenRequest,
+    current_user: CurrentUser = Depends(require_exam_manager),
+    service: ExamService = Depends(get_exam_service),
+):
+    try:
+        return service.reopen_exam(exam_id, payload.reason, current_user)
+    except Exception as exc:
+        _translate(exc)
+
+
+@router.patch("/{exam_id}/sharing", response_model=ExamResponse)
+def update_exam_sharing(
+    exam_id: str,
+    payload: ExamSharingRequest,
+    current_user: CurrentUser = Depends(require_exam_manager),
+    service: ExamService = Depends(get_exam_service),
+):
+    try:
+        return service.update_sharing(exam_id, payload, current_user)
+    except Exception as exc:
+        _translate(exc)
+
+
+@router.post("/{exam_id}/transfer-owner", response_model=ExamResponse)
+def transfer_exam_owner(
+    exam_id: str,
+    payload: ExamOwnerTransferRequest,
+    current_user: CurrentUser = Depends(require_roles("Admin")),
+    service: ExamService = Depends(get_exam_service),
+):
+    try:
+        return service.transfer_owner(exam_id, payload, current_user)
     except Exception as exc:
         _translate(exc)
 
@@ -182,11 +232,12 @@ def matrix_availability(
 @router.post("/{exam_id}/questions/auto-generate", response_model=ExamResponse)
 def auto_generate_questions(
     exam_id: str,
+    seed: int | None = Query(None, ge=0, le=MAX_SEED),
     current_user: CurrentUser = Depends(require_exam_manager),
     service: ExamService = Depends(get_exam_service),
 ):
     try:
-        return service.auto_generate_pool(exam_id, current_user)
+        return service.auto_generate_pool(exam_id, current_user, seed)
     except Exception as exc:
         _translate(exc)
 
@@ -298,15 +349,26 @@ async def export_variant_pdf(
     if export_type not in VALID_EXPORT_TYPES:
         raise HTTPException(status_code=400, detail="type phải là de, dapan hoặc de_dapan")
     try:
-        exam, variant = service.get_exam_variant_pair(exam_id, variant_id, current_user)
+        exam, variant, official = await asyncio.to_thread(
+            service.export_access, exam_id, variant_id, export_type, current_user,
+        )
     except Exception as exc:
         _translate(exc)
     if not variant["questions"]:
         raise HTTPException(status_code=400, detail="Mã đề chưa có câu hỏi, không thể xuất PDF")
     pdf_bytes = await render_exam_pdf(
-        exam["header"], variant["exam_code"], variant["questions"], export_type
+        exam["header"], variant["exam_code"], variant["questions"], export_type,
+        None if official else PREVIEW_WATERMARK,
     )
-    filename = f"{variant['exam_code']}_{export_type}.pdf"
+    if official:
+        try:
+            await asyncio.to_thread(
+                service.record_official_export, exam, variant,
+                export_type=export_type, file_format="pdf", current_user=current_user,
+            )
+        except Exception as exc:
+            _translate(exc)
+    filename = f"{variant['exam_code']}_{export_type}{'' if official else '_xem_truoc'}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -325,15 +387,23 @@ def export_variant_docx(
     if export_type not in VALID_EXPORT_TYPES:
         raise HTTPException(status_code=400, detail="type phải là de, dapan hoặc de_dapan")
     try:
-        exam, variant = service.get_exam_variant_pair(exam_id, variant_id, current_user)
+        exam, variant, official = service.export_access(exam_id, variant_id, export_type, current_user)
     except Exception as exc:
         _translate(exc)
     if not variant["questions"]:
         raise HTTPException(status_code=400, detail="Mã đề chưa có câu hỏi, không thể xuất DOCX")
     docx_bytes = render_exam_docx(
-        exam["header"], variant["exam_code"], variant["questions"], export_type
+        exam["header"], variant["exam_code"], variant["questions"], export_type,
+        None if official else PREVIEW_WATERMARK,
     )
-    filename = f"{variant['exam_code']}_{export_type}.docx"
+    if official:
+        try:
+            service.record_official_export(
+                exam, variant, export_type=export_type, file_format="docx", current_user=current_user,
+            )
+        except Exception as exc:
+            _translate(exc)
+    filename = f"{variant['exam_code']}_{export_type}{'' if official else '_xem_truoc'}.docx"
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

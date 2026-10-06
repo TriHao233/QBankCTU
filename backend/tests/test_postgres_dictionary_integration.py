@@ -25,11 +25,9 @@ def test_dictionary_is_postgres_backed_and_pending_keywords_are_unique(monkeypat
     monkeypatch.setattr(mongodb, "_dictionaries_collection", lambda: pytest.fail("MongoDB was queried"))
     course_id = f"test-{uuid4().hex[:12]}"
     try:
-        active = get_active_keywords(course_id)
-        assert "struct" in active
-        assert "thuật toán" in active
-        assert get_active_keywords(course_id) == active
-        add_pending_keywords(course_id, ["  Học sâu  ", "học sâu", "STRUCT", "", "Giải thuật"])
+        assert get_active_keywords(course_id) == []
+        assert get_active_keywords(course_id) == []
+        add_pending_keywords(course_id, ["  Học sâu  ", "học sâu", "", "Giải thuật"])
         assert "học sâu" not in get_active_keywords(course_id)
         with postgres_connection() as conn:
             rows = conn.execute("""
@@ -40,7 +38,7 @@ def test_dictionary_is_postgres_backed_and_pending_keywords_are_unique(monkeypat
             dictionary = conn.execute("""
                 SELECT id, payload FROM legacy_dictionaries WHERE course_id=%s
             """, (course_id,)).fetchone()
-            assert dictionary["payload"]["pending_keywords"] == ["Học sâu"]
+            assert dictionary["payload"]["pending_keywords"] == ["Học sâu", "Giải thuật"]
             conn.execute("UPDATE keywords SET status='LEARNED' WHERE id=%s", (
                 conn.execute("SELECT id FROM keywords WHERE payload->>'course_id'=%s AND keyword=%s",
                              (course_id, "Học sâu")).fetchone()["id"],

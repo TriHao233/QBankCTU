@@ -32,7 +32,11 @@ class ExamStatus(str, Enum):
     DRAFT = "DRAFT"
     READY = "READY"
     FINALIZED = "FINALIZED"
+    PUBLISHED = "PUBLISHED"
     ARCHIVED = "ARCHIVED"
+
+
+MAX_SEED = 2**31 - 1
 
 
 class ExamHeaderConfig(BaseModel):
@@ -85,6 +89,19 @@ class ExamStatusUpdateRequest(BaseModel):
     status: ExamStatus
 
 
+class ExamReopenRequest(BaseModel):
+    reason: str = Field(..., min_length=5, max_length=1000)
+
+
+class ExamSharingRequest(BaseModel):
+    shared_with_user_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class ExamOwnerTransferRequest(BaseModel):
+    new_owner_user_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=5, max_length=1000)
+
+
 class AddQuestionsManualRequest(BaseModel):
     question_ids: list[str] = Field(..., min_length=1)
 
@@ -111,6 +128,14 @@ class ExamResponse(BaseModel):
     scoring_config: dict[str, Any] | None = None
     lms_export_status: str = "not_exported"
     created_by_user_id: str | None = None
+    shared_with_user_ids: list[str] = Field(default_factory=list)
+    can_edit: bool = True
+    can_export_official: bool = True
+    selection_seed: int | None = None
+    item_flags: list[dict[str, Any]] = Field(default_factory=list)
+    reopen_history: list[dict[str, Any]] = Field(default_factory=list)
+    published_at: datetime | None = None
+    official_exported_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -132,6 +157,7 @@ class ExamQuestionPoolResponse(BaseModel):
 class ExamVariantCreateRequest(BaseModel):
     exam_code: str = Field(..., min_length=1, max_length=40)
     shuffle: bool = True
+    seed: int | None = Field(None, ge=0, le=MAX_SEED)
 
 
 class ExamVariantQuestionEntry(BaseModel):
@@ -147,6 +173,7 @@ class ExamVariantResponse(BaseModel):
     exam_code: str
     questions: list[ExamVariantQuestionEntry]
     answer_key: dict[str, Any]
+    shuffle_seed: int | None = None
     created_at: datetime
 
 

@@ -14,7 +14,7 @@ from core.demo_auth import create_demo_session_token
 from core.dependencies import CurrentUser, get_current_user
 from core.firebase_auth import verify_firebase_id_token
 from modules.auth.session_repository import get_firebase_session_repository
-from modules.users.repository import serialize_user
+from modules.users.repository import ProfileNotProvisionedError, UnverifiedEmailLinkError, serialize_user
 from modules.users.service import get_user_service
 from core.limiter import limiter
 
@@ -49,8 +49,8 @@ DEMO_USERS = {
         "role": "Reviewer",
     },
     "teacher": {
-        "password": settings.demo_admin_password,
-        "email": "teacher@qbankctu.edu.vn",
+        "password": settings.demo_teacher_password,
+        "email": settings.demo_teacher_email,
         "display_name": "Teacher Demo",
         "role": "Teacher",
     },
@@ -82,6 +82,7 @@ def _ensure_demo_app_user(firebase_uid: str, demo_user: dict) -> dict:
         user = repository.sync_identity({
             "uid": firebase_uid,
             "email": demo_user["email"],
+            "email_verified": True,
             "name": demo_user["display_name"],
         })
         return repository.update(user["_id"], {
@@ -163,6 +164,18 @@ def login_user(request: Request, body: TokenRequest):
         return {"message": "Đăng nhập thành công", "user": user}
     except HTTPException:
         raise
+    except UnverifiedEmailLinkError as exc:
+        logger.warning("Refused unverified email link for Firebase uid %s", claims.get("uid"))
+        raise HTTPException(
+            status_code=403,
+            detail="Email chưa được xác minh. Vui lòng xác minh email rồi đăng nhập lại.",
+        ) from exc
+    except ProfileNotProvisionedError as exc:
+        logger.warning("Refused login without provisioned profile for Firebase uid %s", claims.get("uid"))
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản chưa được cấp quyền truy cập. Vui lòng liên hệ quản trị viên.",
+        ) from exc
     except Exception as exc:
         logger.exception("Backend session sync failed for Firebase uid %s", claims.get("uid"))
         raise HTTPException(

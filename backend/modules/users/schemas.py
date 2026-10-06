@@ -122,6 +122,8 @@ class UserAdminUpdateRequest(UserSelfUpdateRequest):
     permissions: Optional[list[str]] = Field(None, max_length=50)
     # Subjects a reviewer specialises in; empty means "can review any subject".
     review_subject_ids: Optional[list[str]] = Field(None, max_length=100)
+    # Subjects a teacher teaches; SUBJECT-scoped shares are visible only within these.
+    teaching_subject_ids: Optional[list[str]] = Field(None, max_length=100)
 
 
 class PasswordResetResponse(BaseModel):
@@ -277,6 +279,7 @@ class UserResponse(BaseModel):
     permission_grants: list[str] = Field(default_factory=list)
     permission_revokes: list[str] = Field(default_factory=list)
     review_subject_ids: list[str] = Field(default_factory=list)
+    teaching_subject_ids: list[str] = Field(default_factory=list)
     profile: UserProfile
     is_active: bool
     created_at: datetime

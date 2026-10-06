@@ -90,7 +90,8 @@ def _snapshot(record: dict, fields: tuple[str, ...]) -> dict:
     return {field: _json(record.get(field)) for field in fields}
 
 
-SUBJECT_FIELDS = ("subject_code", "subject_name", "description", "is_active")
+SUBJECT_FIELDS = ("subject_code", "subject_name", "description", "is_active", "approval_status",
+                  "approval_reason")
 CHAPTER_FIELDS = ("chapter_code", "chapter_name", "sequence_no", "is_active")
 CLO_FIELDS = ("clo_code", "description", "target_weight", "is_active")
 
@@ -166,7 +167,8 @@ class PostgresSubjectRepository:
             raise SubjectCodeConflict("Mã môn học đã tồn tại") from exc
 
     def update(self, subject_id: str | ObjectId, fields: dict, actor: Any = None,
-               *, deactivate: bool = False) -> dict:
+               *, deactivate: bool = False, action: str | None = None,
+               expected_approval_status: str | None = None) -> dict:
         row_id = str(subject_id)
         try:
             with postgres_connection() as conn:
@@ -175,13 +177,16 @@ class PostgresSubjectRepository:
                     if not row:
                         raise LookupError("Không tìm thấy học phần")
                     before = _subject(row)
+                    current_status = str(before.get("approval_status") or "APPROVED")
+                    if expected_approval_status and current_status != expected_approval_status:
+                        raise ValueError("Trạng thái duyệt của học phần vừa thay đổi, hãy tải lại")
                     after = {**before, **fields, "updated_at": _now()}
                     conn.execute("""
                         UPDATE subjects SET subject_code=%s, subject_name=%s, is_active=%s,
                             payload=%s, updated_at=%s WHERE id=%s
                     """, (after["subject_code"], after["subject_name"], after["is_active"],
                           Jsonb(_json(after)), after["updated_at"], row_id))
-                    _audit(conn, "catalog.subject_deactivate" if deactivate else "catalog.subject_update",
+                    _audit(conn, action or ("catalog.subject_deactivate" if deactivate else "catalog.subject_update"),
                            "subject", row_id, actor, _snapshot(before, SUBJECT_FIELDS),
                            _snapshot(after, SUBJECT_FIELDS), label=after["subject_code"])
                     return self._load(conn, ids=[row_id])[0]

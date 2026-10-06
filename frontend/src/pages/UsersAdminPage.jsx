@@ -134,6 +134,7 @@ function UsersAdminPage() {
   const [editPermissions, setEditPermissions] = useState([]);
   const [subjects, setSubjects] = useState(null);
   const [editReviewSubjects, setEditReviewSubjects] = useState([]);
+  const [editTeachingSubjects, setEditTeachingSubjects] = useState([]);
   const [subjectSuggestions, setSubjectSuggestions] = useState(null);
   useEffect(() => { listSubjects().then(setSubjects).catch(() => setSubjects(null)); }, []);
   const showReviewSubjects = editRole === 'Reviewer' || editPermissions.includes('reviews.manage');
@@ -299,6 +300,7 @@ function UsersAdminPage() {
     setEditActive(user.is_active);
     setEditPermissions(assignablePermissions(user.permissions || permissionsForRole(user.role)));
     setEditReviewSubjects(user.review_subject_ids || []);
+    setEditTeachingSubjects(user.teaching_subject_ids || []);
   };
 
   const closeEdit = () => {
@@ -320,6 +322,9 @@ function UsersAdminPage() {
         ...(showReviewSubjects
           ? { review_subject_ids: editReviewSubjects }
           : (editing.review_subject_ids?.length ? { review_subject_ids: [] } : {})),
+        ...(editRole === 'Teacher'
+          ? { teaching_subject_ids: editTeachingSubjects }
+          : (editing.teaching_subject_ids?.length ? { teaching_subject_ids: [] } : {})),
       });
       setEditing(null);
       await refreshAll();
@@ -505,7 +510,7 @@ function UsersAdminPage() {
                       </div>
                     </td>
                     <td>
-                      <span className={`role-pill role-pill--${(u.role || '').toLowerCase()}`}>{ROLE_LABEL[u.role] || u.role}</span>{u.role === 'Reviewer' && <small>{u.review_subject_ids?.length ? `${u.review_subject_ids.length} học phần` : 'Mọi học phần'}</small>}
+                      <span className={`role-pill role-pill--${(u.role || '').toLowerCase()}`}>{ROLE_LABEL[u.role] || u.role}</span>{u.role === 'Reviewer' && <small>{u.review_subject_ids?.length ? `${u.review_subject_ids.length} học phần` : 'Chưa gán học phần'}</small>}
                     </td>
                     <td>{(u.permissions || []).length} quyền</td>
                     <td>
@@ -751,7 +756,7 @@ function UsersAdminPage() {
             {subjects && showReviewSubjects && (
               <fieldset className="field-group">
                 <legend>Học phần phụ trách</legend>
-                <p className="field-hint">Để trống = có thể nhận câu mọi học phần.</p>
+                <p className="field-hint">Để trống = chưa được duyệt học phần nào; cần gán ít nhất một học phần.</p>
                 <div className="permission-grid">
                   {subjects
                     .map((item) => ({ item, id: String(item.id || item._id) }))
@@ -783,6 +788,30 @@ function UsersAdminPage() {
                     ))}
                   </div>
                 )}
+              </fieldset>
+            )}
+            {subjects && editRole === 'Teacher' && (
+              <fieldset className="field-group">
+                <legend>Học phần giảng dạy</legend>
+                <p className="field-hint">
+                  Câu hỏi và tài liệu chia sẻ theo học phần chỉ hiện với giảng viên dạy học phần đó.
+                  Học phần do giảng viên tự tạo được tính tự động.
+                </p>
+                <div className="permission-grid">
+                  {subjects
+                    .map((item) => ({ item, id: String(item.id || item._id) }))
+                    .filter(({ item, id }) => item.is_active !== false || editTeachingSubjects.includes(id))
+                    .map(({ item, id }) => (
+                      <label className="field-checkbox" key={id}>
+                        <input
+                          type="checkbox"
+                          checked={editTeachingSubjects.includes(id)}
+                          onChange={() => setEditTeachingSubjects((current) => togglePermission(current, id))}
+                        />
+                        {item.subject_code} — {item.subject_name}{item.is_active === false ? ' (đã ngừng)' : ''}
+                      </label>
+                    ))}
+                </div>
               </fieldset>
             )}
 

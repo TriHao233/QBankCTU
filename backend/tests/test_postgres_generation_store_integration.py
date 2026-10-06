@@ -168,7 +168,13 @@ def test_generation_queue_runs_and_admin_views_use_postgres(monkeypatch):
             "question_data": {}, "classification": {}, "clos": [], "sources": [],
             "content_hash": f"h-{suffix}", "created_by_user_id": uid, "created_at": now,
         })
-        assert generation.get_existing_question_texts(str(document_id)) == ["Câu đã có"]
+        assert generation.get_existing_question_texts(str(document_id), viewer_user_id=uid) == ["Câu đã có"]
+        other_user = ObjectId()
+        assert generation.get_existing_question_texts(str(document_id), viewer_user_id=other_user) == []
+        assert generation.get_existing_question_texts(
+            str(document_id), viewer_user_id=other_user, include_shared=True,
+        ) == []
+        assert generation.get_existing_question_texts(str(document_id), viewer_user_id=None) == []
 
         # Startup recovery and worker restart only touch unfinished jobs.
         stale_id = retried["job"]["job_id"]
@@ -176,11 +182,19 @@ def test_generation_queue_runs_and_admin_views_use_postgres(monkeypatch):
             conn.execute("UPDATE generation_jobs SET updated_at=now()-interval '3 hours' "
                          "WHERE id=%s", (stale_id,))
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
-        assert job_recovery._recover_generation_jobs(None, cutoff, now, "timeout") == 1
-        assert generation.get_generation_job(stale_id)["status"] == "failed"
+        # A queued job is never failed by recovery, however old; the worker will pick it up.
+        assert job_recovery._recover_generation_jobs(None, cutoff, now, "timeout") == 0
+        assert generation.get_generation_job(stale_id)["status"] == "queued"
         restart_id = generation.create_generation_job(request, uid, model_snapshot=GEMINI)
-        assert job_recovery.cancel_unfinished_generation_jobs_on_worker_start() >= 1
-        assert generation.get_generation_job(restart_id)["progress"]["stage"] == "cancelled"
+        job_recovery.requeue_orphaned_generation_jobs_on_worker_start()
+        assert generation.get_generation_job(restart_id)["status"] == "queued"
+        orphan_id = generation.create_generation_job(request, uid, model_snapshot=GEMINI)
+        assert generation.claim_generation_job(orphan_id, "dead-worker")
+        with postgres_connection() as conn:
+            conn.execute("UPDATE generation_jobs SET lease_expires_at=now()-interval '1 minute' "
+                         "WHERE id=%s", (orphan_id,))
+        assert job_recovery.requeue_orphaned_generation_jobs_on_worker_start()["requeued"] >= 1
+        assert generation.get_generation_job(orphan_id)["status"] == "queued"
         assert generation.get_generation_job(done_id)["status"] == "completed"
     finally:
         user_ids = [str(uid), str(admin["_id"])]

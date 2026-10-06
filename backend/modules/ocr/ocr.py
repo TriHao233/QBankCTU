@@ -14,14 +14,16 @@ from fastapi.concurrency import run_in_threadpool
 
 from core.config import resolve_path, settings
 from core.dependencies import CurrentUser, require_document_manager
-from modules.documents.service import DocumentService, get_document_service
+from modules.documents.service import DocumentService, ensure_document_subjects_usable, get_document_service
 from modules.documents.storage import artifact_storage, storage_for_provider
 from modules.documents.ingest.base import UnsupportedDocumentError
+from modules.documents.upload_validation import UploadContentError, inspect_upload
 from modules.ocr.mongodb import (
     attach_original_artifact,
     attach_processing_artifact,
     create_document_record,
     create_ocr_job,
+    find_duplicate_upload,
     get_document_status,
     save_document_pages,
     update_document_status,
@@ -87,7 +89,10 @@ async def process_ocr_background(
     source_file_name: str | None = None,
     mime_type: str | None = None,
     source_provider: str = "LOCAL",
+    auto_chunk: bool = False,
+    promote_actor: str | None = None,
 ):
+    extraction_completed = False
     try:
         async with gpu_semaphore:
             if _ocr_job_cancelled(job_id):
@@ -143,6 +148,7 @@ async def process_ocr_background(
             if _ocr_job_cancelled(job_id):
                 return
             update_document_status(document_id, job_id, status="completed", stats=stats)
+            extraction_completed = True
     except DocumentQualityError as exc:
         logger.error("OCR job %s failed quality gate: %s", job_id, exc)
         if _ocr_job_cancelled(job_id):
@@ -175,6 +181,26 @@ async def process_ocr_background(
             status="failed",
             error_message=str(exc),
         )
+    if extraction_completed and auto_chunk:
+        await _auto_chunk_after_extraction(document_id, promote_actor)
+
+
+async def _auto_chunk_after_extraction(document_id: str, promote_actor: str | None) -> None:
+    from modules.dictionary.dictionary import run_dictionary_auto_learning
+    from modules.dictionary.service import dictionary_key_for_document
+    from modules.rag.chunking import auto_chunk_extracted_document
+    from modules.rag.mongodb import get_document_record
+
+    result = await run_in_threadpool(auto_chunk_extracted_document, document_id, promote_actor=promote_actor)
+    if not result or not result.total_chunks:
+        return
+    document = get_document_record(document_id)
+    dictionary_key = dictionary_key_for_document(document) if document else None
+    if dictionary_key:
+        try:
+            await run_dictionary_auto_learning(document_id=document_id, course_id=dictionary_key)
+        except Exception:
+            logger.exception("Dictionary auto-learning after automatic chunking failed for %s", document_id)
 
 
 def _iter_docx_blocks(document: Document):
@@ -281,8 +307,29 @@ async def queue_document_upload(
     file.file.seek(0)
     if file_size > 50 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Dung lượng tối đa 50 MB")
+    try:
+        inspected = await run_in_threadpool(inspect_upload, file.file, upload_type["source_format"])
+    except UploadContentError as exc:
+        file.file.close()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     title = Path(safe_filename).stem.replace("_", " ")
+    try:
+        await run_in_threadpool(ensure_document_subjects_usable, [subject_id], current_user)
+    except PermissionError as exc:
+        file.file.close()
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        file.file.close()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    duplicate = await run_in_threadpool(find_duplicate_upload, current_user.id, inspected["sha256"])
+    if duplicate:
+        file.file.close()
+        raise HTTPException(status_code=409, detail={
+            "code": "DUPLICATE_DOCUMENT",
+            "document_id": str(duplicate["_id"]),
+            "message": f"Bạn đã tải lên tài liệu có cùng nội dung: {duplicate.get('title') or duplicate['_id']}",
+        })
     try:
         document_id = create_document_record(
             filename=safe_filename,
@@ -294,7 +341,10 @@ async def queue_document_upload(
     except ValueError as exc:
         file.file.close()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    job_id = create_ocr_job(document_id, config={"source_format": upload_type["source_format"]})
+    job_id = create_ocr_job(document_id, config={
+        "source_format": upload_type["source_format"],
+        "auto_chunk": settings.auto_chunk_after_extraction,
+    })
     upload_path = _UPLOAD_DIR / f"{document_id}_{safe_filename}"
     output_path = _OUTPUT_DIR / f"{document_id}_{job_id}_result.md"
 
@@ -332,6 +382,7 @@ async def queue_document_upload(
         source_file_name=safe_filename,
         mime_type=upload_type["mime_type"],
         source_provider=saved["provider"],
+        auto_chunk=settings.auto_chunk_after_extraction,
     )
     return {
         "message": "File đã được tiếp nhận và đang xử lý nền",
@@ -393,6 +444,8 @@ def check_job_status(
             document_service.can_use(document["id"], current_user)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Không tìm thấy OCR job") from exc
     job = result["job"]
     return {
         "job_id": job["_id"],
@@ -401,4 +454,5 @@ def check_job_status(
         "progress": job.get("progress"),
         "error_message": (job.get("error") or {}).get("message"),
         "stats": job.get("stats"),
+        "auto_chunk": bool((job.get("config") or {}).get("auto_chunk")),
     }

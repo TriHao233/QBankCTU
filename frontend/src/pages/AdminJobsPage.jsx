@@ -94,6 +94,14 @@ function formatAge(seconds) {
   return `${Math.floor(seconds / 86400)} ngày`;
 }
 
+const OUTCOME_LABEL = {
+  SUCCEEDED: 'Hoàn tất',
+  PARTIAL: 'Hoàn tất một phần',
+  CANCELLED: 'Đã hủy',
+  FAILED: 'Thất bại',
+  DEAD_LETTER: 'Hết lượt thử lại',
+};
+
 function statusClass(status) {
   const normalized = String(status || 'unknown').toLowerCase();
   if (['failed', 'error', 'cancelled'].includes(normalized)) return 'danger';
@@ -125,6 +133,7 @@ const JOB_EXPORT_COLUMNS = [
   { header: 'Quá thời gian (Long running)', value: (job) => (job.is_long_running ? 'có' : 'không') },
   { header: 'Có thể chạy lại', value: (job) => (job.can_retry ? 'có' : 'không') },
   { header: 'Có thể hủy', value: (job) => (job.can_cancel ? 'có' : 'không') },
+  { header: 'Kết quả', value: (job) => OUTCOME_LABEL[job.outcome] || '' },
   { header: 'Lỗi', value: (job) => job.error_message || '' },
   { header: 'Dữ liệu trạng thái', value: (job) => job.snapshot || {} },
 ];
@@ -496,6 +505,9 @@ function AdminJobsPage() {
                         <span className={`status-pill status-pill--${statusClass(job.status)}`}>
                           {STATUS_LABEL[job.status] || job.status || 'Chưa rõ'}
                         </span>
+                        {OUTCOME_LABEL[job.outcome] && job.outcome !== 'SUCCEEDED' && (
+                          <small className="long-running">{OUTCOME_LABEL[job.outcome]}</small>
+                        )}
                         {job.is_long_running && <small className="long-running">Quá ngưỡng</small>}
                       </td>
                       <td>

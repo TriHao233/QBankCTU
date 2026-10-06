@@ -92,8 +92,13 @@ def test_document_metadata_crud_is_postgres_backed(monkeypatch):
                                                   "shared_scope": "SUBJECT"})
         assert updated["title"] == "Slide mới"
         shared, total = repository.list(1, 10, None, "Slide mới",
-                                         visible_to_user_id=ObjectId())
+                                         visible_to_user_id=ObjectId(),
+                                         shared_subject_ids=[str(secondary)])
         assert total == 1 and shared[0]["_id"] == document_id
+        _other_subject, total = repository.list(1, 10, None, "Slide mới",
+                                                visible_to_user_id=ObjectId(),
+                                                shared_subject_ids=[str(ObjectId())])
+        assert total == 0
         with postgres_connection() as conn:
             row = conn.execute("SELECT title FROM documents WHERE id=%s",
                                (str(document_id),)).fetchone()

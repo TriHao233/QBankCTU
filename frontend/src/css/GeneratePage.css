@@ -1456,3 +1456,23 @@
     transition-duration: 1ms !important;
   }
 }
+
+.generate-page .btn--sm { padding: 5px 12px; font-size: 0.8rem; }
+.generate-page .ratio-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
+  border: 1px dashed var(--border-color, #d0d7de);
+  border-radius: 10px;
+}
+.generate-page .ratio-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+.generate-page .ratio-group > span { width: 100%; font-weight: 600; font-size: 0.85rem; }
+.generate-page .ratio-check { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; }
+.generate-page .ratio-input { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; }
+.generate-page .ratio-input .field-input { width: 72px; }

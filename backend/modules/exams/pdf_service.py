@@ -18,6 +18,7 @@ _env = Environment(
 )
 
 VALID_EXPORT_TYPES = {"de", "dapan", "de_dapan"}
+PREVIEW_WATERMARK = "BẢN XEM TRƯỚC – KHÔNG DÙNG CHÍNH THỨC"
 
 
 def _split_answer_keys(correct_answer: Any) -> list[str]:
@@ -33,6 +34,7 @@ def _build_context(
     exam_code: str,
     questions: list[dict],
     export_type: str,
+    watermark: str | None = None,
 ) -> dict:
     show_questions = export_type in {"de", "de_dapan"}
     show_answers = export_type == "de_dapan"
@@ -73,6 +75,7 @@ def _build_context(
         "show_questions": show_questions,
         "show_answers": show_answers,
         "show_answer_table": show_answer_table,
+        "watermark": watermark,
     }
 
 
@@ -81,11 +84,12 @@ def render_exam_html(
     exam_code: str,
     questions: list[dict],
     export_type: str,
+    watermark: str | None = None,
 ) -> str:
     if export_type not in VALID_EXPORT_TYPES:
         raise ValueError(f"export_type không hợp lệ: {export_type}")
     template = _env.get_template("exam_pdf.html")
-    context = _build_context(header, exam_code, questions, export_type)
+    context = _build_context(header, exam_code, questions, export_type, watermark)
     return template.render(**context)
 
 
@@ -94,10 +98,11 @@ async def render_exam_pdf(
     exam_code: str,
     questions: list[dict],
     export_type: str,
+    watermark: str | None = None,
 ) -> bytes:
     if not questions:
         raise ValueError("Đề thi chưa có câu hỏi, không thể xuất PDF")
-    html = render_exam_html(header, exam_code, questions, export_type)
+    html = render_exam_html(header, exam_code, questions, export_type, watermark)
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         try:
@@ -133,17 +138,25 @@ def render_exam_docx(
     exam_code: str,
     questions: list[dict],
     export_type: str,
+    watermark: str | None = None,
 ) -> bytes:
     if export_type not in VALID_EXPORT_TYPES:
         raise ValueError(f"export_type không hợp lệ: {export_type}")
     if not questions:
         raise ValueError("Đề thi chưa có câu hỏi, không thể xuất DOCX")
 
-    context = _build_context(header, exam_code, questions, export_type)
+    context = _build_context(header, exam_code, questions, export_type, watermark)
     document = Document()
     normal_style = document.styles["Normal"]
     normal_style.font.name = "Times New Roman"
     normal_style.font.size = Pt(12)
+    if watermark:
+        for section in document.sections:
+            section.header.paragraphs[0].text = watermark
+            section.header.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        notice = document.add_paragraph()
+        notice.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        notice.add_run(watermark).bold = True
 
     if header.get("school_name"):
         document.add_paragraph(str(header["school_name"]))

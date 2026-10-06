@@ -181,7 +181,7 @@ const techStack = [
   { icon: Icon.database, name: 'MongoDB', caption: 'Cơ sở dữ liệu' },
   { icon: Icon.nodes, name: 'ChromaDB', caption: 'Vector Database' },
   { icon: Icon.key, name: 'Firebase', caption: 'Xác thực' },
-  { icon: Icon.scan, name: 'EasyOCR', caption: 'Xử lý tài liệu' },
+  { icon: Icon.scan, name: 'Docling', caption: 'Xử lý tài liệu' },
   { icon: Icon.cpu, name: 'LLM', caption: 'Mô hình AI' },
   { icon: Icon.cap, name: 'Moodle', caption: 'Tích hợp LMS' },
 ];

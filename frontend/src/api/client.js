@@ -12,7 +12,12 @@ export async function parseError(response) {
   } catch {
     /* ignore */
   }
-  throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  if (typeof detail === 'string') throw new Error(detail);
+  const error = new Error(detail?.message || JSON.stringify(detail));
+  error.status = response.status;
+  error.code = detail?.code;
+  error.documentId = detail?.document_id;
+  throw error;
 }
 
 export async function authHeaders() {

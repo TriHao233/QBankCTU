@@ -130,8 +130,8 @@ def fix_exponents(text: str) -> str:
     text = re.sub(r'(\w)/2([A-Z])\b', r'\1/2^\2', text)
     return re.sub(r'(\d)\*(\d)(\d)\)', r'\1*\2^\3)', text)
 
-def fix_easyocr_typos(line: str) -> str:
-    """Sửa các lỗi rớt ký tự hoặc dính chữ kinh điển của EasyOCR"""
+def fix_ocr_typos(line: str) -> str:
+    """Sửa các lỗi rớt ký tự hoặc dính chữ thường gặp của OCR"""
     stripped = line.strip()
     if not stripped: return line
 
@@ -152,7 +152,7 @@ def clean_page_text(text: str) -> str:
 
     cleaned_lines = []
     for l in lines:
-        fixed_line = fix_easyocr_typos(l)
+        fixed_line = fix_ocr_typos(l)
         cleaned = clean_line(fixed_line)
         if not is_garbled_line(cleaned) or not cleaned.strip():
             cleaned_lines.append(cleaned)

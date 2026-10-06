@@ -3,6 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from core.config import settings
+from modules.questions.review_reasons import review_reason_errors
 
 
 class EvaluationScores(BaseModel):
@@ -116,14 +117,26 @@ class ReviewCreateRequest(BaseModel):
     bulk: bool = False
     # Quản trị viên tự duyệt câu do chính mình tạo/sửa phải ghi lý do (được lưu và ghi nhật ký).
     self_review_reason: str = Field("", max_length=500)
+    # Codes from REVIEW_REASON_CATALOG; at least one is required to reject or ask for revision.
+    reason_codes: list[str] = Field(default_factory=list, max_length=12)
+    # Submission-check flags the reviewer confirmed seeing; approving requires every current flag.
+    acknowledged_flags: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def require_structured_reason(self):
+        self.acknowledged_flags = list(dict.fromkeys(
+            flag.strip() for flag in self.acknowledged_flags if flag.strip()
+        ))
         has_reason = bool(self.note.strip()) or self.review_form.has_reason()
         if self.decision == "REJECTED" and not has_reason:
             raise ValueError("Reject cần ghi rõ lý do")
         if self.decision == "NEEDS_REVISION" and not self.review_form.revision_issues:
             raise ValueError("Cần ít nhất một lỗi cần Teacher sửa")
+        self.reason_codes = list(dict.fromkeys(code.strip().upper() for code in self.reason_codes if code.strip()))
+        has_note = bool(self.note.strip() or self.review_form.overall_note.strip())
+        errors = review_reason_errors(self.decision, self.reason_codes, has_note=has_note)
+        if errors:
+            raise ValueError(errors[0])
         return self
 
 
@@ -145,6 +158,11 @@ class SecondaryReviewRequest(BaseModel):
 class ReviewAssignmentRequest(BaseModel):
     reviewer_user_id: str | None = Field(None, min_length=1, max_length=120)
     note: str = Field("", max_length=500)
+
+
+class ReviewClaimRequest(BaseModel):
+    # Required only when an Admin takes a question another reviewer still holds.
+    reason: str = Field("", max_length=500)
 
 
 class AutoAssignRequest(BaseModel):

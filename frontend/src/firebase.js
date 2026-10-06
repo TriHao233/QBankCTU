@@ -2,16 +2,16 @@ import { initializeApp } from "firebase/app";
 import { getAnalytics } from "firebase/analytics";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 
-export const CANONICAL_FIREBASE_PROJECT_ID = "nckh-e6817";
+export const CANONICAL_FIREBASE_PROJECT_ID = "nckh-c0ef6";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCA0WPy--PUOvHcgQgDQRYCqgaeSy029_E",
-  authDomain: "nckh-e6817.firebaseapp.com",
+  apiKey: "AIzaSyDDPsHgdDyAbyNL4pTQUUInyw9s4VMQVeM",
+  authDomain: "nckh-c0ef6.firebaseapp.com",
   projectId: CANONICAL_FIREBASE_PROJECT_ID,
-  storageBucket: "nckh-e6817.firebasestorage.app",
-  messagingSenderId: "920272280208",
-  appId: "1:920272280208:web:454fd58bf1f15b58479615",
-  measurementId: "G-ZLLP495N0E",
+  storageBucket: "nckh-c0ef6.firebasestorage.app",
+  messagingSenderId: "953198341983",
+  appId: "1:953198341983:web:22a5e6810096bca9be10ea",
+  measurementId: "G-BV5PSNEMVP",
 };
 
 const app = initializeApp(firebaseConfig);
@@ -29,7 +29,7 @@ if (hasFirebaseWebConfig && usesRegisterProject) {
     googleProviderInstance = new GoogleAuthProvider();
     googleProviderInstance.setCustomParameters({ prompt: "select_account" });
   } catch (error) {
-    console.error("Firebase web app config is invalid for nckh-e6817.", error);
+    console.error(`Firebase web app config is invalid for ${CANONICAL_FIREBASE_PROJECT_ID}.`, error);
   }
 }
 

@@ -1,9 +1,18 @@
-import React, { useEffect, useState } from 'react';
+import React, { useContext, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faClone, faTrashCan } from '@fortawesome/free-solid-svg-icons';
-import { createExam, deleteExam, duplicateExam, listExams } from '../api/exams';
+import { faClone, faShareNodes, faTrashCan } from '@fortawesome/free-solid-svg-icons';
+import {
+  createExam,
+  deleteExam,
+  duplicateExam,
+  listExams,
+  transferExamOwner,
+  updateExamSharing,
+} from '../api/exams';
 import { listSubjects } from '../api/catalog';
+import { listTeacherOptions } from '../api/users';
+import { AuthContext } from '../context/AuthContext';
 import '../css/ExamListPage.css';
 
 function refId(value) {
@@ -16,6 +25,7 @@ const STATUS_LABEL = {
   DRAFT: 'Nháp',
   READY: 'Sẵn sàng',
   FINALIZED: 'Đã chốt',
+  PUBLISHED: 'Đã phát hành',
   ARCHIVED: 'Lưu trữ',
 };
 
@@ -37,6 +47,15 @@ function ExamListPage() {
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState(null);
   const [duplicatingId, setDuplicatingId] = useState(null);
+  const { user } = useContext(AuthContext);
+  const isAdmin = user?.role === 'Admin';
+  const [teacherOptions, setTeacherOptions] = useState([]);
+  const [sharingExam, setSharingExam] = useState(null);
+  const [sharingIds, setSharingIds] = useState([]);
+  const [newOwnerId, setNewOwnerId] = useState('');
+  const [transferReason, setTransferReason] = useState('');
+  const [sharingSaving, setSharingSaving] = useState(false);
+  const [sharingError, setSharingError] = useState('');
 
   const [name, setName] = useState('');
   const [examTitle, setExamTitle] = useState('');
@@ -116,6 +135,46 @@ function ExamListPage() {
     }
   };
 
+  const openSharing = (exam) => {
+    setSharingExam(exam);
+    setSharingIds(exam.shared_with_user_ids || []);
+    setNewOwnerId('');
+    setTransferReason('');
+    setSharingError('');
+    if (teacherOptions.length === 0) {
+      listTeacherOptions().then((result) => setTeacherOptions(result.items || [])).catch(() => {});
+    }
+  };
+
+  const toggleSharingUser = (userId) => {
+    setSharingIds((current) => (
+      current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]
+    ));
+  };
+
+  const submitSharing = async (event) => {
+    event.preventDefault();
+    if (!sharingExam) return;
+    if (newOwnerId && transferReason.trim().length < 5) {
+      setSharingError('Cần nêu lý do chuyển chủ sở hữu (ít nhất 5 ký tự).');
+      return;
+    }
+    setSharingSaving(true);
+    setSharingError('');
+    try {
+      await updateExamSharing(sharingExam.id, sharingIds);
+      if (isAdmin && newOwnerId) {
+        await transferExamOwner(sharingExam.id, newOwnerId, transferReason.trim());
+      }
+      setSharingExam(null);
+      await fetchExams();
+    } catch (err) {
+      setSharingError(err.message || 'Cập nhật chia sẻ thất bại');
+    } finally {
+      setSharingSaving(false);
+    }
+  };
+
   const handleDuplicate = async (exam) => {
     setDuplicatingId(exam.id);
     try {
@@ -170,6 +229,7 @@ function ExamListPage() {
 	                    <button type="button" className="btn btn--outline" onClick={() => navigate(`/lam-de-thi/${exam.id}`)}>
 	                      Mở đề thi
 	                    </button>
+                    {exam.can_edit !== false && (
 	                    <button
 	                      type="button"
 	                      className="icon-btn"
@@ -179,15 +239,29 @@ function ExamListPage() {
 	                    >
 	                      <FontAwesomeIcon icon={faClone} />
 	                    </button>
-	                    <button
-	                      type="button"
-	                      className="icon-btn icon-btn--danger"
-                      title="Xoá"
-                      disabled={deletingId === exam.id}
-                      onClick={() => handleDelete(exam)}
-                    >
-                      <FontAwesomeIcon icon={faTrashCan} />
-                    </button>
+                    )}
+                    {exam.can_edit !== false && (
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title="Chia sẻ"
+                        onClick={() => openSharing(exam)}
+                      >
+                        <FontAwesomeIcon icon={faShareNodes} />
+                      </button>
+                    )}
+                    {exam.can_edit !== false && (
+                      <button
+                        type="button"
+                        className="icon-btn icon-btn--danger"
+                        title="Xoá"
+                        disabled={deletingId === exam.id}
+                        onClick={() => handleDelete(exam)}
+                      >
+                        <FontAwesomeIcon icon={faTrashCan} />
+                      </button>
+                    )}
+                    {exam.can_edit === false && <small>Được chia sẻ (chỉ xem)</small>}
                   </div>
                 </div>
               ))}
@@ -242,6 +316,61 @@ function ExamListPage() {
               <button type="button" className="btn btn--outline" onClick={closeCreate} disabled={saving}>Huỷ</button>
               <button type="submit" className="btn btn--primary" disabled={saving}>
                 {saving ? 'Đang tạo...' : 'Tạo đề thi'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {sharingExam && (
+        <div className="modal-overlay" onClick={() => !sharingSaving && setSharingExam(null)}>
+          <form className="modal-card" onClick={(e) => e.stopPropagation()} onSubmit={submitSharing}>
+            <h3 className="profile-card-title">Chia sẻ đề thi "{sharingExam.name}"</h3>
+            <div className="field-group">
+              <label className="field-label">Chia sẻ quyền xem cho giảng viên</label>
+              <div className="sharing-user-list">
+                {teacherOptions
+                  .filter((teacher) => teacher.id !== sharingExam.created_by_user_id)
+                  .map((teacher) => (
+                    <label className="clo-option" key={teacher.id}>
+                      <input
+                        type="checkbox"
+                        checked={sharingIds.includes(teacher.id)}
+                        onChange={() => toggleSharingUser(teacher.id)}
+                      />
+                      <span><b>{teacher.display_name || teacher.email}</b> {teacher.email}</span>
+                    </label>
+                  ))}
+                {teacherOptions.length === 0 && <p className="empty-note">Không tải được danh sách giảng viên.</p>}
+              </div>
+              <p className="field-hint">Người được chia sẻ chỉ xem, xuất mã đề và nhân bản; không sửa hay xoá đề.</p>
+            </div>
+            {isAdmin && (
+              <div className="field-group">
+                <label className="field-label">Chuyển chủ sở hữu (Admin)</label>
+                <select className="field-select" value={newOwnerId} onChange={(e) => setNewOwnerId(e.target.value)}>
+                  <option value="">Không đổi chủ sở hữu</option>
+                  {teacherOptions
+                    .filter((teacher) => teacher.id !== sharingExam.created_by_user_id)
+                    .map((teacher) => (
+                      <option key={teacher.id} value={teacher.id}>{teacher.display_name || teacher.email}</option>
+                    ))}
+                </select>
+                {newOwnerId && (
+                  <input
+                    className="field-input"
+                    placeholder="Lý do chuyển chủ sở hữu"
+                    value={transferReason}
+                    onChange={(e) => setTransferReason(e.target.value)}
+                  />
+                )}
+              </div>
+            )}
+            {sharingError && <p className="exam-error">{sharingError}</p>}
+            <div className="modal-actions">
+              <button type="button" className="btn btn--outline" onClick={() => setSharingExam(null)} disabled={sharingSaving}>Huỷ</button>
+              <button type="submit" className="btn btn--primary" disabled={sharingSaving}>
+                {sharingSaving ? 'Đang lưu...' : 'Lưu'}
               </button>
             </div>
           </form>

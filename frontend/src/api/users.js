@@ -1,5 +1,14 @@
 import { apiRequest } from '../services/apiClient';
 
+export async function isPublicRegistrationEnabled() {
+  try {
+    const data = await apiRequest('/auth/registration-status', { authRequired: false });
+    return data?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
 export function getMe() {
   return apiRequest('/users/me');
 }

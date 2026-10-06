@@ -36,9 +36,13 @@
   .answer-table tr { break-inside: avoid; page-break-inside: avoid; }
   .answer-table .row-label { width: 18mm; font-weight: bold; }
   .answer-block { break-before: page; page-break-before: always; }
+  .watermark { position: fixed; top: 45%; left: 0; width: 100%; text-align: center; transform: rotate(-30deg);
+               font-size: 40pt; font-weight: bold; color: rgba(0, 0, 0, 0.12); z-index: 1000; pointer-events: none; }
+  .watermark-note { text-align: center; font-weight: bold; margin: 0 0 4mm; }
 </style>
 </head>
 <body>
+  {% if watermark %}<div class="watermark">{{ watermark }}</div><p class="watermark-note">{{ watermark }}</p>{% endif %}
   <div class="masthead">
     <div>
       {% if header.school_name %}<p class="school">{{ header.school_name }}</p>{% endif %}

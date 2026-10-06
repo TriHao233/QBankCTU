@@ -22,7 +22,7 @@ from modules.documents.repository import object_id
 from modules.documents.store import get_document_repository
 from modules.documents.service import DocumentService, get_document_service
 from modules.dictionary.dictionary import run_dictionary_auto_learning
-from modules.dictionary.service import get_active_keywords
+from modules.dictionary.service import dictionary_key_for_document, get_active_keywords
 from modules.rag.chunking_export import export_chunks_to_file
 from modules.rag.chromadb_engine import (
     chroma_persist_uri,
@@ -44,6 +44,7 @@ from modules.rag.mongodb import (
     start_chunk_set,
     update_chunking_status,
 )
+from modules.rag.lineage import auto_promote_pending_lineage
 from modules.rag.schemas import ChunkingStats, DocumentChunkRequest, DocumentChunkResponse
 from modules.rag.retrieval_policy import filter_retrieval_pages
 
@@ -89,9 +90,14 @@ async def chunk_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
     try:
-        document_service.can_use(req.document_id, current_user)
+        if req.dry_run:
+            document_service.can_use(req.document_id, current_user)
+        else:
+            document_service.can_manage(req.document_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     try:
         result = await run_in_threadpool(
@@ -106,19 +112,24 @@ async def chunk_document(
             dry_run=req.dry_run,
         )
 
-        if not req.dry_run and result.total_chunks > 0:
+        dictionary_key = dictionary_key_for_document(doc)
+        if not req.dry_run and result.total_chunks > 0 and dictionary_key:
             logger.info("Đang kích hoạt tiến trình AI học từ khóa ngầm...")
             background_tasks.add_task(
                 run_dictionary_auto_learning,
                 document_id=req.document_id,
-                course_id="it_fundamentals"
+                course_id=dictionary_key,
             )
 
         return result
+    except ValueError as ex:
+        logger.warning("Chunking rejected: %s", ex)
+        update_chunking_status(req.document_id, status="failed", error_message=str(ex))
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
     except Exception as ex:
         logger.exception("Chunking failed: %s", ex)
         update_chunking_status(req.document_id, status="failed", error_message=str(ex))
-        raise HTTPException(status_code=500, detail=str(ex)) from ex
+        raise HTTPException(status_code=500, detail="Không thể chia chunk tài liệu") from ex
 
 
 def _chunk_run_config(config: dict) -> dict:
@@ -168,20 +179,42 @@ def _cancelled_chunk_response(
     )
 
 
+def _promote_reprocessed_lineage(document_id: str, promote_actor: str | None) -> None:
+    if not promote_actor or not settings.auto_promote_reprocessed_lineage:
+        return
+    outcome = auto_promote_pending_lineage(
+        document_id,
+        actor=promote_actor,
+        reason="Tự động promote sau khi xử lý lại tài liệu từ giao diện",
+    )
+    if outcome.get("status") == "FAILED":
+        logger.warning("Auto-promotion of document %s kept pending: %s", document_id, outcome.get("reason"))
+
+
 def process_chunk_retry_background(
     document_id: str,
     chunk_job_id: str,
     chunk_set_id: str,
     run_config: dict,
+    promote_actor: str | None = None,
 ) -> None:
     try:
-        _process_existing_chunk_set(document_id, chunk_job_id, chunk_set_id, run_config)
+        result = _process_existing_chunk_set(document_id, chunk_job_id, chunk_set_id, run_config)
     except Exception as exc:
         logger.exception("Chunk retry job %s failed", chunk_job_id)
         update_chunking_status(document_id, status="failed", error_message=str(exc))
+        return
+    if result.total_chunks and not run_config.get("dry_run"):
+        _promote_reprocessed_lineage(document_id, promote_actor)
 
 
-def queue_chunk_retry(background_tasks: BackgroundTasks, document_id: str, config: dict) -> dict:
+def queue_chunk_retry(
+    background_tasks: BackgroundTasks,
+    document_id: str,
+    config: dict,
+    *,
+    promote_actor: str | None = None,
+) -> dict:
     run_config = _chunk_run_config(config)
     chunk_job_id, chunk_set_id = start_chunk_set(document_id, run_config)
     background_tasks.add_task(
@@ -190,8 +223,26 @@ def queue_chunk_retry(background_tasks: BackgroundTasks, document_id: str, confi
         chunk_job_id=chunk_job_id,
         chunk_set_id=chunk_set_id,
         run_config=run_config,
+        promote_actor=promote_actor,
     )
     return {"chunk_job_id": chunk_job_id, "chunk_set_id": chunk_set_id}
+
+
+def auto_chunk_extracted_document(document_id: str, *, promote_actor: str | None = None) -> DocumentChunkResponse | None:
+    """Chunk and index right after a successful extraction; failures are recorded on the chunk job."""
+    try:
+        result = chunk_document_and_store(
+            document_id=document_id,
+            chunk_size=settings.chunk_size_default,
+            chunk_overlap=settings.chunk_overlap_default,
+        )
+    except Exception as exc:
+        logger.exception("Automatic chunking of document %s failed", document_id)
+        update_chunking_status(document_id, status="failed", error_message=str(exc))
+        return None
+    if result.total_chunks:
+        _promote_reprocessed_lineage(document_id, promote_actor)
+    return result
 
 
 def _vector_collection_for_current_model(collection_name: str) -> tuple[dict, str]:
@@ -887,12 +938,12 @@ def _process_existing_chunk_set(
     all_chunks_for_export: list[dict] = []
     vector_collection_id: str | None = None
 
+    document = get_document_record(document_id)
     keyword_started_at = perf_counter()
-    dynamic_keywords = get_active_keywords(course_id="it_fundamentals")
+    dynamic_keywords = get_active_keywords(dictionary_key_for_document(document))
     timings_ms["keyword_load"] = round((perf_counter() - keyword_started_at) * 1000, 2)
 
     split_started_at = perf_counter()
-    document = get_document_record(document_id)
     chunk_set = get_database().chunk_sets.find_one(
         {"_id": object_id(chunk_set_id, "chunk_set_id")},
         {"source_ocr_job_id": 1},

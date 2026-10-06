@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,9 @@ from core.audit import record_audit_event
 from core.config import resolve_path, settings
 from core.database import get_database
 from core.dependencies import CurrentUser, has_permission
+from modules.catalog.subject_approval import ensure_subject_approved, subject_usable_by
+from modules.questions.review_scope import ReviewerScope, reviewer_can_read
+from modules.users.store import teaching_subject_ids, users_by_ids
 from modules.questions.repository import (
     MongoQuestionRepository,
     MongoQuestionReferenceRepository,
@@ -23,7 +27,24 @@ from modules.questions.repository import (
     serialize_question,
     utc_now,
 )
-from modules.questions.schemas import QuestionCreateRequest, QuestionSharingRequest, QuestionUpdateRequest
+from modules.questions.schemas import (
+    QuestionCreateRequest,
+    QuestionOwnerTransferRequest,
+    QuestionSharingRequest,
+    QuestionUpdateRequest,
+)
+from modules.generation.postprocessing import contains_exact_text
+from modules.questions.review_limits import MIN_TAKEOVER_REASON_LENGTH, active_holder_id, released_assignment
+from modules.questions.submission_checks import (
+    SourceNotLocatedError,
+    answer_quality_issues,
+    check_grounding,
+    duplicate_flag,
+    evidence_texts,
+    submission_schema_errors,
+)
+
+logger = logging.getLogger(__name__)
 
 BLOOM_LEVELS = {
     1: ("REMEMBER", "Nhớ"),
@@ -36,6 +57,7 @@ BLOOM_LEVELS = {
 
 INITIAL_REVIEW_STATUSES = {"DRAFT", "PENDING"}
 SUBMITTABLE_REVIEW_STATUSES = {"DRAFT", "NEEDS_REVISION"}
+MIN_RESUBMIT_NOTE_LENGTH = 10
 SOURCE_PAGE_TEXT_LIMIT = 6000
 
 
@@ -121,17 +143,13 @@ class QuestionService:
         self.repository = repository
         self.references = references
 
-    def _owns_question(self, question: dict, version: dict, user_id: ObjectId) -> bool:
-        if question.get("created_by_user_id") == user_id:
-            return True
-        if version.get("created_by_user_id") == user_id:
-            return True
-        document_id = version.get("document_id")
-        if document_id:
-            document = self.references.find_document(document_id)
-            if document and document.get("uploaded_by_user_id") == user_id:
-                return True
-        return False
+    @staticmethod
+    def _owns_question(question: dict, version: dict, user_id: ObjectId) -> bool:
+        """Only the question owner; version authors and document uploaders gain nothing."""
+        owner = question.get("created_by_user_id")
+        if owner is not None:
+            return owner == user_id
+        return version.get("created_by_user_id") == user_id
 
     @staticmethod
     def _can_manage_all(current_user: CurrentUser) -> bool:
@@ -142,11 +160,21 @@ class QuestionService:
         return has_permission(current_user, "reviews.manage")
 
     @staticmethod
-    def _is_shared_question(question: dict, current_user: CurrentUser) -> bool:
+    def _teaching_subject_ids(current_user: CurrentUser) -> set[str]:
+        return teaching_subject_ids(get_database(), current_user.id)
+
+    def _is_shared_question(self, question: dict, current_user: CurrentUser, version: dict | None = None) -> bool:
         if not has_permission(current_user, "questions.use_shared_bank"):
             return False
         shared_with = set(question.get("shared_with_user_ids") or [])
-        return current_user.id in shared_with or question.get("shared_scope") == "SUBJECT"
+        if current_user.id in shared_with:
+            return True
+        if question.get("shared_scope") != "SUBJECT" or not question.get("approved_version_id"):
+            return False
+        subject_id = question.get("subject_id") or (
+            ((version or {}).get("classification") or {}).get("subject") or {}
+        ).get("id")
+        return bool(subject_id) and str(subject_id) in self._teaching_subject_ids(current_user)
 
     @staticmethod
     def _can_use_document(document: dict | None, current_user: CurrentUser) -> bool:
@@ -159,27 +187,78 @@ class QuestionService:
         if not has_permission(current_user, "questions.use_shared_bank"):
             return False
         shared_with = set(document.get("shared_with_user_ids") or [])
-        return current_user.id in shared_with or document.get("shared_scope") == "SUBJECT"
+        if current_user.id in shared_with:
+            return True
+        if document.get("shared_scope") != "SUBJECT":
+            return False
+        document_subjects = {str(item) for item in [document.get("subject_id"), *(document.get("subject_ids") or [])]
+                             if item}
+        return bool(document_subjects & QuestionService._teaching_subject_ids(current_user))
+
+    def _reviewer_scope(self, current_user: CurrentUser | None) -> ReviewerScope | None:
+        """Read scope of a reviewer who cannot manage every question; None when unrestricted."""
+        if not current_user or self._can_manage_all(current_user) or not self._can_review_all(current_user):
+            return None
+        loader = getattr(self.references, "reviewer_subject_ids", None)
+        return ReviewerScope(current_user.id, loader(current_user.id) if loader else [])
 
     def _ensure_read_access(
         self,
         pair: tuple[dict, dict] | None,
         current_user: CurrentUser | None,
-    ) -> None:
-        if not pair or not current_user or self._can_manage_all(current_user) or self._can_review_all(current_user):
-            return
-        if not self._owns_question(pair[0], pair[1], current_user.id) and not self._is_shared_question(pair[0], current_user):
-            raise PermissionError("Bạn không có quyền truy cập câu hỏi này")
+    ) -> tuple[dict, dict] | None:
+        """Return the pair when readable, None when it must look missing (out of reviewer scope)."""
+        if not pair or not current_user or self._can_manage_all(current_user):
+            return pair
+        question, version = pair
+        if self._owns_question(question, version, current_user.id) or self._is_shared_question(
+            question, current_user, version,
+        ):
+            return pair
+        scope = self._reviewer_scope(current_user)
+        if scope is not None:
+            has_decided = getattr(self.repository, "reviewer_has_decided", None)
+            visible = reviewer_can_read(
+                question, version, scope,
+                lambda: bool(has_decided and has_decided(question["_id"], current_user.id)),
+            )
+            return pair if visible else None
+        # Questions the user cannot see look missing rather than forbidden.
+        return None
+
+    def _is_primary_owner(self, question: dict, version: dict, user_id: ObjectId) -> bool:
+        """The question owner; a shared editor who authored a version is not an owner."""
+        return self._owns_question(question, version, user_id)
+
+    @staticmethod
+    def _is_shared_editor(question: dict, current_user: CurrentUser) -> bool:
+        if not has_permission(current_user, "questions.use_shared_bank"):
+            return False
+        return current_user.id in set(question.get("shared_edit_user_ids") or [])
 
     def _ensure_write_access(
         self,
         pair: tuple[dict, dict] | None,
         current_user: CurrentUser | None,
+        *,
+        allow_shared_editor: bool = True,
     ) -> None:
+        """Owners write; shared editors may edit and submit but not archive or reshare."""
         if not pair or not current_user or self._can_manage_all(current_user):
             return
-        if not self._owns_question(pair[0], pair[1], current_user.id):
-            raise PermissionError("Bạn không có quyền chỉnh sửa câu hỏi này")
+        question, version = pair
+        if allow_shared_editor:
+            if self._owns_question(question, version, current_user.id) or self._is_shared_editor(
+                question, current_user,
+            ):
+                return
+        elif self._is_primary_owner(question, version, current_user.id):
+            return
+        if self._ensure_read_access(pair, current_user) is None:
+            raise LookupError("Không tìm thấy câu hỏi")
+        if not allow_shared_editor:
+            raise PermissionError("Chỉ chủ sở hữu câu hỏi được thực hiện thao tác này")
+        raise PermissionError("Bạn không có quyền chỉnh sửa câu hỏi này")
 
     def _sources(
         self,
@@ -222,21 +301,39 @@ class QuestionService:
             raise ValueError("Tài liệu nguồn không tồn tại hoặc đã lưu trữ")
         return document
 
-    def _validate_subject(self, subject_id: str | ObjectId | None) -> dict | None:
+    def _validate_subject(
+        self,
+        subject_id: str | ObjectId | None,
+        actor: CurrentUser | None = None,
+    ) -> dict | None:
         if subject_id is None:
             return None
         subject_oid = object_id(subject_id, "subject_id")
         subject = self.references.find_subject(subject_oid)
-        if not subject:
+        if not subject or (actor is not None and not subject_usable_by(
+            subject, actor.id, is_admin=self._can_manage_all(actor),
+        )):
             raise ValueError("Học phần không tồn tại hoặc đã ngừng hoạt động")
         return subject
+
+    def _question_subject(self, version: dict) -> dict | None:
+        subject_id = ((version.get("classification") or {}).get("subject") or {}).get("id")
+        if not subject_id:
+            return None
+        return self.references.find_subject(object_id(subject_id, "subject_id"))
+
+    def _ensure_question_subject_approved(self, version: dict, action: str) -> None:
+        subject = self._question_subject(version)
+        if subject is not None:
+            ensure_subject_approved(subject, action)
 
     def _validate_classification_refs(
         self,
         subject_id: str | ObjectId | None,
         chapter_id: str | ObjectId | None,
+        actor: CurrentUser | None = None,
     ) -> dict | None:
-        subject = self._validate_subject(subject_id)
+        subject = self._validate_subject(subject_id, actor)
         if chapter_id is None:
             return subject
         if subject is None:
@@ -458,7 +555,9 @@ class QuestionService:
             raise ValueError("Chương câu hỏi không khớp với tài liệu nguồn")
         subject_id = document_subject_id or payload.subject_id
         chapter_id = document_chapter_id or payload.chapter_id
-        validated_subject = self._validate_classification_refs(subject_id, chapter_id)
+        validated_subject = self._validate_classification_refs(subject_id, chapter_id, actor)
+        if initial_review_status == "PENDING" and validated_subject is not None:
+            ensure_subject_approved(validated_subject, "gửi duyệt câu hỏi")
         classification = self._classification(
             question_type=payload.question_type,
             bloom_level=payload.bloom_level,
@@ -523,6 +622,7 @@ class QuestionService:
             "created_by_user_id": created_by_user_id,
             "subject_id": classification["subject"].get("id"),
             "review_submission": review_submission,
+            "grounding_required": origin == "AI",
             "created_at": now,
             "updated_at": now,
             "archived_at": None,
@@ -550,22 +650,99 @@ class QuestionService:
         question, current = self.repository.create(aggregate, version)
         return serialize_question(question, current)
 
+    def create_generated_draft(
+        self,
+        item: dict,
+        *,
+        created_by_user_id,
+        generation_run_id: ObjectId | None = None,
+        candidate_chunk_ids: list[str] | tuple = (),
+    ) -> dict:
+        """Persist one accepted AI candidate as a DRAFT question.
+
+        Sources are chosen here, never by the model: only retrieved chunks that
+        contain the candidate's quote are cited. A candidate whose quote is in no
+        retrieved chunk is not stored (SourceNotLocatedError) so the generator
+        can replace it.
+        """
+        quote = str(item.get("source_context") or "").strip()[:4000]
+        candidates = list(dict.fromkeys(str(chunk_id) for chunk_id in candidate_chunk_ids if chunk_id))
+        cited = []
+        evidence = [quote]
+        for chunk_id in candidates:
+            chunk = self.references.find_chunk(object_id(chunk_id, "chunk_id"))
+            if chunk and quote and contains_exact_text(chunk.get("content") or "", quote):
+                cited.append(chunk_id)
+                evidence.append(chunk.get("content") or "")
+        warnings = list(item.get("validation_warnings") or [])
+        if not cited:
+            raise SourceNotLocatedError()
+        draft_version = {
+            "classification": {"assessment_type": str(getattr(item.get("question_type"), "value", None)
+                                                      or item.get("question_type") or "")},
+            "question_data": {
+                "options": item.get("options"),
+                "correct_answer": item.get("correct_answer"),
+                "model_source_context": quote,
+            },
+        }
+        warnings.extend(message for _flag, message in answer_quality_issues(draft_version, evidence))
+        bloom_digits = "".join(ch for ch in str(item.get("bloom_level") or "")[:1] if ch.isdigit())
+        payload = QuestionCreateRequest(
+            content=item["question"],
+            question_type=item["question_type"],
+            bloom_level=int(bloom_digits) if bloom_digits else None,
+            difficulty=item.get("difficulty") or None,
+            question_data={
+                "options": item.get("options"),
+                "correct_answer": item.get("correct_answer"),
+                "explanation": item.get("explanation"),
+                "source_keywords": item.get("source_keywords") or [],
+                "false_mutation": item.get("false_mutation"),
+                "validation_warnings": warnings,
+            },
+            document_id=item.get("document_id"),
+            source_context=quote or None,
+            source_chunk_ids=cited,
+            clo_ids=item.get("clo_ids") or [],
+        )
+        return self.create(
+            payload,
+            created_by_user_id,
+            origin="AI",
+            generation_run_id=generation_run_id,
+        )
+
     def get(
         self,
         question_id: str,
         current_user: CurrentUser | None = None,
     ) -> dict | None:
-        pair = self.repository.find_pair(question_id)
-        self._ensure_read_access(pair, current_user)
+        pair = self._ensure_read_access(self.repository.find_pair(question_id), current_user)
         return serialize_question(*pair) if pair else None
 
     def duplicate(self, question_id: str, current_user: CurrentUser) -> dict | None:
-        pair = self.repository.find_pair(question_id)
-        self._ensure_read_access(pair, current_user)
+        pair = self._ensure_read_access(self.repository.find_pair(question_id), current_user)
         if not pair:
             return None
 
         source_question, source_version = pair
+        is_owner_level = self._can_manage_all(current_user) or self._owns_question(
+            source_question, source_version, current_user.id,
+        )
+        if not is_owner_level:
+            if not self._is_shared_question(source_question, current_user, source_version):
+                # Reviewer read scope lets a reviewer inspect a question, not copy it into their bank.
+                raise PermissionError("Chỉ được nhân bản câu hỏi bạn sở hữu hoặc được chia sẻ")
+            approved_id = source_question.get("approved_version_id")
+            approved = next(
+                (item for item in self.repository.list_versions(source_question["_id"])
+                 if approved_id is not None and str(item.get("_id")) == str(approved_id)),
+                None,
+            ) if approved_id is not None else None
+            if approved is None:
+                raise ValueError("Chỉ nhân bản được câu hỏi đã có phiên bản được duyệt")
+            source_version = approved
         now = utc_now()
         new_question_id = ObjectId()
         new_version_id = ObjectId()
@@ -613,6 +790,7 @@ class QuestionService:
             "created_by_user_id": current_user.id,
             "subject_id": (classification.get("subject") or {}).get("id"),
             "review_submission": {},
+            "grounding_required": bool(source_question.get("grounding_required")),
             "created_at": now,
             "updated_at": now,
             "archived_at": None,
@@ -719,6 +897,20 @@ class QuestionService:
         if sla_breached_only:
             sla_cutoff = utc_now() - timedelta(hours=max(1, settings.review_sla_hours))
             submitted_to = min(submitted_to, sla_cutoff) if submitted_to else sla_cutoff
+        scope_options: dict = {}
+        reviewer_scope = self._reviewer_scope(current_user)
+        uses_shared = bool(current_user) and has_permission(current_user, "questions.use_shared_bank")
+        if reviewer_scope is not None:
+            scope_options = {
+                "reviewer_scope": reviewer_scope,
+                "shared_subject_ids": sorted(self._teaching_subject_ids(current_user)) if uses_shared else [],
+                "include_shared": uses_shared,
+            }
+        elif owner_user_id is not None:
+            scope_options = {
+                "shared_subject_ids": sorted(self._teaching_subject_ids(current_user)) if uses_shared else [],
+                "include_shared": uses_shared,
+            }
 
         list_result = self.repository.list(
             page,
@@ -740,6 +932,7 @@ class QuestionService:
             assigned_reviewer_user_id=assigned_reviewer_user_id,
             creator_user_id=creator_oid,
             visible_to_user_id=owner_user_id,
+            **scope_options,
             waiting_since=waiting_since,
             overdue_at=overdue_at,
             override_only=override_only,
@@ -770,8 +963,7 @@ class QuestionService:
         question_id: str,
         current_user: CurrentUser | None = None,
     ) -> list[dict] | None:
-        pair = self.repository.find_pair(question_id)
-        self._ensure_read_access(pair, current_user)
+        pair = self._ensure_read_access(self.repository.find_pair(question_id), current_user)
         if not pair:
             return None
         versions = self.repository.list_versions(question_id)
@@ -806,8 +998,7 @@ class QuestionService:
         question_id: str,
         current_user: CurrentUser | None = None,
     ) -> dict | None:
-        pair = self.repository.find_pair(question_id)
-        self._ensure_read_access(pair, current_user)
+        pair = self._ensure_read_access(self.repository.find_pair(question_id), current_user)
         if not pair:
             return None
         question, version = pair
@@ -933,8 +1124,7 @@ class QuestionService:
         question_id: str,
         current_user: CurrentUser | None = None,
     ) -> dict | None:
-        pair = self.repository.find_pair(question_id)
-        self._ensure_read_access(pair, current_user)
+        pair = self._ensure_read_access(self.repository.find_pair(question_id), current_user)
         if not pair:
             return None
         _, version = pair
@@ -950,6 +1140,15 @@ class QuestionService:
                 if chunk and chunk.get("document_id"):
                     document = self.references.find_document(chunk["document_id"])
                     break
+        if document is not None and current_user is not None and not self._can_use_document(document, current_user):
+            question, _ = pair
+            via_review = (
+                not self._owns_question(question, version, current_user.id)
+                and not self._is_shared_question(question, current_user, version)
+                and self._reviewer_scope(current_user) is not None
+            )
+            if not via_review:
+                raise PermissionError("Bạn không có quyền tải tài liệu nguồn của câu hỏi này")
         artifact = _current_original_pdf_artifact(document)
         if not artifact:
             return None
@@ -998,6 +1197,13 @@ class QuestionService:
             )
         _, current = pair
         classification = current["classification"]
+        current_subject_id = (classification.get("subject") or {}).get("id")
+        subject_changed = (
+            payload.subject_id is not None
+            and str(object_id(payload.subject_id, "subject_id")) != str(current_subject_id or "")
+        )
+        if subject_changed and current_subject_id:
+            raise ValueError("Không thể đổi học phần của câu hỏi; hãy tạo câu hỏi mới trong học phần đích")
         validated_subject = None
         if any(
             value is not None
@@ -1042,6 +1248,7 @@ class QuestionService:
             validated_subject = self._validate_classification_refs(
                 next_subject_id,
                 next_chapter_id,
+                actor,
             )
             classification = self._classification(
                 question_type=payload.question_type or classification["assessment_type"],
@@ -1077,7 +1284,7 @@ class QuestionService:
                 payload.clo_ids,
                 subject=validated_subject,
             )
-        elif payload.subject_id is not None:
+        elif subject_changed:
             clos = []
         else:
             clos = current.get("clos", [])
@@ -1118,6 +1325,7 @@ class QuestionService:
             validated_subject = self._validate_classification_refs(
                 next_subject_id,
                 next_chapter_id,
+                actor,
             )
             classification = self._classification(
                 question_type=classification["assessment_type"],
@@ -1164,12 +1372,6 @@ class QuestionService:
             payload.expected_version,
             next_version,
             **_transactional(notifications),
-            review_submission=self._review_submission(
-                actor,
-                next_version,
-                version_created_at,
-                fallback_user_id=created_by_user_id,
-            ),
         )
         return serialize_question(*updated) if updated else None
 
@@ -1183,39 +1385,120 @@ class QuestionService:
         if not pair:
             return None
         question, version = pair
-        self._ensure_write_access(pair, current_user)
+        self._ensure_write_access(pair, current_user, allow_shared_editor=False)
+        owner_id = str(question.get("created_by_user_id") or "")
+        editors = [item for item in dict.fromkeys(payload.shared_edit_user_ids) if item != owner_id]
+        # Editors can always read, so they are part of the view list too.
+        viewers = [item for item in dict.fromkeys([*payload.shared_with_user_ids, *editors]) if item != owner_id]
+        if payload.shared_scope != "PRIVATE" or viewers:
+            self._ensure_question_subject_approved(version, "chia sẻ câu hỏi")
+        if payload.shared_scope == "SUBJECT" and not question.get("approved_version_id"):
+            raise ValueError("Chỉ chia sẻ toàn học phần cho câu hỏi đã được duyệt")
         before = {
-            "shared_with_user_ids": question.get("shared_with_user_ids") or [],
+            "shared_with_user_ids": [str(item) for item in question.get("shared_with_user_ids") or []],
+            "shared_edit_user_ids": [str(item) for item in question.get("shared_edit_user_ids") or []],
             "shared_scope": question.get("shared_scope") or "PRIVATE",
         }
+        after = {"shared_with_user_ids": viewers, "shared_edit_user_ids": editors,
+                 "shared_scope": payload.shared_scope}
         updated = self.repository.update_sharing(
             question_id,
-            {
-                "shared_with_user_ids": payload.shared_with_user_ids,
-                "shared_scope": payload.shared_scope,
+            after,
+            audit={
+                "action": "question.sharing_update",
+                "entity_type": "question",
+                "entity_id": question["_id"],
+                "actor_user_id": current_user.id,
+                "actor_role": current_user.role,
+                "before": before,
+                "after": after,
+                "metadata": {"version_id": str(version["_id"])},
             },
         )
-        if updated:
-            record_audit_event(
-                action="question.sharing_update",
-                entity_type="question",
-                entity_id=question["_id"],
-                actor_user_id=current_user.id,
-                actor_role=current_user.role,
-                before=before,
-                after={
-                    "shared_with_user_ids": updated[0].get("shared_with_user_ids") or [],
-                    "shared_scope": updated[0].get("shared_scope") or "PRIVATE",
-                },
-                metadata={"version_id": str(version["_id"])},
-            )
         return serialize_question(*updated) if updated else None
+
+    def transfer_owner(self, question_id: str, payload: QuestionOwnerTransferRequest,
+                       current_user: CurrentUser) -> dict | None:
+        if current_user.role != "Admin":
+            raise PermissionError("Chỉ Admin được chuyển chủ sở hữu câu hỏi")
+        pair = self.repository.find_pair(question_id)
+        if not pair:
+            return None
+        question, version = pair
+        new_owner = object_id(payload.new_owner_user_id, "new_owner_user_id")
+        users = users_by_ids(get_database(), [new_owner], active_only=True)
+        if not users:
+            raise ValueError("Người nhận không tồn tại hoặc đã bị vô hiệu hóa")
+        if users[0].get("role") not in {"Teacher", "Admin"}:
+            raise ValueError("Chỉ chuyển câu hỏi cho giảng viên hoặc Admin")
+        previous = question.get("created_by_user_id")
+        if previous == new_owner:
+            return serialize_question(question, version)
+        fields = {
+            "created_by_user_id": new_owner,
+            "shared_with_user_ids": [item for item in question.get("shared_with_user_ids") or [] if item != new_owner],
+            "shared_edit_user_ids": [item for item in question.get("shared_edit_user_ids") or [] if item != new_owner],
+        }
+        updated = self.repository.update_sharing(question_id, fields, audit={
+            "action": "question.owner_transferred",
+            "entity_type": "question",
+            "entity_id": question["_id"],
+            "actor_user_id": current_user.id,
+            "actor_role": current_user.role,
+            "before": {"created_by_user_id": previous},
+            "after": {"created_by_user_id": new_owner},
+            "metadata": {"version_id": str(version["_id"]), "reason": payload.reason.strip()},
+        })
+        return serialize_question(*updated) if updated else None
+
+    def _submission_checks(self, question: dict, version: dict, current_user: CurrentUser | None) -> dict:
+        errors = submission_schema_errors(version)
+        if errors:
+            raise ValueError("Câu hỏi chưa hợp lệ để gửi duyệt: " + "; ".join(errors))
+        grounding = check_grounding(
+            version,
+            grounding_required=bool(question.get("grounding_required")),
+            find_chunk=lambda chunk_id: self.references.find_chunk(chunk_id),
+        )
+        flags = []
+        duplicate_of = None
+        document_id = version.get("document_id")
+        subject_id = question.get("subject_id") or ((version.get("classification") or {}).get("subject") or {}).get("id")
+        if document_id or subject_id:
+            try:
+                from modules.generation.mongodb import get_existing_question_texts
+                viewer_id = current_user.id if current_user else question.get("created_by_user_id")
+                texts = get_existing_question_texts(
+                    document_id,
+                    viewer_user_id=viewer_id,
+                    include_shared=True,
+                    shared_subject_ids=self._teaching_subject_ids(current_user) if current_user else (),
+                    exclude_question_id=question["_id"],
+                    subject_id=str(subject_id) if subject_id else None,
+                )
+                duplicate_of = duplicate_flag(version.get("content") or "", texts)
+            except Exception as exc:
+                # Duplicate detection only flags; it must not block a valid submission.
+                logger.warning("Duplicate check failed for question %s: %s", question.get("_id"), exc)
+        if duplicate_of:
+            flags.append(duplicate_of)
+        if grounding["status"] == "weak":
+            flags.append("weak_grounding")
+        if grounding["status"] == "none":
+            flags.append("ungrounded")
+        warnings = list(grounding["warnings"])
+        evidence = evidence_texts(version, lambda chunk_id: self.references.find_chunk(chunk_id))
+        for flag, message in answer_quality_issues(version, evidence):
+            flags.append(flag)
+            warnings.append(message)
+        return {"grounding": grounding, "flags": flags, "warnings": warnings}
 
     def submit_for_review(
         self,
         question_id: str,
         current_user: CurrentUser | None = None,
         notifications: list[dict] | None = None,
+        response_note: str = "",
     ) -> dict | None:
         pair = self.repository.find_pair(question_id)
         if not pair:
@@ -1227,6 +1510,15 @@ class QuestionService:
             return serialize_question(question, version)
         if review_status not in SUBMITTABLE_REVIEW_STATUSES:
             raise ValueError("Chỉ câu hỏi nháp hoặc cần sửa mới được gửi duyệt")
+        response_note = (response_note or "").strip()
+        # Any edit returns the question to DRAFT, so NEEDS_REVISION here means unchanged.
+        if review_status == "NEEDS_REVISION" and len(response_note) < MIN_RESUBMIT_NOTE_LENGTH:
+            raise ValueError(
+                "Câu hỏi chưa được sửa; cần ghi chú phản hồi Reviewer "
+                f"(ít nhất {MIN_RESUBMIT_NOTE_LENGTH} ký tự) khi gửi lại"
+            )
+        self._ensure_question_subject_approved(version, "gửi duyệt câu hỏi")
+        checks = self._submission_checks(question, version, current_user)
 
         submission = self._review_submission(
             current_user,
@@ -1234,6 +1526,10 @@ class QuestionService:
             utc_now(),
             fallback_user_id=question.get("created_by_user_id"),
         )
+        submission["checks"] = checks
+        if response_note:
+            submission["response_note"] = response_note
+            submission["resubmitted_unchanged"] = review_status == "NEEDS_REVISION"
         updated = self.repository.update_review_status(
             question_id,
             SUBMITTABLE_REVIEW_STATUSES,
@@ -1262,12 +1558,136 @@ class QuestionService:
         self,
         question_id: str,
         current_user: CurrentUser | None = None,
+        reason: str | None = None,
+        on_reviewer_displaced=None,
     ) -> bool:
+        """Archive a question; a PENDING one must be withdrawn first unless an Admin forces it.
+
+        ``on_reviewer_displaced(question, version, reviewer_user_id, reason)`` is called
+        after a forced archive took the question from a reviewer holding it.
+        """
         pair = self.repository.find_pair(question_id)
         if not pair:
             return False
+        self._ensure_write_access(pair, current_user, allow_shared_editor=False)
+        question, version = pair
+        review_status = question.get("review_status")
+        reason = (reason or "").strip()
+        now = utc_now()
+        extra_fields = None
+        holder = None
+        if review_status == "PENDING":
+            if current_user is not None and current_user.role != "Admin":
+                raise ValueError("Câu hỏi đang chờ duyệt; hãy rút lại khỏi hàng đợi trước khi lưu trữ")
+            if len(reason) < MIN_TAKEOVER_REASON_LENGTH:
+                raise ValueError(
+                    f"Cần nêu lý do (ít nhất {MIN_TAKEOVER_REASON_LENGTH} ký tự) để lưu trữ câu hỏi đang chờ duyệt"
+                )
+            holder = active_holder_id(question.get("review_assignment"), now)
+            extra_fields = {"review_assignment": released_assignment({
+                "status": "UNASSIGNED", "reviewer_user_id": None, "assigned_by_user_id": None,
+                "assigned_at": None, "claimed_at": None, "lock_expires_at": None,
+                "last_released_at": now, "release_reason": "archived",
+            }, question.get("review_assignment"))}
+        metadata = {"version_id": str(version["_id"]), "review_status": review_status}
+        if review_status == "PENDING":
+            metadata.update(forced=True, reason=reason,
+                            previous_reviewer_user_id=str(holder) if holder else None)
+        archived = self.repository.archive(
+            question_id,
+            audit={
+                "action": "question.archived",
+                "entity_type": "question",
+                "entity_id": question["_id"],
+                "actor_user_id": current_user.id if current_user else None,
+                "actor_role": current_user.role if current_user else None,
+                "before": {"lifecycle_status": question.get("lifecycle_status") or "ACTIVE"},
+                "after": {"lifecycle_status": "ARCHIVED"},
+                "metadata": metadata,
+            },
+            expected_review_status=review_status,
+            extra_fields=extra_fields,
+        )
+        if not archived:
+            if self.repository.find_pair(question_id):
+                raise RuntimeError("VERSION_CONFLICT")
+            return False
+        if holder is not None and on_reviewer_displaced is not None:
+            on_reviewer_displaced(question, version, holder, reason)
+        return True
+
+    def _ensure_owner_or_manager(self, question: dict, current_user: CurrentUser | None) -> None:
+        if current_user is None or self._can_manage_all(current_user):
+            return
+        if question.get("created_by_user_id") != current_user.id:
+            raise LookupError("Không tìm thấy câu hỏi")
+
+    def list_archived(self, page: int, page_size: int, current_user: CurrentUser) -> dict:
+        owner = None if self._can_manage_all(current_user) else current_user.id
+        pairs, total = self.repository.list_archived(page, page_size, owner)
+        return {
+            "items": [serialize_question(question, version) for question, version in pairs],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def restore(self, question_id: str, current_user: CurrentUser) -> dict | None:
+        """Undo an archive; the question returns with its review status and approved version intact."""
+        pair = self.repository.find_archived_pair(question_id)
+        if not pair:
+            return None
+        question, version = pair
+        self._ensure_owner_or_manager(question, current_user)
+        restored = self.repository.restore(question_id, audit={
+            "action": "question.restored",
+            "entity_type": "question",
+            "entity_id": question["_id"],
+            "actor_user_id": current_user.id,
+            "actor_role": current_user.role,
+            "before": {"lifecycle_status": "ARCHIVED"},
+            "after": {"lifecycle_status": "ACTIVE"},
+            "metadata": {"version_id": str(version["_id"]), "review_status": question.get("review_status")},
+        })
+        return serialize_question(*restored) if restored else None
+
+    def withdraw_submission(self, question_id: str, expected_version: int | None,
+                            current_user: CurrentUser) -> dict | None:
+        """Pull a PENDING question back to DRAFT while no reviewer has claimed it."""
+        pair = self.repository.find_pair(question_id)
+        if not pair:
+            return None
+        question, version = pair
         self._ensure_write_access(pair, current_user)
-        return self.repository.archive(question_id)
+        if question.get("review_status") != "PENDING":
+            raise ValueError("Chỉ câu hỏi đang chờ duyệt mới có thể rút lại")
+        if expected_version is not None and int(expected_version) != int(question.get("current_version") or 0):
+            raise RuntimeError("VERSION_CONFLICT")
+        now = utc_now()
+        fields = {
+            "review_status": "DRAFT",
+            "review_assignment": {
+                "status": "UNASSIGNED", "reviewer_user_id": None, "assigned_by_user_id": None,
+                "assigned_at": None, "claimed_at": None, "lock_expires_at": None,
+                "last_released_at": now, "release_reason": "withdrawn",
+            },
+            "review_submission": {},
+            "updated_at": now,
+        }
+        updated = self.repository.withdraw_submission(
+            question_id, expected_version_id=version["_id"], fields=fields,
+            audit={
+                "action": "question.submission_withdrawn",
+                "entity_type": "question",
+                "entity_id": question["_id"],
+                "actor_user_id": current_user.id,
+                "actor_role": current_user.role,
+                "before": {"review_status": "PENDING"},
+                "after": {"review_status": "DRAFT"},
+                "metadata": {"version_id": str(version["_id"])},
+            },
+        )
+        return serialize_question(*updated) if updated else None
 
 
 def _transactional(notifications: list[dict] | None) -> dict:

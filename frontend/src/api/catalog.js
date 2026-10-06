@@ -24,6 +24,18 @@ export function deactivateSubject(subjectId) {
   return apiRequest(`/catalog/subjects/${subjectId}`, { method: 'DELETE' });
 }
 
+export function approveSubject(subjectId) {
+  return apiRequest(`/catalog/subjects/${subjectId}/approve`, { method: 'POST' });
+}
+
+export function rejectSubject(subjectId, reason) {
+  return apiRequest(`/catalog/subjects/${subjectId}/reject`, { method: 'POST', body: { reason } });
+}
+
+export function resubmitSubject(subjectId) {
+  return apiRequest(`/catalog/subjects/${subjectId}/resubmit`, { method: 'POST' });
+}
+
 export function addSubjectChapter(subjectId, payload) {
   return apiRequest(`/catalog/subjects/${subjectId}/chapters`, { method: 'POST', body: payload });
 }

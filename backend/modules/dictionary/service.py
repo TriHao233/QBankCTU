@@ -13,11 +13,19 @@ def _store():
     raise ValueError("DICTIONARY_STORE must be mongo or postgres")
 
 
-def init_default_dictionary(course_id: str = "it_fundamentals") -> None:
+def dictionary_key_for_document(document: dict | None) -> str | None:
+    """Each subject owns its keyword dictionary; documents without a subject use none."""
+    subject_id = (document or {}).get("subject_id")
+    return str(subject_id) if subject_id else None
+
+
+def init_default_dictionary(course_id: str) -> None:
     _store().init_default_dictionary(course_id)
 
 
-def get_active_keywords(course_id: str = "it_fundamentals") -> list[str]:
+def get_active_keywords(course_id: str | None) -> list[str]:
+    if not course_id:
+        return []
     return _store().get_active_keywords(course_id)
 
 

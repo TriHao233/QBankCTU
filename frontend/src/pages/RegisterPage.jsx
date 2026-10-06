@@ -1,9 +1,10 @@
-import { useState, useContext } from "react";
+import { useState, useContext, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
 import { signInWithPopup, signOut } from "firebase/auth";
 import { auth, googleProvider } from "../firebase";
 import { apiRequest } from "../services/apiClient";
+import { isPublicRegistrationEnabled } from "../api/users";
 
 import {
   faArrowLeft,
@@ -29,6 +30,17 @@ function DangKy() {
   const [showPassword, setShowPassword] = useState(false);
   const [showPassword2, setShowPassword2] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [registrationEnabled, setRegistrationEnabled] = useState(null);
+
+  useEffect(() => {
+    let active = true;
+    isPublicRegistrationEnabled().then((enabled) => {
+      if (active) setRegistrationEnabled(enabled);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const [formData, setFormData] = useState({
     fullName: "",
@@ -65,7 +77,7 @@ function DangKy() {
     setLoading(true);
     try {
       if (!auth || !googleProvider) {
-        throw new Error("Firebase web app chưa khởi tạo được với project nckh-e6817. Vui lòng rebuild frontend và tải lại trang.");
+        throw new Error("Firebase web app chưa khởi tạo được với project nckh-c0ef6. Vui lòng rebuild frontend và tải lại trang.");
       }
       const result = await signInWithPopup(auth, googleProvider);
       const appUser = await login(result.user);
@@ -187,6 +199,13 @@ function DangKy() {
                 </p>
               </div>
 
+              {registrationEnabled === false && (
+                <p className="form-subtitle" role="alert">
+                  Đăng ký công khai đang tắt. Tài khoản do quản trị viên cấp; vui lòng liên hệ quản trị viên.
+                </p>
+              )}
+
+              {registrationEnabled && (<>
               {/* NÚT GOOGLE ĐÃ GẮN SỰ KIỆN */}
               <button 
                 className="btn-google" 
@@ -332,6 +351,7 @@ function DangKy() {
                   )}
                 </button>
               </form>
+              </>)}
             </div>
           </div>
         </div>

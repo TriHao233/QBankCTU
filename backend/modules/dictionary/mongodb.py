@@ -1,24 +1,24 @@
 from datetime import datetime
 
 from core.database import get_rag_db
-from modules.dictionary.constants import DEFAULT_CORE_KEYWORDS
+from modules.dictionary.constants import DICTIONARY_CATEGORY, DICTIONARY_NAME
 
 
 def _dictionaries_collection():
     return get_rag_db()["dictionaries"]
 
 
-def init_default_dictionary(course_id: str = "it_fundamentals"):
-    """Khởi tạo từ điển mặc định nếu chưa tồn tại"""
+def init_default_dictionary(course_id: str):
+    """Khởi tạo từ điển rỗng của học phần nếu chưa tồn tại"""
     collection = _dictionaries_collection()
     existing = collection.find_one({"course_id": course_id})
     if not existing:
         default_dict = {
             "course_id": course_id,
-            "name": "Từ điển Công nghệ Thông tin Căn bản",
-            "category": "tech_keywords",
+            "name": DICTIONARY_NAME,
+            "category": DICTIONARY_CATEGORY,
             "is_active": True,
-            "core_keywords": list(DEFAULT_CORE_KEYWORDS),
+            "core_keywords": [],
             "learned_keywords": [],
             "pending_keywords": [],
             "created_at": datetime.utcnow(),
@@ -27,7 +27,7 @@ def init_default_dictionary(course_id: str = "it_fundamentals"):
         collection.insert_one(default_dict)
 
 
-def get_active_keywords(course_id: str = "it_fundamentals") -> list[str]:
+def get_active_keywords(course_id: str) -> list[str]:
     """Lấy toàn bộ từ khóa active (Core + Learned) để phục vụ tính toán Density"""
     collection = _dictionaries_collection()
     # Khởi tạo nếu trống

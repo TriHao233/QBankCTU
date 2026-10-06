@@ -29,6 +29,10 @@ def create_document_record(
     return str(document["_id"])
 
 
+def find_duplicate_upload(uploaded_by_user_id, sha256: str) -> dict | None:
+    return _repository().find_duplicate_original(uploaded_by_user_id, sha256)
+
+
 def attach_original_artifact(
     document_id: str,
     *,

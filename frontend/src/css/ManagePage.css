@@ -664,6 +664,33 @@
 }
 .manage-page .btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
+.manage-page .archived-question-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.manage-page .archived-question-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  padding-bottom: 10px;
+}
+.manage-page .archived-question-list li div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.manage-page .archived-question-list li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ─── Edit modal ─────────────────────────────────────────────── */
 /* .modal-overlay dùng chung — xem css/admin-shared.css */
 .manage-page .modal-card {
@@ -1165,6 +1192,15 @@
   max-height: 260px;
   overflow: auto;
   padding: 10px;
+}
+
+.manage-page .sharing-edit-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 /* ─── Responsive ─────────────────────────────────────────────── */

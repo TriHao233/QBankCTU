@@ -47,7 +47,7 @@ def _document_page_query(document_id: str) -> dict:
         return {"document_id": document_id}
 
 
-async def run_dictionary_auto_learning(document_id: str, course_id: str = "it_fundamentals"):
+async def run_dictionary_auto_learning(document_id: str, course_id: str):
     """
     Hàm phân tích tài liệu ngầm: Trích xuất các đoạn văn đặc sắc,
     gọi AI để học từ khóa mới và đưa vào vùng chờ duyệt.
@@ -72,15 +72,15 @@ async def run_dictionary_auto_learning(document_id: str, course_id: str = "it_fu
 
     # 2. Xây dựng cấu trúc Prompt chuyên sâu ép cấu trúc JSON đầu ra
     prompt = f"""
-Bạn là một chuyên gia tối ưu hóa hệ thống thông tin và xử lý ngôn ngữ tự nhiên (NLP) cho lĩnh vực Công nghệ thông tin.
-Nhiệm vụ của bạn là đọc kỹ đoạn văn bản trích dẫn từ giáo trình dưới đây và trích xuất ra các "Thuật ngữ chuyên ngành cốt lõi" (Technical Keywords/Phrases).
+Bạn là chuyên gia xử lý ngôn ngữ tự nhiên (NLP) hỗ trợ xây dựng từ điển thuật ngữ cho một học phần.
+Nhiệm vụ của bạn là đọc kỹ đoạn văn bản trích dẫn từ giáo trình dưới đây và trích xuất ra các "Thuật ngữ chuyên ngành cốt lõi" của chính lĩnh vực mà giáo trình trình bày.
 
 Mục tiêu của các từ khóa này là giúp hệ thống RAG đo lường chính xác mật độ tri thức của văn bản.
 
 Yêu cầu trích xuất:
-1. Từ khóa phải là thuật ngữ kỹ thuật chuyên sâu (Ví dụ: "con trỏ", "mảng động", "độ phức tạp thuật toán", "bộ nhớ đệm", "bảng băm", "danh sách liên kết").
-2. Chấp nhận cả thuật ngữ tiếng Việt thông dụng và tiếng Anh chuẩn kỹ thuật.
-3. KHÔNG lấy các từ ngữ đời sống phổ thông hoặc từ nối (Ví dụ: "chương trình", "máy tính", "sử dụng", "thực hiện" -> KHÔNG LẤY).
+1. Từ khóa phải là thuật ngữ chuyên môn xuất hiện trong văn bản, không suy diễn từ kiến thức bên ngoài.
+2. Chấp nhận cả thuật ngữ tiếng Việt và thuật ngữ tiếng Anh chuẩn của lĩnh vực.
+3. KHÔNG lấy các từ ngữ đời sống phổ thông, động từ chung chung hoặc từ nối (ví dụ: "sử dụng", "thực hiện", "quan trọng").
 4. Kết quả TRẢ VỀ DUY NHẤT một JSON object có trường "keywords" là mảng chuỗi; không thêm markdown hay giải thích.
 
 VĂN BẢN GIÁO TRÌNH:
@@ -97,7 +97,7 @@ JSON KẾT QUẢ ĐÚNG FORMAT MẪU:
         llm = get_llm_service()
 
         raw_ai_text = await llm.generate_chat(
-            system_prompt="Trích xuất thuật ngữ kỹ thuật. Chỉ trả về JSON đúng schema được cung cấp.",
+            system_prompt="Trích xuất thuật ngữ chuyên môn. Chỉ trả về JSON đúng schema được cung cấp.",
             user_prompt=prompt,
             output_schema=KEYWORD_OUTPUT_SCHEMA,
         )

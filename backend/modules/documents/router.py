@@ -2,6 +2,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 
 from core.config import settings
 from core.dependencies import CurrentUser, require_bank_sharing, require_document_manager
+from modules.documents.repository import DocumentBusyError
 from modules.documents.schemas import (
     DocumentCreateRequest,
     DocumentJobActionResponse,
@@ -48,7 +49,9 @@ def create_document(
     service: DocumentService = Depends(get_document_service),
 ):
     try:
-        return service.create(payload, current_user.id)
+        return service.create(payload, current_user.id, actor=current_user)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -80,6 +83,8 @@ def get_document(
         document = service.get(document_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not document:
@@ -98,6 +103,8 @@ def list_document_jobs(
         result = service.list_jobs(document_id, current_user, limit=limit)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not result:
@@ -116,6 +123,8 @@ def list_document_pages(
         result = service.list_pages(document_id, current_user, limit=limit)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not result:
@@ -135,6 +144,8 @@ def update_document_page(
         page = service.update_page(document_id, page_id, payload, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not page:
@@ -213,6 +224,8 @@ def update_document(
         document = service.update(document_id, payload, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not document:
@@ -231,6 +244,8 @@ def update_document_sharing(
         document = service.update_sharing(document_id, payload, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not document:
@@ -248,7 +263,30 @@ def delete_document(
         deleted = service.archive(document_id, current_user)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DocumentBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+
+@router.post("/{document_id}/restore", response_model=DocumentResponse)
+def restore_document(
+    document_id: str,
+    current_user: CurrentUser = Depends(require_document_manager),
+    service: DocumentService = Depends(get_document_service),
+):
+    try:
+        document = service.restore(document_id, current_user)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not document:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu đã lưu trữ")
+    return document

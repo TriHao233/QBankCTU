@@ -17,6 +17,7 @@ from core.postgres import postgres_connection
 from db.bson_json import restore
 from db.copy_business_data import projected_rows, upsert
 from modules.documents.repository import object_id
+from modules.generation.job_outcome import CANCEL_REASON_USER
 
 ACTIVE = ("queued", "processing")
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -87,12 +88,16 @@ class PostgresGenerationStore:
 
     def create_job(self, request: dict, requested_by_user_id=None,
                    idempotency_key: str | None = None, *, model_snapshot=None,
-                   code_model_snapshot=None, fallback_model_snapshot=None) -> str:
+                   code_model_snapshot=None, fallback_model_snapshot=None,
+                   index_snapshot=None, request_hash=None, max_active=None) -> str:
+        from modules.generation.mongodb import ActiveJobLimitError
+
         now = utc_now()
         record = {
             "_id": ObjectId(), "request": request, "model_snapshot": model_snapshot,
             "code_model_snapshot": code_model_snapshot,
             "fallback_model_snapshot": fallback_model_snapshot,
+            "index_snapshot": index_snapshot, "request_hash": request_hash,
             "requested_by_user_id": requested_by_user_id,
             "idempotency_key": idempotency_key, "status": "queued",
             "attempt_count": 0, "max_attempts": settings.job_max_attempts,
@@ -102,6 +107,15 @@ class PostgresGenerationStore:
         }
         try:
             with postgres_connection() as conn:
+                if max_active is not None and requested_by_user_id is not None:
+                    owner = str(requested_by_user_id)
+                    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"generation:{owner}",))
+                    active = conn.execute(
+                        "SELECT count(*) AS n FROM generation_jobs WHERE requested_by_user_id=%s "
+                        "AND status=ANY(%s)", (owner, list(ACTIVE)),
+                    ).fetchone()["n"]
+                    if active >= max_active:
+                        raise ActiveJobLimitError()
                 _save(conn, record)
         except errors.UniqueViolation:
             existing = self.get_by_idempotency(requested_by_user_id, idempotency_key)
@@ -138,6 +152,13 @@ class PostgresGenerationStore:
                 "SELECT count(*) AS n FROM generation_jobs WHERE requested_by_user_id=%s "
                 "AND status=ANY(%s)", (str(requested_by_user_id), list(ACTIVE)),
             ).fetchone()["n"]
+
+    def active_job_ids(self, requested_by_user_id) -> list[str]:
+        with postgres_connection() as conn:
+            return [row["id"] for row in conn.execute(
+                "SELECT id FROM generation_jobs WHERE requested_by_user_id=%s AND status=ANY(%s) ORDER BY id",
+                (str(requested_by_user_id), list(ACTIVE)),
+            ).fetchall()]
 
     def _locked(self, conn, key: str) -> dict | None:
         return _record(conn.execute(
@@ -184,7 +205,8 @@ class PostgresGenerationStore:
 
     def cancel(self, job_id, *, requested_by_user_id=None,
                message: str = "Đã dừng theo yêu cầu của người dùng",
-               stage: str = "cancelled") -> dict | None:
+               stage: str = "cancelled", reason: str | None = CANCEL_REASON_USER) -> dict | None:
+        """Stop an active job; ``reason=None`` records a plain failure instead of CANCELLED."""
         key = _key(job_id)
         if key is None:
             return None
@@ -198,6 +220,8 @@ class PostgresGenerationStore:
             record.update(status="failed", error_message=message, updated_at=now,
                           expires_at=now + timedelta(days=settings.job_retention_days),
                           progress={"stage": stage, "completed": 0, "total": 1})
+            if reason:
+                record.update(cancelled_at=now, cancel_reason=reason)
             _release(record)
             _save(conn, record)
             return _public(record)
@@ -288,6 +312,55 @@ class PostgresGenerationStore:
                 record["metrics"] = metrics
             _save(conn, record)
         return status
+
+    def requeue_orphaned(self, message: str) -> dict:
+        """Requeue processing jobs whose lease expired; dead-letter those out of attempts."""
+        with postgres_connection() as conn:
+            ids = [row["id"] for row in conn.execute(
+                """SELECT id FROM generation_jobs WHERE status='processing'
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()) ORDER BY id"""
+            ).fetchall()]
+        result = {"requeued": 0, "dead_lettered": 0}
+        for key in ids:
+            with postgres_connection() as conn:
+                record = self._locked(conn, key)
+                now = utc_now()
+                if (not record or record["status"] != "processing"
+                        or (record.get("lease_expires_at") is not None and record["lease_expires_at"] > now)):
+                    continue
+                _release(record)
+                attempts = int(record.get("attempt_count") or 0)
+                max_attempts = int(record.get("max_attempts") or settings.job_max_attempts)
+                if attempts >= max_attempts:
+                    record.update(status="failed", error_message=message, updated_at=now,
+                                  dead_lettered_at=now,
+                                  expires_at=now + timedelta(days=settings.job_retention_days),
+                                  progress={"stage": "failed", "completed": 0, "total": 1})
+                    result["dead_lettered"] += 1
+                else:
+                    record.update(status="queued", error_message=message, updated_at=now,
+                                  last_failed_at=now, next_attempt_at=now,
+                                  progress={"stage": "retry_wait", "completed": 0, "total": 1})
+                    result["requeued"] += 1
+                _save(conn, record)
+        return result
+
+    def requeue_for_shutdown(self, job_id, worker_id: str, message: str) -> bool:
+        """Return a job interrupted by worker shutdown to the queue without spending an attempt."""
+        key = _key(job_id)
+        if key is None:
+            return False
+        with postgres_connection() as conn:
+            record = self._locked(conn, key)
+            if not record or record["status"] != "processing" or record.get("locked_by") != worker_id:
+                return False
+            now = utc_now()
+            _release(record)
+            record.update(status="queued", error_message=message, updated_at=now, next_attempt_at=now,
+                          attempt_count=max(0, int(record.get("attempt_count") or 0) - 1),
+                          progress={"stage": "retry_wait", "completed": 0, "total": 1})
+            _save(conn, record)
+            return True
 
     def fail_active(self, message: str, *, updated_before=None) -> int:
         """Đánh failed các job còn queued/processing (khởi động worker hoặc recovery)."""
@@ -389,6 +462,16 @@ class PostgresGenerationStore:
             record["updated_at"] = fields.get("finished_at") or utc_now()
             for table, projected in projected_rows("generation_runs", record):
                 upsert(conn, table, projected)
+
+    def completed_runs(self, generation_job_id) -> list[dict]:
+        with postgres_connection() as conn:
+            rows = conn.execute(
+                """SELECT result FROM generation_runs
+                   WHERE generation_job_id=%s AND status='COMPLETED'
+                   ORDER BY created_at, id""",
+                (str(object_id(generation_job_id, "generation_job_id")),),
+            ).fetchall()
+        return [_shallow(row["result"]) for row in rows]
 
     def recent_runs(self, since, limit: int = 1000) -> list[dict]:
         with postgres_connection() as conn:

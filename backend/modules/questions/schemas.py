@@ -47,9 +47,20 @@ class QuestionUpdateRequest(BaseModel):
     change_note: str = Field("Question edited", min_length=1, max_length=500)
 
 
+class QuestionSubmitRequest(BaseModel):
+    response_note: str = Field("", max_length=2000)
+
+
 class QuestionSharingRequest(BaseModel):
     shared_with_user_ids: list[str] = Field(default_factory=list, max_length=100)
+    # Edit-level sharing: may change content and create versions, never archive or reshare.
+    shared_edit_user_ids: list[str] = Field(default_factory=list, max_length=100)
     shared_scope: str = Field("PRIVATE", pattern="^(PRIVATE|SUBJECT)$")
+
+
+class QuestionOwnerTransferRequest(BaseModel):
+    new_owner_user_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=5, max_length=1000)
 
 
 class QuestionResponse(BaseModel):
@@ -78,6 +89,7 @@ class QuestionResponse(BaseModel):
     quality_summary: dict[str, Any]
     review_assignment: dict[str, Any] = Field(default_factory=dict)
     shared_with_user_ids: list[str] = Field(default_factory=list)
+    shared_edit_user_ids: list[str] = Field(default_factory=list)
     shared_scope: str = "PRIVATE"
     secondary_review: dict[str, Any] = Field(default_factory=dict)
     latest_review_id: str | None

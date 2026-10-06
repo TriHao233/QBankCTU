@@ -19,11 +19,12 @@ export const BLOOM_LEVELS = [
 
 // Ma trận tương thích đã được chốt theo loại câu hỏi của dự án.
 // Các giá trị là UI id để giao diện có thể khóa ngay trước khi tạo request.
+// Phải đồng bộ với QUESTION_TYPE_BLOOM_LEVELS trong backend/modules/generation/schemas.py.
 export const QUESTION_TYPE_BLOOM_MATRIX = Object.freeze({
-  mcq: Object.freeze(['remember', 'understand', 'apply', 'analyze']),
-  multi: Object.freeze(['remember', 'understand', 'apply', 'analyze']),
-  tf: Object.freeze(['remember', 'understand']),
-  fill: Object.freeze(['remember', 'understand']),
+  mcq: Object.freeze(['remember', 'understand', 'apply', 'analyze', 'evaluate']),
+  multi: Object.freeze(['remember', 'understand', 'apply', 'analyze', 'evaluate']),
+  tf: Object.freeze(['remember', 'understand', 'apply']),
+  fill: Object.freeze(['remember', 'understand', 'apply']),
   match: Object.freeze(['remember', 'understand']),
   order: Object.freeze(['remember', 'understand', 'apply']),
   scenario: Object.freeze(['apply', 'analyze', 'evaluate', 'create']),

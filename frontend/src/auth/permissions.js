@@ -126,10 +126,15 @@ export function rolesForPath(pathname) {
   return entry?.[1] || null;
 }
 
+// A synced profile carries the backend's effective permissions (defaults minus revokes plus grants),
+// so it replaces the role defaults instead of being added to them.
 export function permissionsForUser(userOrRole) {
   const role = typeof userOrRole === "string" ? userOrRole : userOrRole?.role;
-  const explicit = typeof userOrRole === "string" ? [] : (userOrRole?.permissions || []);
-  return Array.from(new Set([...(ROLE_DEFAULT_PERMISSIONS[role] || []), ...explicit]));
+  if (role === "Admin") return [...ROLE_DEFAULT_PERMISSIONS.Admin];
+  if (typeof userOrRole !== "string" && Array.isArray(userOrRole?.permissions)) {
+    return Array.from(new Set(userOrRole.permissions));
+  }
+  return [...(ROLE_DEFAULT_PERMISSIONS[role] || [])];
 }
 
 export function permissionsForPath(pathname) {
@@ -143,9 +148,13 @@ export function canAccessPath(userOrRole, pathname) {
   const roles = rolesForPath(pathname);
   if (!roles) return true;
   const role = typeof userOrRole === "string" ? userOrRole : userOrRole?.role;
-  if (roles.includes(role)) return true;
   const requiredPermissions = permissionsForPath(pathname);
-  if (!requiredPermissions?.length) return false;
+  if (roles.includes(role)) {
+    // A matching role is not enough once the permission behind the page has been revoked.
+    if (role === "Admin" || typeof userOrRole === "string" || !requiredPermissions?.length) return true;
+  } else if (!requiredPermissions?.length) {
+    return false;
+  }
   const permissions = permissionsForUser(userOrRole);
   return requiredPermissions.every((permission) => permissions.includes(permission));
 }

@@ -29,7 +29,7 @@ class DoclingIntegrationTests(unittest.TestCase):
         with self.path.open('wb') as stream:
             writer.write(stream)
 
-    def parse(self, engine, kinds, failure=False):
+    def parse(self, kinds, failure=False, blank_ocr=False):
         self.fixture(kinds)
         selected = []
 
@@ -44,44 +44,41 @@ class DoclingIntegrationTests(unittest.TestCase):
             selected.extend(pages)
             if failure:
                 raise ConnectionError('simulated unavailable Docling')
-            return {number: {'text': self.prose, 'structured_blocks': [], 'formula_blocks': []} for number in pages}
+            text = '' if blank_ocr else self.prose
+            return {number: {'text': text, 'structured_blocks': [], 'formula_blocks': []} for number in pages}
 
-        with patch.object(pdf, 'settings', SimpleNamespace(pdf_ocr_engine=engine)), patch.object(pdf, '_candidate_texts', candidates), patch.object(pdf, '_text_is_usable', lambda quality: quality.get('test_usable', bool(quality.get('word_count')))), patch.object(pdf, '_has_table_signature', lambda text: 'TABLE' in text), patch.object(pdf, '_image_objects', lambda resources: []):
+        with patch.object(pdf, '_candidate_texts', candidates), patch.object(pdf, '_text_is_usable', lambda quality: quality.get('test_usable', bool(quality.get('word_count')))), patch.object(pdf, '_has_table_signature', lambda text: 'TABLE' in text), patch.object(pdf, '_image_objects', lambda resources: []):
             parsed = pdf.PdfParser(ocr_page_extractor=extract).parse(self.path, self.context)
         self.assertEqual([unit.page_number for unit in parsed.units], list(range(1, len(kinds) + 1)))
         return selected, parsed
 
-    def test_native_text_does_not_call_either_engine(self):
-        for engine in ('easyocr', 'docling'):
-            selected, _ = self.parse(engine, ['plain', 'plain'])
-            self.assertEqual(selected, [])
+    def test_native_text_does_not_call_docling(self):
+        selected, _ = self.parse(['plain', 'plain'])
+        self.assertEqual(selected, [])
 
     def test_docling_processes_scan_and_layout_only(self):
-        selected, parsed = self.parse('docling', ['plain', 'scan', 'table'])
+        selected, parsed = self.parse(['plain', 'scan', 'table'])
         self.assertEqual(selected, [2, 3])
         self.assertEqual(parsed.stats['docling_page_count'], 2)
         self.assertEqual(parsed.stats['layout_page_count'], 1)
         self.assertIn('docling', parsed.units[1].raw_extraction)
 
-    def test_existing_easyocr_routing_is_preserved(self):
-        selected, parsed = self.parse('easyocr', ['plain', 'scan', 'table'])
-        self.assertEqual(selected, [2])
-        self.assertEqual(parsed.stats['easyocr_page_count'], 1)
-
     def test_docling_failure_retains_native_text_but_rejects_scan(self):
-        _, parsed = self.parse('docling', ['plain', 'table', 'scan'], failure=True)
+        _, parsed = self.parse(['plain', 'table', 'scan'], failure=True)
         self.assertEqual(parsed.units[1].quality['status'], 'passed_with_warning')
         self.assertEqual(parsed.units[2].quality['status'], 'quality_failed')
         self.assertEqual(parsed.units[1].raw_text, self.prose + ' TABLE')
 
-    def test_default_adapter_does_not_fallback_on_docling_failure(self):
-        with patch.object(pdf, 'settings', SimpleNamespace(pdf_ocr_engine='docling')), patch.object(docling_engine, 'ocr_pdf_pages', side_effect=ConnectionError('offline')):
-            with self.assertRaises(ConnectionError):
-                pdf._default_ocr_page_extractor(self.path, [1], self.context)
+    def test_scan_page_with_no_ocr_text_is_blank_and_retrieval_excluded(self):
+        _, parsed = self.parse(['plain', 'scan'], blank_ocr=True)
+        quality = parsed.units[1].quality
+        self.assertEqual(quality['status'], 'passed_with_warning')
+        self.assertTrue(quality['retrieval_excluded'])
+        self.assertTrue(quality['blank_page'])
 
-    def test_invalid_engine_is_rejected(self):
-        with patch.object(pdf, 'settings', SimpleNamespace(pdf_ocr_engine='invalid')):
-            with self.assertRaisesRegex(ValueError, 'PDF_OCR_ENGINE'):
+    def test_default_adapter_does_not_fallback_on_docling_failure(self):
+        with patch.object(docling_engine, 'ocr_pdf_pages', side_effect=ConnectionError('offline')):
+            with self.assertRaises(ConnectionError):
                 pdf._default_ocr_page_extractor(self.path, [1], self.context)
 
     def test_docling_subset_maps_source_pages_and_blocks(self):

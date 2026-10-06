@@ -65,11 +65,20 @@ def text_quality_score(value: str) -> float:
     return round(max(0.0, min(score, 1.0)), 6)
 
 
-def validate_parsed_document(document: ParsedDocument) -> QualityReport:
+def validate_parsed_document(document: ParsedDocument, *, min_text_unit_ratio: float = 0.0) -> QualityReport:
     errors: list[str] = []
     warnings: list[str] = []
     block_count = 0
+    text_units = 0
+    blank_units: list[int] = []
     for unit in document.units:
+        if unit.quality.get("retrieval_excluded"):
+            blank_units.append(unit.unit_number)
+        elif any(
+            block.content.strip() and block.block_type not in {"image", "diagram", "page_break"}
+            for block in unit.content_blocks
+        ):
+            text_units += 1
         if unit.quality.get("status") == "quality_failed":
             errors.append(
                 f"unit {unit.unit_number}: {unit.quality.get('reason') or 'extraction quality failed'}"
@@ -134,10 +143,26 @@ def validate_parsed_document(document: ParsedDocument) -> QualityReport:
         errors.append("document has no units")
     if not block_count:
         errors.append("document has no content blocks")
+    if blank_units:
+        warnings.append(
+            f"{len(blank_units)} trang trống/không trích xuất được văn bản bị loại khỏi truy xuất: "
+            + ", ".join(str(number) for number in blank_units[:20])
+            + (" …" if len(blank_units) > 20 else "")
+        )
+    text_unit_ratio = round(text_units / len(document.units), 4) if document.units else 0.0
+    if document.units and min_text_unit_ratio > 0 and text_unit_ratio < min_text_unit_ratio:
+        errors.insert(
+            0,
+            f"Chỉ {text_units}/{len(document.units)} trang/đơn vị ({text_unit_ratio:.0%}) trích xuất được văn bản; "
+            f"yêu cầu tối thiểu {min_text_unit_ratio:.0%}"
+        )
     metrics = {
         "units": len(document.units),
         "blocks": block_count,
         "assets": len(document.assets),
+        "text_units": text_units,
+        "text_unit_ratio": text_unit_ratio,
+        "retrieval_excluded_units": blank_units,
     }
     status = "quality_failed" if errors else "needs_review" if warnings else "passed"
     return QualityReport(status, errors, warnings, metrics)

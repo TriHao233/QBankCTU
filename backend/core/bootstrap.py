@@ -596,6 +596,7 @@ def _ensure_indexes() -> None:
             [
                 IndexModel([("document_id", ASCENDING), ("created_at", DESCENDING)], name="ix_generation_document"),
                 IndexModel([("requested_by_user_id", ASCENDING), ("created_at", DESCENDING)], name="ix_generation_requester"),
+                IndexModel([("generation_job_id", ASCENDING), ("status", ASCENDING)], name="ix_generation_job_status"),
             ]
         )
     if mongo_owns("questions"):

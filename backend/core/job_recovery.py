@@ -37,7 +37,7 @@ def recover_stale_jobs(timeout_minutes: int | None = None) -> dict:
         f"{timeout} minute recovery timeout"
     )
     results = {
-        "generation_failed": _recover_generation_jobs(db, cutoff, now, message),
+        "generation_requeued": _recover_generation_jobs(db, cutoff, now, message),
         "evaluation_stale": (
             _recover_postgres_evaluation_jobs(cutoff, message)
             if settings.question_store == "postgres"
@@ -66,50 +66,69 @@ def _recover_postgres_evaluation_jobs(cutoff: datetime, message: str) -> int:
 
 
 def _recover_generation_jobs(db, cutoff: datetime, now: datetime, message: str) -> int:
+    """Queued jobs are left for the worker; only processing jobs whose lease expired are requeued."""
     if settings.generation_store == "postgres":
         from modules.generation.postgres_store import PostgresGenerationStore
-        return PostgresGenerationStore().fail_active(message, updated_before=cutoff)
-    result = db.generation_jobs.update_many(
-        {
-            "status": {"$in": ["queued", "processing"]},
-            **_stale_time_filter(cutoff),
-        },
-        {
-            "$set": {
-                "status": "failed",
-                "error_message": message,
-                "updated_at": now,
-            }
-        },
-    )
-    return result.modified_count
+        result = PostgresGenerationStore().requeue_orphaned(WORKER_RESTART_MESSAGE)
+    else:
+        result = _requeue_orphaned_mongo_generation_jobs(db, now)
+    return result["requeued"] + result["dead_lettered"]
 
 
-def cancel_unfinished_generation_jobs_on_worker_start() -> int:
-    """Never resume generation left by a previous worker process."""
+WORKER_RESTART_MESSAGE = "Worker đã khởi động lại; job được xếp hàng chạy lại"
+
+
+def requeue_orphaned_generation_jobs_on_worker_start() -> dict:
+    """Return generation jobs abandoned by a stopped worker to the queue.
+
+    Queued jobs and jobs still holding a live lease (another worker) are left alone.
+    Abandoned jobs that already used every attempt are dead-lettered.
+    """
     if settings.generation_store == "postgres":
         from modules.generation.postgres_store import PostgresGenerationStore
-        changed = PostgresGenerationStore().fail_active("Job đã bị dừng khi worker khởi động lại")
-        if changed:
-            logger.warning("Cancelled %s unfinished generation jobs from previous worker", changed)
-        return changed
-    now = utc_now()
-    result = get_database().generation_jobs.update_many(
-        {"status": {"$in": ["queued", "processing"]}},
-        {
-            "$set": {
+        result = PostgresGenerationStore().requeue_orphaned(WORKER_RESTART_MESSAGE)
+    else:
+        result = _requeue_orphaned_mongo_generation_jobs(get_database(), utc_now())
+    if result["requeued"] or result["dead_lettered"]:
+        logger.warning("Recovered generation jobs from a previous worker: %s", result)
+    return result
+
+
+def _requeue_orphaned_mongo_generation_jobs(db, now: datetime) -> dict:
+    orphaned = {
+        "status": "processing",
+        "$or": [{"lease_expires_at": {"$lte": now}}, {"lease_expires_at": None}],
+    }
+    result = {"requeued": 0, "dead_lettered": 0}
+    for job in list(db.generation_jobs.find(orphaned, {"attempt_count": 1, "max_attempts": 1})):
+        attempts = int(job.get("attempt_count") or 0)
+        max_attempts = int(job.get("max_attempts") or settings.job_max_attempts)
+        if attempts >= max_attempts:
+            fields = {
                 "status": "failed",
-                "error_message": "Job đã bị dừng khi worker khởi động lại",
-                "updated_at": now,
+                "error_message": WORKER_RESTART_MESSAGE,
+                "dead_lettered_at": now,
                 "expires_at": now + timedelta(days=settings.job_retention_days),
-                "progress": {"stage": "cancelled", "completed": 0, "total": 1},
-            },
-            "$unset": {"locked_by": "", "lease_expires_at": "", "heartbeat_at": "", "next_attempt_at": ""},
-        },
-    )
-    if result.modified_count:
-        logger.warning("Cancelled %s unfinished generation jobs from previous worker", result.modified_count)
-    return result.modified_count
+                "updated_at": now,
+                "progress": {"stage": "failed", "completed": 0, "total": 1},
+            }
+            outcome = "dead_lettered"
+        else:
+            fields = {
+                "status": "queued",
+                "error_message": WORKER_RESTART_MESSAGE,
+                "last_failed_at": now,
+                "next_attempt_at": now,
+                "updated_at": now,
+                "progress": {"stage": "retry_wait", "completed": 0, "total": 1},
+            }
+            outcome = "requeued"
+        updated = db.generation_jobs.update_one(
+            {"_id": job["_id"], **orphaned},
+            {"$set": fields, "$unset": {"locked_by": "", "lease_expires_at": "", "heartbeat_at": ""}},
+        )
+        result[outcome] += updated.modified_count
+    return result
 
 
 def _recover_evaluation_jobs(db, cutoff: datetime, now: datetime, message: str) -> int:
@@ -174,22 +193,27 @@ def _recover_document_jobs(db, cutoff: datetime, now: datetime, message: str) ->
             },
         )
         job_type = str(job.get("job_type") or "UNKNOWN").lower()
-        db.documents.update_one(
-            {"_id": job.get("document_id"), "archived_at": None},
-            {
-                "$set": {
-                    "status": "FAILED",
-                    f"pipeline_summary.{job_type}_status": "FAILED",
-                    "latest_error": {
-                        "job_id": job["_id"],
-                        "job_type": job.get("job_type"),
-                        "message": message,
-                        "at": now,
-                    },
-                    "updated_at": now,
-                }
+        document_fields = {
+            "status": "FAILED",
+            f"pipeline_summary.{job_type}_status": "FAILED",
+            f"pipeline_attempts.{job_type}.status": "FAILED",
+            "latest_error": {
+                "job_id": job["_id"],
+                "job_type": job.get("job_type"),
+                "message": message,
+                "at": now,
             },
-        )
+            "updated_at": now,
+        }
+        if job.get("preserves_active_pipeline"):
+            # A failed re-index must not take down the index that is still serving generation.
+            previous = job.get("previous_document_state") or {}
+            document_fields["status"] = previous.get("status") or "READY"
+            if previous.get("pipeline_status"):
+                document_fields[f"pipeline_summary.{job_type}_status"] = previous["pipeline_status"]
+            else:
+                document_fields.pop(f"pipeline_summary.{job_type}_status")
+        db.documents.update_one({"_id": job.get("document_id"), "archived_at": None}, {"$set": document_fields})
         if job.get("job_type") == "CHUNK":
             chunk_sets = list(
                 db.chunk_sets.find(

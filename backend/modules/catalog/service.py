@@ -42,10 +42,18 @@ from modules.generation.prompt_builder import PromptBuilder
 from modules.questions.repository import json_safe, object_id
 from modules.catalog.postgres_ai_repository import PostgresAiRepository
 from modules.catalog.postgres_subject_repository import PostgresSubjectRepository, SubjectCodeConflict
+from modules.catalog.subject_approval import (
+    SUBJECT_APPROVED,
+    SUBJECT_PENDING_APPROVAL,
+    SUBJECT_REJECTED,
+    subject_approval_status,
+    subject_usable_by,
+)
 
 logger = logging.getLogger(__name__)
 
-SUBJECT_AUDIT_FIELDS = ("subject_code", "subject_name", "description", "is_active")
+SUBJECT_AUDIT_FIELDS = ("subject_code", "subject_name", "description", "is_active", "approval_status",
+                        "approval_reason")
 CHAPTER_AUDIT_FIELDS = ("chapter_code", "chapter_name", "sequence_no", "is_active")
 CLO_AUDIT_FIELDS = ("clo_code", "description", "target_weight", "is_active")
 MODEL_AUDIT_FIELDS = (
@@ -157,8 +165,16 @@ def _subject_response(
             "owner_id": record.get("owner_id"),
             "owner_email": record.get("owner_email", ""),
             "can_manage": _can_manage_subject(record, viewer),
+            "approval_status": subject_approval_status(record),
+            "approval_reason": record.get("approval_reason") or "",
+            "approval_reviewed_at": record.get("approval_reviewed_at"),
+            "approval_reviewed_by_user_id": record.get("approval_reviewed_by_user_id"),
         }
     )
+
+
+def _subject_visible_to(record: dict, viewer: Any) -> bool:
+    return subject_usable_by(record, getattr(viewer, "id", None), is_admin=_is_catalog_admin(viewer))
 
 
 class CatalogService:
@@ -242,8 +258,8 @@ class CatalogService:
             from modules.exams.postgres_repository import PostgresExamRepository
             return PostgresExamRepository.count(subject_id=subject_id, chapter_id=chapter_id)
         if subject_id is not None:
-            return self._count("exams", {"subject_id": subject_id})
-        return self._count("exams", {"matrix.chapter_id": chapter_id})
+            return self._count("exams", {"subject_id": subject_id, "deleted_at": None})
+        return self._count("exams", {"matrix.chapter_id": chapter_id, "deleted_at": None})
 
     def _count_current_questions(self, version_query: dict) -> int:
         versions = getattr(self.db, "question_versions", None)
@@ -305,6 +321,8 @@ class CatalogService:
 
     @staticmethod
     def _ensure_can_manage(subject: dict, viewer: Any) -> None:
+        if not _subject_visible_to(subject, viewer):
+            raise LookupError("Không tìm thấy học phần")
         if not _can_manage_subject(subject, viewer):
             raise PermissionError("Bạn chỉ có thể chỉnh sửa học phần do mình tạo")
 
@@ -353,11 +371,13 @@ class CatalogService:
         return [
             _subject_response(record, self._usage_counts(record), viewer)
             for record in records
+            if _subject_visible_to(record, viewer)
         ]
 
     def create_subject(self, payload: SubjectPayload, viewer: Any = None) -> dict:
         now = utc_now()
         subject_code = self._ensure_subject_code_available(payload.subject_code)
+        approved = _is_catalog_admin(viewer)
         record = {
             "_id": ObjectId(),
             "schema_version": SCHEMA_VERSION,
@@ -371,6 +391,11 @@ class CatalogService:
             "updated_at": now,
             "owner_id": getattr(viewer, "id", None),
             "owner_email": getattr(viewer, "email", "") or "",
+            # Teacher-created subjects stay private to their owner until an admin approves them.
+            "approval_status": SUBJECT_APPROVED if approved else SUBJECT_PENDING_APPROVAL,
+            "approval_reason": "",
+            "approval_reviewed_at": now if approved else None,
+            "approval_reviewed_by_user_id": getattr(viewer, "id", None) if approved else None,
         }
         if self.subject_repo:
             record = self.subject_repo.create(record, viewer)
@@ -381,7 +406,103 @@ class CatalogService:
                 raise CatalogConflictError("Mã môn học đã tồn tại") from exc
             self._audit("catalog.subject_create", "subject", record, viewer, SUBJECT_AUDIT_FIELDS,
                         label=record["subject_code"])
+        if not approved:
+            self._notify_admins_subject_pending(record, viewer)
         return _subject_response(record, self._usage_counts(record), viewer)
+
+    def _set_subject_approval(self, subject: dict, fields: dict, viewer: Any, *, action: str,
+                              expected_status: str) -> dict:
+        if self.subject_repo:
+            return self.subject_repo.update(subject["_id"], fields, viewer, action=action,
+                                            expected_approval_status=expected_status)
+        previous = _audit_snapshot(subject, SUBJECT_AUDIT_FIELDS)
+        status_filter = (
+            {"$in": [None, SUBJECT_APPROVED]} if expected_status == SUBJECT_APPROVED else expected_status
+        )
+        record = self.db.subjects.find_one_and_update(
+            {"_id": subject["_id"], "approval_status": status_filter},
+            {"$set": {**fields, "updated_at": utc_now()}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if record is None:
+            raise ValueError("Trạng thái duyệt của học phần vừa thay đổi, hãy tải lại")
+        self._audit(action, "subject", record, viewer, SUBJECT_AUDIT_FIELDS, before=previous,
+                    label=record["subject_code"])
+        return record
+
+    def approve_subject(self, subject_id: str, viewer: Any) -> dict:
+        if not _is_catalog_admin(viewer):
+            raise PermissionError("Chỉ quản trị viên được duyệt học phần")
+        subject = self._subject_or_404(subject_id)
+        if subject_approval_status(subject) != SUBJECT_PENDING_APPROVAL:
+            raise ValueError("Học phần không ở trạng thái chờ duyệt")
+        record = self._set_subject_approval(subject, {
+            "approval_status": SUBJECT_APPROVED, "approval_reason": "",
+            "approval_reviewed_at": utc_now(), "approval_reviewed_by_user_id": getattr(viewer, "id", None),
+        }, viewer, action="catalog.subject_approve", expected_status=SUBJECT_PENDING_APPROVAL)
+        self._notify_subject_owner(record, viewer, approved=True)
+        return _subject_response(record, self._usage_counts(record), viewer)
+
+    def reject_subject(self, subject_id: str, reason: str, viewer: Any) -> dict:
+        if not _is_catalog_admin(viewer):
+            raise PermissionError("Chỉ quản trị viên được từ chối học phần")
+        subject = self._subject_or_404(subject_id)
+        if subject_approval_status(subject) != SUBJECT_PENDING_APPROVAL:
+            raise ValueError("Học phần không ở trạng thái chờ duyệt")
+        record = self._set_subject_approval(subject, {
+            "approval_status": SUBJECT_REJECTED, "approval_reason": reason,
+            "approval_reviewed_at": utc_now(), "approval_reviewed_by_user_id": getattr(viewer, "id", None),
+        }, viewer, action="catalog.subject_reject", expected_status=SUBJECT_PENDING_APPROVAL)
+        self._notify_subject_owner(record, viewer, approved=False)
+        return _subject_response(record, self._usage_counts(record), viewer)
+
+    def resubmit_subject(self, subject_id: str, viewer: Any) -> dict:
+        subject = self._subject_or_404(subject_id)
+        self._ensure_can_manage(subject, viewer)
+        if subject_approval_status(subject) != SUBJECT_REJECTED:
+            raise ValueError("Chỉ gửi duyệt lại được học phần đã bị từ chối")
+        record = self._set_subject_approval(subject, {
+            "approval_status": SUBJECT_PENDING_APPROVAL,
+            "approval_reviewed_at": None, "approval_reviewed_by_user_id": None,
+        }, viewer, action="catalog.subject_resubmit", expected_status=SUBJECT_REJECTED)
+        self._notify_admins_subject_pending(record, viewer)
+        return _subject_response(record, self._usage_counts(record), viewer)
+
+    def _notify_admins_subject_pending(self, record: dict, viewer: Any) -> None:
+        try:
+            from modules.notifications.service import NotificationService
+            from modules.users.store import active_admin_ids
+            NotificationService(self.db).create_many([{
+                "recipient_user_id": admin_id, "actor_user_id": getattr(viewer, "id", None),
+                "type": "SUBJECT_APPROVAL_REQUESTED",
+                "title": f"Học phần {record['subject_code']} chờ duyệt",
+                "body": f"{getattr(viewer, 'email', '') or 'Giảng viên'} đề nghị thêm học phần "
+                        f"{record['subject_name']} vào danh mục chung.",
+                "link": "/danh-muc",
+                "entity": {"type": "subject", "id": str(record["_id"])},
+            } for admin_id in active_admin_ids(self.db)])
+        except Exception as exc:
+            logger.warning("Failed to notify admins about pending subject: %s", exc)
+
+    def _notify_subject_owner(self, record: dict, viewer: Any, *, approved: bool) -> None:
+        owner_id = record.get("owner_id")
+        if owner_id is None or str(owner_id) == str(getattr(viewer, "id", None)):
+            return
+        try:
+            from modules.notifications.service import NotificationService
+            reason = record.get("approval_reason") or ""
+            NotificationService(self.db).create(
+                recipient_user_id=owner_id, actor_user_id=getattr(viewer, "id", None),
+                type="SUBJECT_APPROVED" if approved else "SUBJECT_REJECTED",
+                title=(f"Học phần {record['subject_code']} đã được duyệt" if approved
+                       else f"Học phần {record['subject_code']} bị từ chối"),
+                body=("Học phần đã vào danh mục chung." if approved
+                      else f"Lý do: {reason}. Bạn có thể sửa rồi gửi duyệt lại."),
+                link="/quan-ly-hoc-phan",
+                entity={"type": "subject", "id": str(record["_id"])},
+            )
+        except Exception as exc:
+            logger.warning("Failed to notify subject owner: %s", exc)
 
     def deactivate_subject(self, subject_id: str, viewer: Any = None) -> dict:
         """Xoá mềm học phần: giữ nguyên dữ liệu lịch sử, chỉ ẩn khỏi danh sách chọn."""

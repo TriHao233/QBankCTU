@@ -36,6 +36,8 @@
 .exam-list-page .status--draft { background: #EAF4FF; color: var(--primary, #0c78d4); }
 .exam-list-page .status--ready { background: #FFF4E0; color: #B36500; }
 .exam-list-page .status--finalized { background: #E8FFF0; color: #16A34A; }
+.exam-list-page .status--published { background: #EEE8FF; color: #6D28D9; }
+.exam-list-page .sharing-user-list { display: grid; gap: 6px; max-height: 240px; overflow-y: auto; }
 .exam-list-page .status--archived { background: #F3F6FA; color: #5c6f89; }
 .exam-list-page .icon-btn {
   width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border-radius: 8px;

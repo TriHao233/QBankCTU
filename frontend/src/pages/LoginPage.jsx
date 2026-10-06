@@ -11,6 +11,7 @@ import {
 } from "firebase/auth";
 import { auth, googleProvider } from "../firebase";
 import { apiRequest } from "../services/apiClient";
+import { isPublicRegistrationEnabled } from "../api/users";
 import { landingPathForRole } from "../auth/permissions";
 import {
   demoUsernameFor,
@@ -28,7 +29,7 @@ const POPUP_FALLBACK_CODES = new Set([
 
 function googleLoginErrorMessage(error) {
   if (error?.code === "auth/not-configured") {
-    return "Firebase web app chưa khởi tạo được với project nckh-e6817. Vui lòng rebuild frontend và tải lại trang.";
+    return "Firebase web app chưa khởi tạo được với project nckh-c0ef6. Vui lòng rebuild frontend và tải lại trang.";
   }
   if (error?.code === "auth/unauthorized-domain") {
     return "Miền hiện tại chưa được Firebase cho phép. Hãy mở ứng dụng bằng localhost hoặc thêm domain này vào Firebase Authorized domains.";
@@ -46,6 +47,17 @@ function LoginPage() {
   const [authNotice, setAuthNotice] = useState(null);
   const notice = authNotice || (sessionNotice ? { type: 'info', message: sessionNotice } : null);
   const redirectChecked = useRef(false);
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    isPublicRegistrationEnabled().then((enabled) => {
+      if (active) setRegistrationEnabled(enabled);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const [formData, setFormData] = useState({
     email: "",
@@ -245,10 +257,16 @@ function LoginPage() {
               <div className="form-header">
                 <h1 className="form-title">Đăng nhập</h1>
                 <p className="form-subtitle">
-                  Chưa có tài khoản?{" "}
-                  <Link to="/dang-ky" className="form-link">
-                    Đăng ký ngay
-                  </Link>
+                  {registrationEnabled ? (
+                    <>
+                      Chưa có tài khoản?{" "}
+                      <Link to="/dang-ky" className="form-link">
+                        Đăng ký ngay
+                      </Link>
+                    </>
+                  ) : (
+                    "Tài khoản do quản trị viên cấp."
+                  )}
                 </p>
               </div>
 

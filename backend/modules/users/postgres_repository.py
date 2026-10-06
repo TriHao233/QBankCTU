@@ -11,10 +11,18 @@ from psycopg.types.json import Jsonb
 from core.database import get_database
 from core.config import settings
 from core.postgres import postgres_connection
-from modules.users.repository import MongoUserRepository
+from core.postgres_audit import write_postgres_audit_event
+from modules.users.repository import (
+    AuditBuilder,
+    MongoUserRepository,
+    ProfileNotProvisionedError,
+    UnverifiedEmailLinkError,
+    has_verified_email,
+)
 
 JSON_FIELDS = {"permissions", "permission_grants", "permission_revokes",
-               "review_subject_ids", "profile", "generation_presets", "task_calendar"}
+               "review_subject_ids", "teaching_subject_ids", "profile", "generation_presets",
+               "task_calendar"}
 UPDATE_FIELDS = JSON_FIELDS | {"email", "display_name", "role", "is_active"}
 TASK_DATES = {"created_at", "updated_at", "completed_at", "due_date", "createdAt", "updatedAt"}
 
@@ -67,6 +75,7 @@ def _user(row: dict | None) -> dict | None:
     result["task_calendar"] = _task_dates(result.get("task_calendar") or [])
     result["generation_presets"] = _task_dates(result.get("generation_presets") or [])
     result["review_subject_ids"] = [ObjectId(item) for item in result.get("review_subject_ids") or []]
+    result["teaching_subject_ids"] = [ObjectId(item) for item in result.get("teaching_subject_ids") or []]
     return result
 
 
@@ -116,20 +125,33 @@ class PostgresUserRepository:
             ).fetchone()
         return _user(row)
 
-    def sync_identity(self, claims: dict) -> dict:
+    def sync_identity(self, claims: dict, *, allow_create: bool = True) -> dict:
         firebase_uid = claims["uid"]
         email = (claims.get("email") or f"{firebase_uid}@firebase.local").lower()
         display_name = claims.get("name") or email.split("@", 1)[0]
         avatar = claims.get("picture") or ""
         now = _utc_now()
         with postgres_connection() as conn:
-            # Preserve the old profile/role when Firebase refreshes its claims.
-            existing = conn.execute(
-                """SELECT * FROM users
-                   WHERE firebase_uid = %s OR lower(email) = lower(%s)
-                   ORDER BY (firebase_uid = %s) DESC LIMIT 1 FOR UPDATE""",
-                (firebase_uid, email, firebase_uid),
-            ).fetchone()
+            if has_verified_email(claims):
+                # Preserve the old profile/role when Firebase refreshes its claims.
+                existing = conn.execute(
+                    """SELECT * FROM users
+                       WHERE firebase_uid = %s OR lower(email) = lower(%s)
+                       ORDER BY (firebase_uid = %s) DESC LIMIT 1 FOR UPDATE""",
+                    (firebase_uid, email, firebase_uid),
+                ).fetchone()
+            else:
+                if claims.get("email") and conn.execute(
+                    """SELECT 1 FROM users
+                       WHERE lower(email) = lower(%s) AND firebase_uid IS DISTINCT FROM %s
+                       LIMIT 1""",
+                    (email, firebase_uid),
+                ).fetchone():
+                    raise UnverifiedEmailLinkError()
+                existing = conn.execute(
+                    "SELECT * FROM users WHERE firebase_uid = %s LIMIT 1 FOR UPDATE",
+                    (firebase_uid,),
+                ).fetchone()
             if existing:
                 profile = {"school": "", "address": "", "avatar": "", **(existing["profile"] or {})}
                 if avatar:
@@ -139,6 +161,8 @@ class PostgresUserRepository:
                        updated_at = %s WHERE id = %s RETURNING *""",
                     (firebase_uid, email, Jsonb(profile), now, existing["id"]),
                 ).fetchone()
+            elif not allow_create:
+                raise ProfileNotProvisionedError()
             else:
                 row = conn.execute(
                     """INSERT INTO users (
@@ -172,7 +196,7 @@ class PostgresUserRepository:
             ).fetchall()
         return [_user(row) for row in rows], total
 
-    def update(self, user_id: str | ObjectId, fields: dict) -> dict | None:
+    def update(self, user_id: str | ObjectId, fields: dict, *, audit: AuditBuilder | None = None) -> dict | None:
         unknown = set(fields) - UPDATE_FIELDS
         if unknown:
             raise ValueError(f"Unsupported user update fields: {', '.join(sorted(unknown))}")
@@ -187,7 +211,11 @@ class PostgresUserRepository:
                 sql.SQL("UPDATE users SET {} WHERE id = %s RETURNING *").format(assignments),
                 (*values, _id(user_id)),
             ).fetchone()
-        return _user(row)
+            updated = _user(row)
+            event = audit(updated) if updated is not None and audit else None
+            if event:
+                write_postgres_audit_event(conn, **event)
+        return updated
 
     def role_summary(self) -> dict:
         with postgres_connection() as conn:

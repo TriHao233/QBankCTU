@@ -22,6 +22,7 @@ from modules.catalog.schemas import (
     PromptTemplatePayload,
     PromptTemplateTestPayload,
     SubjectPayload,
+    SubjectRejectPayload,
     SubjectResponse,
     SubjectUpdatePayload,
 )
@@ -104,6 +105,43 @@ def update_subject(
 ):
     try:
         return service.update_subject(subject_id, payload, user)
+    except Exception as exc:
+        _translate(exc)
+
+
+@router.post("/subjects/{subject_id}/approve", response_model=SubjectResponse)
+def approve_subject(
+    subject_id: str,
+    user: CurrentUser = Depends(require_permissions("admin.catalog")),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    try:
+        return service.approve_subject(subject_id, user)
+    except Exception as exc:
+        _translate(exc)
+
+
+@router.post("/subjects/{subject_id}/reject", response_model=SubjectResponse)
+def reject_subject(
+    subject_id: str,
+    payload: SubjectRejectPayload,
+    user: CurrentUser = Depends(require_permissions("admin.catalog")),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    try:
+        return service.reject_subject(subject_id, payload.reason, user)
+    except Exception as exc:
+        _translate(exc)
+
+
+@router.post("/subjects/{subject_id}/resubmit", response_model=SubjectResponse)
+def resubmit_subject(
+    subject_id: str,
+    user: CurrentUser = Depends(require_subject_manager),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    try:
+        return service.resubmit_subject(subject_id, user)
     except Exception as exc:
         _translate(exc)
 

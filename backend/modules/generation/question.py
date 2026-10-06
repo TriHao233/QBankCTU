@@ -15,6 +15,7 @@ from modules.generation.schemas import (
     GenerationRejection,
     GenerationPlanSummary,
 )
+from modules.generation.structured_answers import structured_answer_errors
 from modules.generation.postprocessing import (
     POSTPROCESSOR_VERSION,
     DuplicateStats,
@@ -38,11 +39,14 @@ from modules.generation.llm.model_registry import (
     resolve_model_snapshot,
 )
 from modules.generation.mongodb import (
+    completed_generation_runs,
     create_generation_run,
+    document_subject_id,
     finish_generation_run,
     get_existing_question_texts,
     get_document_learning_outcomes,
     save_generated_questions,
+    teaching_subject_ids_for,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +88,18 @@ class GenerationOutputError(RuntimeError):
     """The model completed, but its output cannot produce valid questions."""
 
 
+class GenerationDataError(ValueError):
+    """The request cannot run on the current data (no context, invalid CLOs); retrying will not help."""
+
+
+class GenerationAccessRevoked(RuntimeError):
+    """The requester lost access to generate from the sources while the job was running."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def _llm_hit_output_limit(llm) -> bool:
     provider = llm
     if getattr(provider, "last_used", None) in {"primary", "fallback"}:
@@ -110,15 +126,48 @@ def _content_mode(plan_item: QuestionPlanItem, context_text: str, instruction: s
 
 
 def _context_sections(context_text: str) -> list[str]:
+    """Fallback split for snapshots without ``context_sections``; only a rule before a section header counts."""
     return [
         section.strip()
-        for section in re.split(r"\n\s*---\s*\n", str(context_text or ""))
+        for section in re.split(r"\n\s*---\s*\n(?=\s*Mục lục:)", str(context_text or ""))
         if section.strip()
     ]
 
 
+MIN_CONTEXT_SECTIONS = 5
+MAX_CONTEXT_SECTIONS = 30
+
+
+QUESTIONS_PER_CONTEXT_SECTION = 2
+
+
+def _context_section_limit(total_questions: int) -> int:
+    """One retrieved section per two questions so large runs do not reuse five chunks."""
+    return max(
+        MIN_CONTEXT_SECTIONS,
+        min(MAX_CONTEXT_SECTIONS, -(-total_questions // QUESTIONS_PER_CONTEXT_SECTION)),
+    )
+
+
+def heading_scope_warnings(heading_scope: dict | None, total_questions: int) -> list[str]:
+    """Tell the requester when the selected section cannot ground the requested number of questions."""
+    scope = heading_scope or {}
+    target = scope.get("target")
+    if scope.get("status") == "NO_MATCH":
+        return [f"Không tìm thấy nội dung thuộc mục “{target}”; hệ thống đã dùng toàn bộ tài liệu làm ngữ cảnh."]
+    capacity = int(scope.get("matched_chunks") or 0) * QUESTIONS_PER_CONTEXT_SECTION
+    if scope.get("status") in {"MATCHED", "NARROW"} and capacity < total_questions:
+        return [
+            f"Mục đã chọn chỉ đủ ngữ cảnh cho khoảng {capacity} câu (yêu cầu {total_questions}); "
+            "các câu còn lại có thể lặp ý."
+        ]
+    return []
+
+
 def _focused_context_snapshot(context_snapshot: dict, question_offset: int) -> tuple[dict, str]:
-    sections = _context_sections(context_snapshot.get("context_text") or "")
+    sections = list(context_snapshot.get("context_sections") or []) or _context_sections(
+        context_snapshot.get("context_text") or ""
+    )
     results = context_snapshot.get("results") or []
     if len(sections) <= 1:
         return context_snapshot, "Use the available CONTEXT, but choose a different tested idea from any prior question."
@@ -127,12 +176,38 @@ def _focused_context_snapshot(context_snapshot: dict, question_offset: int) -> t
     focused_snapshot = {
         **context_snapshot,
         "context_text": sections[section_index],
+        "context_sections": [sections[section_index]],
         "results": [results[section_index]] if section_index < len(results) else results,
     }
     return (
         focused_snapshot,
         f"Use primarily context section {section_index + 1} of {len(sections)} for this question.",
     )
+
+def _load_existing_questions(document_id: str, requested_by_user_id) -> tuple[list[str], list[str]]:
+    """Return (the requester's own questions for the prompt, the wider set used for near-dedup)."""
+    try:
+        dedup_subject_id = document_subject_id(document_id)
+    except Exception as exc:
+        logger.warning("Không xác định được học phần của tài liệu để kiểm tra trùng: %s", exc)
+        dedup_subject_id = None
+    try:
+        # Only the requester's own questions may be sent to the model as "do not repeat".
+        existing_questions = get_existing_question_texts(
+            document_id, viewer_user_id=requested_by_user_id,
+        )
+        dedup_questions = get_existing_question_texts(
+            document_id,
+            viewer_user_id=requested_by_user_id,
+            include_shared=True,
+            shared_subject_ids=teaching_subject_ids_for(requested_by_user_id),
+            subject_id=dedup_subject_id,
+        )
+    except Exception as exc:
+        logger.warning("Không tải được câu hỏi hiện có để near-dedup: %s", exc)
+        return [], []
+    return existing_questions, dedup_questions
+
 
 async def generate_questions_rag(
     req: QuestionGenerateRequest,
@@ -141,7 +216,11 @@ async def generate_questions_rag(
     model_snapshot: dict | None = None,
     code_model_snapshot: dict | None = None,
     fallback_model_snapshot: dict | None = None,
+    generation_job_id: str | None = None,
+    index_snapshot: dict | None = None,
+    access_check: Callable[[], Awaitable[None]] | None = None,
 ) -> QuestionGenerateResponse:
+    """``access_check`` runs before every batch and raises GenerationAccessRevoked to stop the job."""
     plan = req.effective_plan()
     plan_log = ", ".join(
         (
@@ -159,36 +238,67 @@ async def generate_questions_rag(
     model_runtime = str((model_snapshot or {}).get("runtime") or "").upper()
     code_runtime = str((code_model_snapshot or model_snapshot or {}).get("runtime") or "").upper()
     gemini_only_request = model_runtime == "GEMINI" and code_runtime == "GEMINI"
-    context_snapshot = await asyncio.to_thread(
-        get_context_snapshot,
-        document_id=req.document_id,
-        collection_name=req.collection_name,
-        target_heading=req.target_heading,
-        query_text=req.instruction,
-        avoid_ollama_gpu_wait=gemini_only_request,
-    )
-    context_text = context_snapshot["context_text"]
+    total_questions = sum(item.num_questions for item in plan)
+    learning_outcomes = await asyncio.to_thread(get_document_learning_outcomes, req.document_id)
+    if req.target_clo_ids:
+        targets = set(req.target_clo_ids)
+        learning_outcomes = [item for item in learning_outcomes if item["id"] in targets]
+        if not learning_outcomes:
+            raise GenerationDataError("Các CLO được chọn không còn hiệu lực trong học phần.")
+    retrieval_query = req.instruction
+    if not retrieval_query and req.target_clo_ids:
+        retrieval_query = " ".join(item["description"] for item in learning_outcomes if item["description"]) or None
+    document_ids = req.all_document_ids()
+    per_document_questions = max(1, -(-total_questions // len(document_ids)))
+    sources: list[tuple[str, dict]] = []
+    context_warnings: list[str] = []
+    for document_id in document_ids:
+        retrieval_kwargs = {}
+        if index_snapshot and index_snapshot.get(str(document_id)):
+            retrieval_kwargs["pinned_snapshot"] = index_snapshot[str(document_id)]
+        try:
+            snapshot = await asyncio.to_thread(
+                get_context_snapshot,
+                document_id=document_id,
+                collection_name=req.collection_name,
+                target_heading=req.target_heading,
+                query_text=retrieval_query,
+                limit=_context_section_limit(per_document_questions),
+                avoid_ollama_gpu_wait=gemini_only_request,
+                **retrieval_kwargs,
+            )
+        except ValueError as exc:
+            raise GenerationDataError(str(exc)) from exc
+        context_warnings.extend(
+            warning
+            for warning in heading_scope_warnings(snapshot.get("heading_scope"), per_document_questions)
+            if warning not in context_warnings
+        )
+        if snapshot["context_text"]:
+            sources.append((document_id, snapshot))
+        elif len(document_ids) > 1:
+            context_warnings.append(f"Tài liệu {document_id} không có ngữ cảnh phù hợp nên được bỏ qua.")
+    context_text = "\n\n".join(snapshot["context_text"] for _document_id, snapshot in sources)
 
     if not context_text:
-        raise ValueError("Không tìm thấy đủ dữ liệu tri thức để sinh câu hỏi.")
+        raise GenerationDataError("Không tìm thấy đủ dữ liệu tri thức để sinh câu hỏi.")
 
     prompt_builder = PromptBuilder()
-    learning_outcomes = get_document_learning_outcomes(req.document_id)
     generated_questions: List[GeneratedQuestion] = []
     summaries: List[GenerationPlanSummary] = []
-    try:
-        existing_questions = get_existing_question_texts(req.document_id)
-    except Exception as exc:
-        logger.warning("Không tải được câu hỏi hiện có để near-dedup: %s", exc)
-        existing_questions = []
+    existing_questions, dedup_questions = await asyncio.to_thread(
+        _load_existing_questions, req.document_id, requested_by_user_id,
+    )
     seen_question_fingerprints = {
         fingerprint
-        for question in existing_questions
+        for question in dedup_questions
         if (fingerprint := question_fingerprint(question))
     }
 
-    total_questions = sum(item.num_questions for item in plan)
+    resumed_by_slot = await asyncio.to_thread(_resumed_questions_by_plan_index, generation_job_id)
     completed_questions = 0
+    context_offset = 0
+    failed_batch_errors: list[str] = []
     if progress_callback:
         await progress_callback(
             {
@@ -198,15 +308,23 @@ async def generate_questions_rag(
                 "generated_questions": 0,
                 "data": [],
                 "summary": [],
+                "warnings": context_warnings,
             }
         )
 
     for plan_index, plan_item in enumerate(plan, start=1):
         content_mode = _content_mode(plan_item, context_text, req.instruction)
-        selected_provider = req.model_provider
-        selected_snapshot = model_snapshot or resolve_model_snapshot(
-            selected_provider, capability=GENERATION_CAPABILITY
-        )
+        if content_mode == "code" and (code_model_snapshot or model_snapshot is None):
+            # Code questions go to the code model snapshotted at job creation.
+            selected_provider = req.code_model_provider
+            selected_snapshot = code_model_snapshot or await asyncio.to_thread(
+                resolve_model_snapshot, selected_provider, capability=GENERATION_CAPABILITY,
+            )
+        else:
+            selected_provider = req.model_provider
+            selected_snapshot = model_snapshot or await asyncio.to_thread(
+                resolve_model_snapshot, selected_provider, capability=GENERATION_CAPABILITY,
+            )
         llm = get_llm_service(
             selected_provider,
             None,
@@ -214,6 +332,27 @@ async def generate_questions_rag(
             fallback_model_snapshot=None,
         )
         item_summaries: list[GenerationPlanSummary] = []
+        resumed = resumed_by_slot.get(plan_index, [])[:plan_item.num_questions]
+        if resumed:
+            for question in resumed:
+                seen_question_fingerprints.add(question_fingerprint(question.question))
+            generated_questions.extend(resumed)
+            completed_questions += len(resumed)
+            item_summaries.append(
+                GenerationPlanSummary(
+                    plan_index=plan_index,
+                    question_type=plan_item.question_type.value,
+                    bloom_level=(plan_item.bloom_level or req.bloom_level).value,
+                    difficulty=plan_item.difficulty or req.difficulty,
+                    model_provider=selected_provider,
+                    content_mode=content_mode,
+                    requested_count=len(resumed),
+                    parsed_count=len(resumed),
+                    valid_count=len(resumed),
+                    saved_count=len(resumed),
+                )
+            )
+        remaining = plan_item.num_questions - len(resumed)
         # Local 7B models are more reliable when each response contains one question.
         # Remote providers keep the configured batching to reduce API requests.
         configured_batch_size = (
@@ -221,42 +360,95 @@ async def generate_questions_rag(
             if str((selected_snapshot or {}).get("runtime") or "").upper() == "OLLAMA"
             else settings.generation_batch_size
         )
-        batch_size = max(1, min(configured_batch_size, plan_item.num_questions))
-        for batch_start in range(0, plan_item.num_questions, batch_size):
-            batch_count = min(batch_size, plan_item.num_questions - batch_start)
+        batch_size = max(1, min(configured_batch_size, max(1, remaining)))
+        batch_queue = [
+            (min(batch_size, remaining - batch_start), False)
+            for batch_start in range(0, remaining, batch_size)
+        ]
+        topup_scheduled = False
+        batch_number = 0
+        while batch_number < len(batch_queue):
+            if access_check is not None:
+                await access_check()
+            batch_count, is_topup = batch_queue[batch_number]
+            batch_number += 1
+            source_document_id, source_snapshot = sources[context_offset % len(sources)]
             focused_snapshot, focus_directive = _focused_context_snapshot(
-                context_snapshot,
-                completed_questions,
+                source_snapshot,
+                context_offset // len(sources),
+            )
+            context_offset += 1
+            if req.target_clo_ids:
+                focus_directive = (
+                    f"{focus_directive} Every question must assess at least one of the listed learning "
+                    "outcomes and set clo_codes accordingly."
+                )
+            batch_req = (
+                req if source_document_id == req.document_id
+                else req.model_copy(update={"document_id": source_document_id})
             )
             batch_item = plan_item.model_copy(update={"num_questions": batch_count})
-            questions, batch_summary = await _generate_questions_for_plan_item(
-                req,
-                batch_item,
-                plan_index=plan_index,
-                avoid_questions=[
-                    *existing_questions[:12],
-                    *(question.question for question in generated_questions),
-                ],
-                avoid_source_contexts=[
-                    question.source_context for question in generated_questions
-                ],
-                seen_question_fingerprints=seen_question_fingerprints,
-                context_snapshot=focused_snapshot,
-                context_text=focused_snapshot["context_text"],
-                prompt_builder=prompt_builder,
-                llm=llm,
-                model_snapshot=selected_snapshot,
-                model_provider=selected_provider,
-                content_mode=content_mode,
-                focus_directive=focus_directive,
-                learning_outcomes=learning_outcomes,
-                requested_by_user_id=requested_by_user_id,
-            )
+            try:
+                questions, batch_summary = await _generate_questions_for_plan_item(
+                    batch_req,
+                    batch_item,
+                    plan_index=plan_index,
+                    avoid_questions=[
+                        *existing_questions[:12],
+                        *(question.question for question in generated_questions),
+                    ],
+                    avoid_source_contexts=[
+                        question.source_context for question in generated_questions
+                    ],
+                    seen_question_fingerprints=seen_question_fingerprints,
+                    context_snapshot=focused_snapshot,
+                    context_text=focused_snapshot["context_text"],
+                    prompt_builder=prompt_builder,
+                    llm=llm,
+                    model_snapshot=selected_snapshot,
+                    model_provider=selected_provider,
+                    content_mode=content_mode,
+                    focus_directive=focus_directive,
+                    learning_outcomes=learning_outcomes,
+                    requested_by_user_id=requested_by_user_id,
+                    generation_job_id=generation_job_id,
+                    clo_slot_offset=len(generated_questions) if req.target_clo_ids else None,
+                )
+            except GenerationOutputError as exc:
+                # Keep accepted questions from earlier batches; the job fails only if nothing was saved.
+                logger.warning(
+                    "Bỏ qua lượt sinh %s/%s%s (%s): %s",
+                    plan_index,
+                    batch_number,
+                    " (sinh bù)" if is_topup else "",
+                    plan_item.question_type.value,
+                    exc,
+                )
+                failed_batch_errors.append(str(exc))
+                questions = []
+                batch_summary = GenerationPlanSummary(
+                    plan_index=plan_index,
+                    question_type=plan_item.question_type.value,
+                    bloom_level=(plan_item.bloom_level or req.bloom_level).value,
+                    difficulty=plan_item.difficulty or req.difficulty,
+                    model_provider=selected_provider,
+                    content_mode=content_mode,
+                    requested_count=batch_count,
+                    rejection_reasons=[
+                        GenerationRejection(code="BATCH_NO_VALID_OUTPUT", message=str(exc))
+                    ],
+                )
             for question in questions:
                 seen_question_fingerprints.add(question_fingerprint(question.question))
             generated_questions.extend(questions)
             item_summaries.append(batch_summary)
-            completed_questions += batch_count
+            if not is_topup:
+                completed_questions += batch_count
+            if batch_number == len(batch_queue) and not topup_scheduled:
+                # One extra single-question attempt per missing question, after the planned batches.
+                topup_scheduled = True
+                missing = plan_item.num_questions - sum(summary.saved_count for summary in item_summaries)
+                batch_queue.extend((1, True) for _ in range(max(0, missing)))
 
             current_summary = _aggregate_plan_summaries(
                 item_summaries,
@@ -280,6 +472,7 @@ async def generate_questions_rag(
                             *(item.model_dump() for item in summaries),
                             current_summary.model_dump(),
                         ],
+                        "warnings": context_warnings,
                     }
                 )
 
@@ -296,11 +489,30 @@ async def generate_questions_rag(
             )
         )
 
+    if not generated_questions and failed_batch_errors:
+        raise GenerationOutputError(failed_batch_errors[-1])
     return QuestionGenerateResponse(
         status="success",
         data=generated_questions,
         summary=summaries,
+        warnings=context_warnings,
     )
+
+
+def _resumed_questions_by_plan_index(generation_job_id: str | None) -> dict[int, list[GeneratedQuestion]]:
+    if not generation_job_id:
+        return {}
+    resumed: dict[int, list[GeneratedQuestion]] = {}
+    for run in completed_generation_runs(generation_job_id):
+        plan_index = run.get("plan_index")
+        if plan_index is None:
+            continue
+        for question in run.get("accepted_questions") or []:
+            try:
+                resumed.setdefault(int(plan_index), []).append(GeneratedQuestion(**question))
+            except (TypeError, ValueError) as exc:
+                logger.warning("Bỏ qua câu đã lưu không hợp lệ khi tiếp tục job %s: %s", generation_job_id, exc)
+    return resumed
 
 
 async def _generate_questions_for_plan_item(
@@ -321,6 +533,8 @@ async def _generate_questions_for_plan_item(
     focus_directive: str | None = None,
     learning_outcomes: list[dict],
     requested_by_user_id=None,
+    generation_job_id: str | None = None,
+    clo_slot_offset: int | None = None,
 ) -> tuple[List[GeneratedQuestion], GenerationPlanSummary]:
     reset_llm_execution_tracking(llm)
     bloom_level = plan_item.bloom_level or req.bloom_level
@@ -346,7 +560,8 @@ async def _generate_questions_for_plan_item(
         "effective_bloom_level": bloom_level.value,
         "effective_difficulty": difficulty,
     }
-    generation_run_id = create_generation_run(
+    generation_run_id = await asyncio.to_thread(
+        create_generation_run,
         document_id=req.document_id,
         requested_by_user_id=requested_by_user_id,
         request_snapshot=request_snapshot,
@@ -356,6 +571,8 @@ async def _generate_questions_for_plan_item(
         retrieval_results=context_snapshot["results"],
         chunk_set_id=context_snapshot["chunk_set_id"],
         vector_collection_id=context_snapshot["vector_collection_id"],
+        generation_job_id=generation_job_id,
+        plan_index=plan_index,
     )
 
     # 3. Gọi LLM
@@ -367,7 +584,8 @@ async def _generate_questions_for_plan_item(
             output_schema=chat_prompt.output_schema,
         )
     except Exception as exc:
-        finish_generation_run(
+        await asyncio.to_thread(
+            finish_generation_run,
             generation_run_id,
             status="FAILED",
             latency_ms=int((time.perf_counter() - started_at) * 1000),
@@ -453,11 +671,6 @@ async def _generate_questions_for_plan_item(
         )
         if len(deduped_data) < plan_item.num_questions:
             missing_count = plan_item.num_questions - len(deduped_data)
-            fallback_candidates: list[GeneratedQuestion] = [
-                question
-                for question in validated_data
-                if question not in deduped_data
-            ]
             for retry_index in range(1, MAX_FORMAT_RETRY_ATTEMPTS + 1):
                 repair_attempt_count += 1
                 retry_attempt_count += 1
@@ -495,7 +708,6 @@ async def _generate_questions_for_plan_item(
                         context_text=context_text,
                     )
                     postprocessed_count += len(retry_validated)
-                    fallback_candidates.extend(retry_validated)
                     retry_deduped, retry_duplicate_stats = filter_duplicate_questions(
                         retry_validated,
                         seen_question_fingerprints,
@@ -523,17 +735,11 @@ async def _generate_questions_for_plan_item(
                         )
                     )
                     break
-            if missing_count > 0 and fallback_candidates:
-                fallback_deduped, _fallback_duplicate_stats = filter_duplicate_questions(
-                    fallback_candidates,
-                    seen_question_fingerprints,
-                    limit=missing_count,
-                    keep_duplicates=True,
-                )
-                deduped_data.extend(fallback_deduped)
 
         # 5. Chuẩn bị bản nháp tạm; chỉ ghi vào ngân hàng khi giảng viên gửi duyệt.
-        saved_data = save_generated_questions(
+        storage_rejections: list[dict] = []
+        saved_data = await asyncio.to_thread(
+            save_generated_questions,
             req.document_id,
             [q.model_dump() for q in deduped_data],
             generation_run_id=generation_run_id,
@@ -544,6 +750,12 @@ async def _generate_questions_for_plan_item(
                 if result.get("chunk_id")
             ],
             learning_outcomes=learning_outcomes,
+            rejections=storage_rejections,
+            clo_slot_start=clo_slot_offset,
+        )
+        validation_errors.extend(
+            GenerationRejection(code=item["code"], message=item["message"], repairable=False)
+            for item in storage_rejections
         )
         summary = _build_plan_summary(
             plan_index=plan_index,
@@ -564,9 +776,12 @@ async def _generate_questions_for_plan_item(
             raise GenerationOutputError(
                 "Mô hình không tạo được câu hỏi hợp lệ sau bước kiểm tra đầu ra."
             )
-        finish_generation_run(
+        accepted_questions = [GeneratedQuestion(**question) for question in saved_data]
+        await asyncio.to_thread(
+            finish_generation_run,
             generation_run_id,
             status="COMPLETED",
+            accepted_questions=[question.model_dump(mode="json") for question in accepted_questions],
             raw_model_response=raw_response,
             generated_count=len(saved_data),
             latency_ms=int((time.perf_counter() - started_at) * 1000),
@@ -585,7 +800,7 @@ async def _generate_questions_for_plan_item(
             model_execution=get_llm_execution_snapshot(llm),
         )
 
-        return [GeneratedQuestion(**question) for question in saved_data], summary
+        return accepted_questions, summary
 
     except json.JSONDecodeError as exc:
         logger.error(
@@ -600,7 +815,8 @@ async def _generate_questions_for_plan_item(
                 repairable=False,
             )
         ]
-        finish_generation_run(
+        await asyncio.to_thread(
+            finish_generation_run,
             generation_run_id,
             status="FAILED",
             raw_model_response=_response_excerpt(raw_response, limit=12000),
@@ -624,7 +840,8 @@ async def _generate_questions_for_plan_item(
             "Mô hình trả về JSON không hoàn chỉnh nên không tạo được câu hỏi hợp lệ."
         ) from exc
     except Exception as exc:
-        finish_generation_run(
+        await asyncio.to_thread(
+            finish_generation_run,
             generation_run_id,
             status="FAILED",
             raw_model_response=_response_excerpt(raw_response, limit=12000),
@@ -868,15 +1085,16 @@ def _check_type_format(item: dict, question_type: str) -> str | None:
         alpha_keys = [k for k in options if str(k).isalpha()]
         if len(numeric_keys) < 3 or len(alpha_keys) < len(numeric_keys) + 1:
             return "ghep_cot cần tối thiểu 3 mục đánh số và số mục chữ phải nhiều hơn số mục số ít nhất 1 (distractor)"
-        if not re.search(r"\d+\s*-\s*[a-zA-Z]", correct_answer):
-            return "ghep_cot: correct_answer phải theo định dạng '1-b, 2-a, ...'"
+        errors = structured_answer_errors(question_type, options, correct_answer)
+        if errors:
+            return errors[0]
 
     elif question_type == "sap_xep":
         if not isinstance(options, dict) or len(options) < 4:
             return "sap_xep cần tối thiểu 4 bước trong options"
-        correct_keys = [c.strip() for c in correct_answer.split(",") if c.strip()]
-        if sorted(correct_keys) != sorted(str(k) for k in options.keys()):
-            return "sap_xep: correct_answer phải liệt kê đủ và đúng các khóa trong options theo thứ tự"
+        errors = structured_answer_errors(question_type, options, correct_answer)
+        if errors:
+            return errors[0]
 
     return None
 

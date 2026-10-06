@@ -1,4 +1,5 @@
 import math
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
@@ -71,6 +72,21 @@ class SubjectResponse(BaseModel):
     owner_id: str | None = None
     owner_email: str = ""
     can_manage: bool = True
+    approval_status: str = "APPROVED"
+    approval_reason: str = ""
+    approval_reviewed_at: datetime | None = None
+    approval_reviewed_by_user_id: str | None = None
+
+
+class SubjectRejectPayload(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+    @model_validator(mode="after")
+    def normalize_reason(self):
+        self.reason = self.reason.strip()
+        if len(self.reason) < 3:
+            raise ValueError("Cần nêu lý do từ chối")
+        return self
 
 
 class AiModelPayload(BaseModel):

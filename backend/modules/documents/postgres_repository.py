@@ -15,6 +15,7 @@ from db.bson_json import restore as _restore
 from db.copy_business_data import normalized, projected_rows, upsert
 from core.postgres_audit import write_postgres_audit_event
 from modules.documents.repository import (
+    ACTIVE_DOCUMENT_JOB_STATUSES, DOCUMENT_BUSY_MESSAGE, DUPLICATE_IGNORED_STATUSES, DocumentBusyError,
     MongoDocumentRepository, compact_raw_extraction, json_safe, object_id, utc_now,
 )
 
@@ -104,8 +105,9 @@ class PostgresDocumentRepository:
     def list(self, page: int, page_size: int, status: str | None,
              search: str | None, *, subject_id: ObjectId | None = None,
              uploaded_by_user_id: ObjectId | None = None,
-             visible_to_user_id: ObjectId | None = None) -> tuple[list[dict], int]:
-        filters = [sql.SQL("d.status <> 'ARCHIVED'")]
+             visible_to_user_id: ObjectId | None = None,
+             shared_subject_ids=None) -> tuple[list[dict], int]:
+        filters = [sql.SQL("d.status <> 'ARCHIVED'")] if status != "ARCHIVED" else []
         params = []
         if status:
             filters.append(sql.SQL("d.status=%s"))
@@ -120,8 +122,11 @@ class PostgresDocumentRepository:
         if visible_to_user_id:
             filters.append(sql.SQL("(d.uploaded_by_user_id=%s OR "
                                    "d.payload->'shared_with_user_ids' ? %s OR "
-                                   "d.payload->>'shared_scope'='SUBJECT')"))
-            params.extend((str(visible_to_user_id), str(visible_to_user_id)))
+                                   "(d.payload->>'shared_scope'='SUBJECT' AND EXISTS ("
+                                   "SELECT 1 FROM document_subjects ds "
+                                   "WHERE ds.document_id=d.id AND ds.subject_id=ANY(%s))))"))
+            params.extend((str(visible_to_user_id), str(visible_to_user_id),
+                           [str(item) for item in shared_subject_ids or ()]))
         if search:
             filters.append(sql.SQL("(d.title ILIKE %s OR d.original_filename ILIKE %s)"))
             pattern = f"%{search}%"
@@ -235,7 +240,7 @@ class PostgresDocumentRepository:
                                     if row["document_owner"] else None),
         }) for row in rows]
 
-    def update(self, document_id: str | ObjectId, fields: dict) -> dict | None:
+    def update(self, document_id: str | ObjectId, fields: dict, *, audit: dict | None = None) -> dict | None:
         key = str(object_id(document_id, "document_id"))
         with postgres_connection() as conn:
             row = conn.execute(
@@ -279,9 +284,11 @@ class PostgresDocumentRepository:
             current.update(normalized)
             current["updated_at"] = utc_now()
             self._save(conn, current)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
             return current
 
-    def archive(self, document_id: str | ObjectId) -> bool:
+    def archive(self, document_id: str | ObjectId, *, audit: dict | None = None) -> bool:
         key = str(object_id(document_id, "document_id"))
         with postgres_connection() as conn:
             row = conn.execute(
@@ -290,10 +297,41 @@ class PostgresDocumentRepository:
             ).fetchone()
             if not row:
                 return False
+            busy = conn.execute(
+                "SELECT 1 FROM document_jobs WHERE document_id=%s AND status=ANY(%s) LIMIT 1",
+                (key, sorted(ACTIVE_DOCUMENT_JOB_STATUSES)),
+            ).fetchone()
+            if busy:
+                raise DocumentBusyError(DOCUMENT_BUSY_MESSAGE)
             record = self._load(conn, row)
-            record.update(status="ARCHIVED", archived_at=utc_now(), updated_at=utc_now())
+            record.update(status="ARCHIVED", archived_at=utc_now(), updated_at=utc_now(), pending_processing={})
             self._save(conn, record)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
             return True
+
+    def find_archived(self, document_id: str | ObjectId) -> dict | None:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM documents WHERE id=%s AND status='ARCHIVED'",
+                (str(object_id(document_id, "document_id")),),
+            ).fetchone()
+            return self._load(conn, row)
+
+    def restore(self, document_id: str | ObjectId, *, status: str, audit: dict | None = None) -> dict | None:
+        key = str(object_id(document_id, "document_id"))
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM documents WHERE id=%s AND status='ARCHIVED' FOR UPDATE", (key,),
+            ).fetchone()
+            if not row:
+                return None
+            record = self._load(conn, row)
+            record.update(status=status, archived_at=None, updated_at=utc_now())
+            self._save(conn, record)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
+            return record
 
     @staticmethod
     def _job(row: dict | None) -> dict | None:
@@ -402,6 +440,20 @@ class PostgresDocumentRepository:
             self._save(conn, document)
             return page
 
+    def find_duplicate_original(self, uploaded_by_user_id, sha256: str) -> dict | None:
+        if uploaded_by_user_id is None:
+            return None
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "SELECT d.id, d.title FROM documents d "
+                "JOIN document_artifacts a ON a.document_id=d.id "
+                "WHERE d.uploaded_by_user_id=%s AND NOT (d.status = ANY(%s)) "
+                "AND a.checksum_sha256=%s AND a.artifact_type LIKE 'ORIGINAL\\_%%' "
+                "ORDER BY d.created_at LIMIT 1",
+                (str(uploaded_by_user_id), list(DUPLICATE_IGNORED_STATUSES), sha256),
+            ).fetchone()
+        return {"_id": ObjectId(row["id"]), "title": row["title"]} if row else None
+
     def attach_original_artifact(self, document_id: str | ObjectId, *, uri: str,
                                  size_bytes: int, sha256: str,
                                  artifact_type: str = "ORIGINAL_PDF",
@@ -476,7 +528,7 @@ class PostgresDocumentRepository:
             now = utc_now()
             current = document.get("current_processing") or {}
             active_pointer = (current.get("ocr_job_id") if normalized_type == "OCR"
-                              else current.get("chunk_set_id") if normalized_type == "CHUNK"
+                              else current.get("chunk_set_id") if normalized_type in {"CHUNK", "INDEX"}
                               else None)
             record = {
                 "_id": ObjectId(), "schema_version": document["schema_version"],

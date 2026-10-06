@@ -56,6 +56,15 @@ def filter_retrieval_pages(pages: list[dict], metrics: dict | None = None) -> li
     body_started = False
     for page in pages:
         blocks = page.get("content_blocks") or []
+        if (page.get("quality") or {}).get("retrieval_excluded"):
+            if blocks:
+                decisions.append({
+                    "block_id": None, "page_number": page.get("page_number"),
+                    "reasons": ["blank_page"], "removed_lines": 0,
+                })
+                filtered_chars += sum(len(block.get("content") or "") for block in blocks)
+            filtered_pages.append({**page, "content_blocks": []})
+            continue
         cover = not body_started and _cover(blocks)
         all_lines = [line.strip() for b in blocks for line in b.get("content", "").splitlines() if line.strip()]
         toc_lines = sum(bool(TOC_ENTRY.fullmatch(line)) for line in all_lines)

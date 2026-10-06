@@ -11,6 +11,7 @@ from core.config import settings
 from core.database import get_rag_db, mongo_transaction
 from modules.documents.repository import object_id
 from modules.documents.store import get_document_repository
+from modules.questions.citations import count_versions_citing_chunks
 from modules.rag.chromadb_engine import get_collection
 
 
@@ -517,6 +518,13 @@ class LineagePromotionService:
             raise
         return {"operation_id": operation_id, "archived_at": now}
 
+    def _ensure_not_cited(self, chunk_set_id) -> None:
+        """Question versions are immutable evidence records; their cited chunks must outlive them."""
+        chunk_ids = self.db.document_chunks.distinct("_id", {"chunk_set_id": chunk_set_id})
+        cited = count_versions_citing_chunks(self.db, chunk_ids)
+        if cited:
+            raise ValueError(f"lineage is cited by {cited} question version(s) and cannot be deleted")
+
     def request_permanent_delete(
         self, candidate: CandidateLineage, *, actor: str, reason: str, confirmation: str
     ) -> dict:
@@ -528,6 +536,7 @@ class LineagePromotionService:
         chunk_set = self.db.chunk_sets.find_one({"_id": ids["chunk_set_id"], "archived_at": {"$ne": None}})
         if not chunk_set:
             raise ValueError("candidate must be archived before permanent deletion")
+        self._ensure_not_cited(ids["chunk_set_id"])
         if settings.document_store == "postgres":
             if chunk_set.get("document_id") != ids["document_id"]:
                 raise ValueError("chunk set belongs to another document")
@@ -594,6 +603,7 @@ class LineagePromotionService:
             }
         ):
             raise ValueError("rollback lineage cannot be deleted")
+        self._ensure_not_cited(target["chunk_set_id"])
         vector = self.db.vector_collections.find_one({"_id": target["vector_collection_id"]})
         embeddings = list(
             self.db.chunk_embeddings.find(
@@ -641,3 +651,61 @@ class LineagePromotionService:
                 )
             raise
         return {"operation_id": request_operation_id, "status": "DELETED", "deleted": True}
+
+
+def _auto_smoke_queries(db, chunk_set_id: ObjectId) -> list[str]:
+    queries: list[str] = []
+    for chunk in db.document_chunks.find({"chunk_set_id": chunk_set_id}).sort("chunk_no", 1).limit(20):
+        if (chunk.get("validation") or {}).get("requires_review"):
+            continue
+        words = (chunk.get("content") or "").split()
+        if len(words) >= 5:
+            queries.append(" ".join(words[:16]))
+        if len(queries) >= 2:
+            break
+    return queries
+
+
+def auto_promote_pending_lineage(document_id: str, *, actor: str, reason: str, db=None) -> dict:
+    """Validate and promote the registered pending lineage; failures leave it pending for manual review."""
+    repository = get_document_repository(db)
+    document = repository.find_by_id(document_id)
+    pending = (document or {}).get("pending_processing") or {}
+    if not all(pending.get(key) for key in ("ocr_job_id", "chunk_set_id", "vector_collection_id")):
+        return {"status": "SKIPPED", "reason": "no pending lineage"}
+    candidate = CandidateLineage(
+        document_id=str(document_id),
+        ocr_job_id=str(pending["ocr_job_id"]),
+        chunk_set_id=str(pending["chunk_set_id"]),
+        vector_collection_id=str(pending["vector_collection_id"]),
+    )
+    service = LineagePromotionService(db)
+    smoke_queries = _auto_smoke_queries(service.db, candidate.as_object_ids()["chunk_set_id"])
+    outcome: dict
+    try:
+        preview = service.dry_run(candidate, smoke_queries=smoke_queries)
+        validation = preview["validation"]
+        if validation["status"] != "passed":
+            outcome = {
+                "status": "FAILED",
+                "reason": "; ".join((validation.get("errors") or validation.get("warnings") or [])[:5])
+                or "candidate lineage did not pass validation",
+            }
+        else:
+            result = service.promote(
+                candidate,
+                smoke_queries=smoke_queries,
+                actor=actor,
+                reason=reason,
+                confirmation=preview["confirmation_token"],
+            )
+            outcome = {"status": "PROMOTED", "operation_id": result.get("operation_id")}
+    except Exception as exc:
+        outcome = {"status": "FAILED", "reason": str(exc) or type(exc).__name__}
+    outcome["at"] = utc_now().isoformat()
+    latest = repository.find_by_id(document_id)
+    if latest:
+        summary = dict(latest.get("pipeline_summary") or {})
+        summary["auto_promotion"] = outcome
+        repository.update(document_id, {"pipeline_summary": summary})
+    return outcome

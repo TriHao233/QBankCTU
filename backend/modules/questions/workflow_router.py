@@ -10,6 +10,7 @@ from core.dependencies import (
     require_reviewer_or_admin,
     require_teacher_reviewer_or_admin,
 )
+from modules.questions.review_reasons import REVIEW_REASON_CATALOG
 from modules.questions.workflow_schemas import (
     AutoAssignRequest,
     AutoEvaluationRequest,
@@ -18,6 +19,7 @@ from modules.questions.workflow_schemas import (
     QuestionCommentCreateRequest,
     QuestionCommentUpdateRequest,
     ReviewAssignmentRequest,
+    ReviewClaimRequest,
     ReviewCreateRequest,
     ReviewDraftUpsertRequest,
     ReviewPolicyPayload,
@@ -77,6 +79,13 @@ def review_subject_suggestions(
         return service.suggest_review_subjects(reviewer_user_id)
     except Exception as exc:
         _translate_workflow_error(exc)
+
+
+@router.get("/review-reasons")
+def list_review_reasons(
+    current_user: CurrentUser = Depends(require_teacher_reviewer_or_admin),
+):
+    return {"items": list(REVIEW_REASON_CATALOG)}
 
 
 @router.get("/review-policy")
@@ -140,11 +149,11 @@ def delete_review_draft(
 def evaluate_question(
     question_id: str,
     payload: EvaluationCreateRequest,
-    current_user: CurrentUser = Depends(require_reviewer_or_admin),
+    current_user: CurrentUser = Depends(require_teacher_reviewer_or_admin),
     service: QuestionWorkflowService = Depends(get_workflow_service),
 ):
     try:
-        return service.evaluate(question_id, payload, current_user.id)
+        return service.evaluate_manual(question_id, payload, current_user)
     except Exception as exc:
         _translate_workflow_error(exc)
 
@@ -157,6 +166,7 @@ async def auto_evaluate_question(
     service: QuestionWorkflowService = Depends(get_workflow_service),
 ):
     try:
+        await asyncio.to_thread(service.ensure_question_readable, question_id, current_user)
         job = await asyncio.to_thread(
             service.enqueue_auto_evaluation,
             question_id,
@@ -199,11 +209,12 @@ def review_question(
 @router.post("/{question_id}/review-assignment/claim")
 def claim_review_question(
     question_id: str,
+    payload: ReviewClaimRequest | None = None,
     current_user: CurrentUser = Depends(require_reviewer_or_admin),
     service: QuestionWorkflowService = Depends(get_workflow_service),
 ):
     try:
-        return service.claim_review(question_id, current_user)
+        return service.claim_review(question_id, current_user, reason=payload.reason if payload else None)
     except Exception as exc:
         _translate_workflow_error(exc)
 
@@ -330,6 +341,7 @@ def publish_question_to_moodle(
     service: QuestionWorkflowService = Depends(get_workflow_service),
 ):
     try:
+        service.ensure_question_readable(question_id, current_user)
         return service.publish_to_moodle(question_id, payload, current_user.id, current_user.role)
     except Exception as exc:
         _translate_workflow_error(exc)

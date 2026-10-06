@@ -143,6 +143,7 @@ def test_resubmission_notifies_previous_reviewer_with_the_status_change(monkeypa
     from db.copy_business_data import projected_rows, upsert
     from modules.questions.repository import MongoQuestionReferenceRepository
     from modules.questions.router import submit_question_for_review
+    from modules.questions.schemas import QuestionSubmitRequest
     from modules.questions.service import QuestionService
 
     for key in ("user_store", "catalog_store", "question_store", "notification_store",
@@ -185,7 +186,10 @@ def test_resubmission_notifies_previous_reviewer_with_the_status_change(monkeypa
         monkeypatch.setattr(workflow, "enqueue_auto_evaluation", lambda *_a, **_k: {})
         author = _actor(teacher, "Teacher")
 
-        submitted = submit_question_for_review(str(question_id), author, service, workflow)
+        submitted = submit_question_for_review(
+            str(question_id), author, service, workflow,
+            QuestionSubmitRequest(response_note="Đã giữ nguyên, đáp án đúng theo tài liệu"),
+        )
         assert submitted["review_status"] == "PENDING"
         assert _kinds(reviewer["_id"]) == ["QUESTION_RESUBMITTED"]
         # Submitting an already pending question changes nothing and sends nothing.

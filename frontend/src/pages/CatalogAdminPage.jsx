@@ -4,8 +4,10 @@ import {
   activatePromptTemplate,
   addSubjectChapter,
   addSubjectLearningOutcome,
+  approveSubject,
   checkAiModelHealth,
   getCatalogOverview,
+  rejectSubject,
   saveAiModel,
   saveEvaluationPolicy,
   savePromptTemplate,
@@ -265,6 +267,26 @@ function CatalogAdminPage() {
     });
   };
 
+  const handleApproveSubject = (subject) => {
+    runSave(async () => {
+      await approveSubject(subject.id);
+      return { activeSubjectId: subject.id };
+    });
+  };
+
+  const handleRejectSubject = (subject) => {
+    const reason = window.prompt(`Lý do từ chối môn "${subject.subject_name}":`);
+    if (reason === null) return;
+    if (reason.trim().length < 3) {
+      setError('Lý do từ chối cần ít nhất 3 ký tự.');
+      return;
+    }
+    runSave(async () => {
+      await rejectSubject(subject.id, reason.trim());
+      return { activeSubjectId: subject.id };
+    });
+  };
+
   const toggleChapterActive = (chapter) => {
     if (!activeSubject) return;
     runSave(async () => updateSubjectChapter(
@@ -515,7 +537,11 @@ function CatalogAdminPage() {
                   >
                     <b>{subject.subject_code}</b>
                     <span>{subject.subject_name}</span>
-                    <small>{usageText(subject.usage_counts)}</small>
+                    <small>
+                      {subject.approval_status === 'PENDING_APPROVAL' && 'Chờ duyệt · '}
+                      {subject.approval_status === 'REJECTED' && 'Đã từ chối · '}
+                      {usageText(subject.usage_counts)}
+                    </small>
                   </button>
                 ))}
               </div>
@@ -524,7 +550,28 @@ function CatalogAdminPage() {
                   <div>
                     <h3>{activeSubject?.subject_name || 'Chưa có môn'}</h3>
                     {activeSubject && <p>{usageText(activeSubject.usage_counts)}</p>}
+                    {activeSubject?.approval_status === 'PENDING_APPROVAL' && (
+                      <p>Giảng viên {activeSubject.owner_email || ''} đề nghị đưa môn này vào danh mục chung.</p>
+                    )}
+                    {activeSubject?.approval_status === 'REJECTED' && (
+                      <p>Đã từ chối: {activeSubject.approval_reason || 'không ghi lý do'}</p>
+                    )}
                   </div>
+                  {activeSubject?.approval_status === 'PENDING_APPROVAL' && (
+                    <div className="catalog-form-actions">
+                      <button type="button" onClick={() => handleApproveSubject(activeSubject)} disabled={saving}>
+                        Duyệt môn
+                      </button>
+                      <button
+                        type="button"
+                        className="catalog-ghost-button"
+                        onClick={() => handleRejectSubject(activeSubject)}
+                        disabled={saving}
+                      >
+                        Từ chối
+                      </button>
+                    </div>
+                  )}
                   {activeSubject && (
                     <button type="button" className="catalog-ghost-button" onClick={toggleSubjectActive} disabled={saving}>
                       {activeSubject.is_active === false ? 'Kích hoạt' : 'Tạm khóa'}

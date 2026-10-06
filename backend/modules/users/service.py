@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import datetime, timezone
 from typing import Callable, Protocol
@@ -29,12 +30,18 @@ from modules.users.schemas import (
     UserSelfUpdateRequest,
 )
 
+logger = logging.getLogger(__name__)
 MAX_GENERATION_PRESETS = 12
 MAX_TASK_CALENDAR_ITEMS = 500
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class PublicRegistrationDisabledError(PermissionError):
+    def __init__(self) -> None:
+        super().__init__("Đăng ký công khai đã bị tắt. Vui lòng liên hệ quản trị viên để được cấp tài khoản.")
 
 
 class IdentityGateway(Protocol):
@@ -72,12 +79,29 @@ class UserService:
         repository: UserRepository,
         identity: IdentityGateway,
         sessions: FirebaseSessionRepository,
-        release_review_assignments: Callable[[ObjectId, CurrentUser | None, str], int] | None = None,
+        release_review_assignments: Callable[..., int] | None = None,
+        cancel_generation_jobs: Callable[[ObjectId], int] | None = None,
     ):
         self.repository = repository
         self.identity = identity
         self.sessions = sessions
         self.release_review_assignments = release_review_assignments
+        self.cancel_generation_jobs = cancel_generation_jobs
+
+    def _stop_user_work(self, user: dict, could_review: bool, actor: CurrentUser | None) -> None:
+        self.sessions.upsert(user["firebase_uid"], None)
+        self._release_reviewer_work(user["_id"], could_review, actor, "reviewer_deactivated")
+        if self.cancel_generation_jobs:
+            cancelled = self.cancel_generation_jobs(user["_id"])
+            if cancelled:
+                record_audit_event(
+                    action="user.generation_jobs_cancelled",
+                    entity_type="user",
+                    entity_id=user["_id"],
+                    actor_user_id=actor.id if actor else None,
+                    actor_role=actor.role if actor else None,
+                    metadata={"cancelled_jobs": cancelled, "reason": "user_deactivated"},
+                )
 
     def _release_reviewer_work(
         self,
@@ -90,9 +114,13 @@ class UserService:
             self.release_review_assignments(user_id, actor, reason)
 
     def sync_from_claims(self, claims: dict) -> dict:
-        return serialize_user(self.repository.sync_identity(claims))
+        return serialize_user(
+            self.repository.sync_identity(claims, allow_create=settings.allow_public_registration)
+        )
 
     def register_teacher(self, payload: PublicRegisterRequest) -> dict:
+        if not settings.allow_public_registration:
+            raise PublicRegistrationDisabledError()
         firebase_user = self.identity.create_user(
             email=str(payload.email),
             password=payload.password,
@@ -497,6 +525,7 @@ class UserService:
             "is_active": user.get("is_active", True),
             "permissions": list(effective_permissions(user)),
             "review_subject_ids": [str(item) for item in user.get("review_subject_ids") or []],
+            "teaching_subject_ids": [str(item) for item in user.get("teaching_subject_ids") or []],
         }
 
     def update_admin(
@@ -514,6 +543,8 @@ class UserService:
             fields["role"] = role.value if hasattr(role, "value") else role
         if "review_subject_ids" in fields:
             fields["review_subject_ids"] = self._normalize_object_ids(fields["review_subject_ids"])
+        if "teaching_subject_ids" in fields:
+            fields["teaching_subject_ids"] = self._normalize_object_ids(fields["teaching_subject_ids"])
         user = self.repository.find_by_id(user_id)
         if not user:
             return None
@@ -526,6 +557,7 @@ class UserService:
             fields["permissions"] = []  # bỏ dữ liệu quyền kiểu cũ (chỉ cộng thêm)
         self._ensure_admin_floor(user, fields)
         before = self._user_audit_snapshot(user)
+        previous_review_subjects = [str(item) for item in user.get("review_subject_ids") or []]
         # Chỉ gọi Firebase khi tên hoặc trạng thái thật sự thay đổi.
         try:
             if payload.display_name is not None and payload.display_name != user.get("display_name"):
@@ -534,30 +566,55 @@ class UserService:
                 self.identity.set_user_disabled(user["firebase_uid"], not payload.is_active)
         except Exception as exc:
             raise ValueError(f"Không cập nhật được tài khoản đăng nhập Firebase: {exc}") from exc
-        updated = self.repository.update(user_id, fields)
+
+        def audit(updated_user: dict) -> dict | None:
+            after_snapshot = self._user_audit_snapshot(updated_user)
+            changed = sorted(key for key in before if before[key] != after_snapshot[key])
+            if not changed:
+                return None
+            return {
+                "action": "user.admin_update",
+                "entity_type": "user",
+                "entity_id": user["_id"],
+                "actor_user_id": actor.id if actor else None,
+                "actor_role": actor.role if actor else None,
+                "before": before,
+                "after": after_snapshot,
+                "metadata": {"changed_fields": changed, "label": user.get("email")},
+            }
+
+        try:
+            updated = self.repository.update(user_id, fields, audit=audit)
+        except Exception:
+            self._restore_identity_state(user, payload)
+            raise
         if not updated:
             return None
         after = self._user_audit_snapshot(updated)
         could_review = "reviews.manage" in before["permissions"]
         can_review = "reviews.manage" in after["permissions"]
         if payload.is_active is False and before["is_active"]:
-            self.sessions.upsert(user["firebase_uid"], None)
-            self._release_reviewer_work(user["_id"], could_review, actor, "reviewer_deactivated")
+            self._stop_user_work(user, could_review, actor)
         elif could_review and not can_review:
             self._release_reviewer_work(user["_id"], could_review, actor, "reviewer_role_removed")
-        changed_fields = sorted(key for key in before if before[key] != after[key])
-        if changed_fields:
-            record_audit_event(
-                action="user.admin_update",
-                entity_type="user",
-                entity_id=user["_id"],
-                actor_user_id=actor.id if actor else None,
-                actor_role=actor.role if actor else None,
-                before=before,
-                after=after,
-                metadata={"changed_fields": changed_fields, "label": user.get("email")},
-            )
+        elif could_review and "review_subject_ids" in fields and self.release_review_assignments:
+            kept = {str(item) for item in updated.get("review_subject_ids") or []}
+            removed = [item for item in previous_review_subjects if item not in kept]
+            if removed:
+                self.release_review_assignments(
+                    user["_id"], actor, "reviewer_subject_removed", subject_ids=removed,
+                )
         return serialize_user(updated)
+
+    def _restore_identity_state(self, user: dict, payload: UserAdminUpdateRequest) -> None:
+        """Undo Firebase changes when the profile write (with its required audit) failed."""
+        try:
+            if payload.display_name is not None and payload.display_name != user.get("display_name"):
+                self.identity.update_user(user["firebase_uid"], display_name=user.get("display_name"))
+            if payload.is_active is not None and payload.is_active != user.get("is_active", True):
+                self.identity.set_user_disabled(user["firebase_uid"], not user.get("is_active", True))
+        except Exception as exc:
+            logger.error("Could not restore Firebase state for user %s: %s", user.get("_id"), exc)
 
     def deactivate(self, user_id: str, actor: CurrentUser | None = None) -> bool:
         user = self.repository.find_by_id(user_id)
@@ -566,32 +623,37 @@ class UserService:
         self._ensure_admin_floor(user, {"is_active": False})
         before = self._user_audit_snapshot(user)
         self.identity.set_user_disabled(user["firebase_uid"], True)
-        updated = self.repository.update(user_id, {"is_active": False})
+
+        def audit(updated_user: dict) -> dict:
+            return {
+                "action": "user.deactivate",
+                "entity_type": "user",
+                "entity_id": user["_id"],
+                "actor_user_id": actor.id if actor else None,
+                "actor_role": actor.role if actor else None,
+                "before": before,
+                "after": self._user_audit_snapshot(updated_user),
+                "metadata": {"label": user.get("email")},
+            }
+
+        try:
+            updated = self.repository.update(user_id, {"is_active": False}, audit=audit)
+        except Exception:
+            if user.get("is_active", True):
+                try:
+                    self.identity.set_user_disabled(user["firebase_uid"], False)
+                except Exception as exc:
+                    logger.error("Could not re-enable Firebase user %s: %s", user.get("_id"), exc)
+            raise
         if updated:
-            self.sessions.upsert(user["firebase_uid"], None)
-            self._release_reviewer_work(
-                user["_id"],
-                "reviews.manage" in effective_permissions(user),
-                actor,
-                "reviewer_deactivated",
-            )
-            record_audit_event(
-                action="user.deactivate",
-                entity_type="user",
-                entity_id=user["_id"],
-                actor_user_id=actor.id if actor else None,
-                actor_role=actor.role if actor else None,
-                before=before,
-                after=self._user_audit_snapshot(updated),
-                metadata={"label": user.get("email")},
-            )
+            self._stop_user_work(user, "reviews.manage" in effective_permissions(user), actor)
         return updated is not None
 
 
 def get_user_service() -> UserService:
     database = get_rag_db()
 
-    def release_review_assignments(reviewer_user_id, actor, reason) -> int:
+    def release_review_assignments(reviewer_user_id, actor, reason, subject_ids=None) -> int:
         # Imported lazily: the question workflow module is heavy and imports
         # user-facing helpers of its own.
         from modules.questions.workflow_service import QuestionWorkflowService
@@ -600,7 +662,13 @@ def get_user_service() -> UserService:
             reviewer_user_id,
             actor,
             reason,
+            subject_ids=subject_ids,
         )
+
+    def cancel_generation_jobs(user_id) -> int:
+        from modules.generation.mongodb import cancel_generation_jobs_for_user
+
+        return cancel_generation_jobs_for_user(user_id)
 
     if settings.user_store == "postgres":
         from modules.users.postgres_repository import PostgresUserRepository
@@ -613,4 +681,5 @@ def get_user_service() -> UserService:
         FirebaseIdentityGateway(),
         get_firebase_session_repository(),
         release_review_assignments=release_review_assignments,
+        cancel_generation_jobs=cancel_generation_jobs,
     )

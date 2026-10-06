@@ -13,6 +13,7 @@ import {
   listExamQuestionPool,
   listVariants,
   removeQuestion,
+  reopenExam,
   saveMatrix,
   updateExamStatus,
   updateExam,
@@ -51,7 +52,14 @@ const EXAM_STATUS_LABEL = {
   DRAFT: 'Nháp',
   READY: 'Sẵn sàng',
   FINALIZED: 'Đã chốt',
+  PUBLISHED: 'Đã phát hành',
   ARCHIVED: 'Lưu trữ',
+};
+
+const ITEM_FLAG_LABEL = {
+  archived_item: 'Câu hỏi đã bị lưu trữ',
+  version_changed: 'Không còn ở phiên bản đã duyệt đã chọn',
+  access_revoked: 'Không còn quyền sử dụng câu hỏi',
 };
 
 const QUESTION_POOL_PAGE_SIZE = 20;
@@ -72,8 +80,14 @@ function examStatus(exam) {
 }
 
 function isExamLocked(exam) {
-  return ['FINALIZED', 'ARCHIVED'].includes(examStatus(exam));
+  return ['FINALIZED', 'PUBLISHED', 'ARCHIVED'].includes(examStatus(exam));
 }
+
+const LOCKED_NOTE = {
+  FINALIZED: 'chốt',
+  PUBLISHED: 'phát hành',
+  ARCHIVED: 'lưu trữ',
+};
 
 const STEPS = [
   { id: 'info', label: '1. Thông tin đề thi' },
@@ -122,10 +136,28 @@ function ExamBuilderPage() {
   );
   const chapters = subject?.chapters || [];
   const statusValue = examStatus(exam);
-  const locked = isExamLocked(exam);
+  const viewOnly = exam?.can_edit === false;
+  const locked = isExamLocked(exam) || viewOnly;
+
+  const handleReopen = async () => {
+    const reason = window.prompt('Lý do mở lại đề đã chốt (bản chốt cũ sẽ được lưu và đánh dấu hủy):');
+    if (reason === null) return;
+    if (reason.trim().length < 5) {
+      alert('Cần nêu lý do mở lại (ít nhất 5 ký tự).');
+      return;
+    }
+    try {
+      setExam(await reopenExam(exam.id, reason.trim()));
+    } catch (err) {
+      alert('Mở lại đề thi thất bại: ' + err.message);
+    }
+  };
 
   const handleStatusChange = async (targetStatus) => {
     if (targetStatus === 'FINALIZED' && !window.confirm('Chốt đề thi và khóa ma trận/danh sách câu hỏi?')) {
+      return;
+    }
+    if (targetStatus === 'PUBLISHED' && !window.confirm('Phát hành đề thi? Sau khi phát hành không thể thêm/xoá mã đề hay mở lại đề.')) {
       return;
     }
     if (targetStatus === 'ARCHIVED' && !window.confirm('Lưu trữ đề thi này?')) {
@@ -171,23 +203,42 @@ function ExamBuilderPage() {
           </nav>
 
           <div className="builder-content card">
-            <LifecycleBar
-              exam={exam}
-              status={statusValue}
-              onStatusChange={handleStatusChange}
-            />
-            {locked && (
+            {viewOnly ? (
               <p className="locked-note">
-                Đề thi đã {statusValue === 'ARCHIVED' ? 'lưu trữ' : 'chốt'}; thông tin, ma trận và danh sách câu hỏi đang được khóa.
+                Đề thi được chia sẻ cho bạn ở chế độ chỉ xem ({EXAM_STATUS_LABEL[statusValue] || statusValue}).
               </p>
+            ) : (
+              <LifecycleBar
+                exam={exam}
+                status={statusValue}
+                onStatusChange={handleStatusChange}
+                onReopen={handleReopen}
+              />
+            )}
+            {!viewOnly && isExamLocked(exam) && (
+              <p className="locked-note">
+                Đề thi đã {LOCKED_NOTE[statusValue]}; thông tin, ma trận và danh sách câu hỏi đang được khóa.
+              </p>
+            )}
+            {exam.item_flags?.length > 0 && (
+              <div className="exam-error">
+                <b>Có {exam.item_flags.length} câu hỏi bị gắn cờ, cần thay hoặc bỏ trước khi chốt đề:</b>
+                <ul>
+                  {exam.item_flags.map((item) => (
+                    <li key={item.question_id}>
+                      {item.question_code || item.question_id}: {item.flags.map((flag) => ITEM_FLAG_LABEL[flag] || flag).join(', ')}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
             {step === 'info' && <InfoStep exam={exam} onSaved={setExam} readOnly={locked} />}
             {step === 'header' && <HeaderStep exam={exam} onSaved={setExam} readOnly={locked} />}
             {step === 'matrix' && <MatrixStep exam={exam} chapters={chapters} onSaved={setExam} readOnly={locked} />}
             {step === 'questions' && <QuestionsStep exam={exam} chapters={chapters} onSaved={setExam} readOnly={locked} />}
-            {step === 'variants' && <VariantsStep exam={exam} />}
+            {step === 'variants' && <VariantsStep exam={exam} onSaved={setExam} />}
             {step === 'preview' && <PreviewStep exam={exam} />}
-            {step === 'export' && <ExportStep exam={exam} />}
+            {step === 'export' && <ExportStep exam={exam} onSaved={setExam} />}
           </div>
         </div>
       </section>
@@ -195,13 +246,15 @@ function ExamBuilderPage() {
   );
 }
 
-function LifecycleBar({ exam, status, onStatusChange }) {
+function LifecycleBar({ exam, status, onStatusChange, onReopen }) {
   const selectedCount = exam.questions?.length || 0;
   const target = Number(exam.question_count) || 0;
   const hasExactQuestionCount = selectedCount === target;
-  const canReady = status === 'DRAFT' && hasExactQuestionCount;
-  const canFinalize = status === 'READY' && hasExactQuestionCount;
-  const canArchive = status === 'FINALIZED';
+  const hasFlags = (exam.item_flags?.length || 0) > 0;
+  const canReady = status === 'DRAFT' && hasExactQuestionCount && !hasFlags;
+  const canFinalize = status === 'READY' && hasExactQuestionCount && !hasFlags;
+  const canArchive = status === 'FINALIZED' || status === 'PUBLISHED';
+  const variantCount = Number(exam.variant_count) || 0;
   const diffMessage = !hasExactQuestionCount
     ? (selectedCount < target
       ? `Còn thiếu ${target - selectedCount} câu để chuyển sẵn sàng hoặc chốt đề.`
@@ -233,6 +286,28 @@ function LifecycleBar({ exam, status, onStatusChange }) {
         {status === 'READY' && (
           <button type="button" className="btn btn--primary" disabled={!canFinalize} onClick={() => onStatusChange('FINALIZED')}>
             Chốt đề
+          </button>
+        )}
+        {status === 'FINALIZED' && (
+          <button
+            type="button"
+            className="btn btn--outline"
+            disabled={variantCount > 0}
+            title={variantCount > 0 ? 'Đề đã có mã đề, hãy nhân bản đề thi để chỉnh sửa' : ''}
+            onClick={onReopen}
+          >
+            Mở lại đề
+          </button>
+        )}
+        {status === 'FINALIZED' && (
+          <button
+            type="button"
+            className="btn btn--primary"
+            disabled={variantCount < 1}
+            title={variantCount < 1 ? 'Cần tạo ít nhất một mã đề trước khi phát hành' : ''}
+            onClick={() => onStatusChange('PUBLISHED')}
+          >
+            Phát hành
           </button>
         )}
         {canArchive && (
@@ -610,6 +685,9 @@ function QuestionsStep({ exam, chapters, onSaved, readOnly }) {
           <button type="button" className="btn btn--primary" onClick={handleAutoGenerate} disabled={busy || readOnly}>
             {busy ? 'Đang sinh đề...' : 'Tự sinh câu hỏi theo ma trận'}
           </button>
+          {exam.selection_seed != null && (
+            <small>Seed lần chọn gần nhất: {exam.selection_seed} (dùng lại để tái tạo cùng bộ câu).</small>
+          )}
         </div>
       )}
 
@@ -696,13 +774,18 @@ function QuestionsStep({ exam, chapters, onSaved, readOnly }) {
   );
 }
 
-function VariantsStep({ exam }) {
+function VariantsStep({ exam, onSaved }) {
   const [variants, setVariants] = useState([]);
   const [loading, setLoading] = useState(true);
   const [examCode, setExamCode] = useState('');
   const [shuffle, setShuffle] = useState(true);
   const [busy, setBusy] = useState(false);
-  const finalized = examStatus(exam) === 'FINALIZED';
+  const finalized = examStatus(exam) === 'FINALIZED' && exam.can_edit !== false;
+  const variantsFrozen = ['PUBLISHED', 'ARCHIVED'].includes(examStatus(exam))
+    || exam.can_edit === false
+    || Boolean(exam.official_exported_at);
+
+  const refreshExam = () => getExam(exam.id).then(onSaved).catch(() => {});
 
   const load = async () => {
     setLoading(true);
@@ -729,6 +812,7 @@ function VariantsStep({ exam }) {
       await createVariant(exam.id, examCode.trim(), shuffle);
       setExamCode('');
       await load();
+      await refreshExam();
     } catch (err) {
       alert('Tạo mã đề thất bại: ' + err.message);
     } finally {
@@ -742,6 +826,7 @@ function VariantsStep({ exam }) {
     try {
       await deleteVariant(exam.id, variantId);
       await load();
+      await refreshExam();
     } catch (err) {
       alert('Xoá mã đề thất bại: ' + err.message);
     } finally {
@@ -752,8 +837,11 @@ function VariantsStep({ exam }) {
   return (
     <div>
       <h3 className="step-title">Quản lý mã đề (tối đa 4 mã đề / kỳ thi)</h3>
-      {!finalized && (
+      {!finalized && !variantsFrozen && (
         <p className="locked-note">Cần chốt đề trước khi tạo mã đề để khóa snapshot câu hỏi.</p>
+      )}
+      {variantsFrozen && (
+        <p className="locked-note">Mã đề đã được khóa (đề đã phát hành, lưu trữ, đã xuất bản chính thức hoặc bạn chỉ có quyền xem).</p>
       )}
       {loading ? (
         <p className="empty-note">Đang tải...</p>
@@ -761,8 +849,11 @@ function VariantsStep({ exam }) {
         <div className="variant-list">
           {variants.map((variant) => (
             <div className="variant-item" key={variant.id}>
-              <span>Mã đề <b>{variant.exam_code}</b> — {(variant.questions || []).length} câu</span>
-              <button type="button" className="icon-btn icon-btn--danger" onClick={() => handleDelete(variant.id)} disabled={busy}>×</button>
+              <span>
+                Mã đề <b>{variant.exam_code}</b> — {(variant.questions || []).length} câu
+                {variant.shuffle_seed != null ? ` · seed ${variant.shuffle_seed}` : ''}
+              </span>
+              <button type="button" className="icon-btn icon-btn--danger" onClick={() => handleDelete(variant.id)} disabled={busy || variantsFrozen}>×</button>
             </div>
           ))}
           {variants.length === 0 && <p className="empty-note">Chưa có mã đề nào.</p>}
@@ -844,9 +935,13 @@ function PreviewStep({ exam }) {
   );
 }
 
-function ExportStep({ exam }) {
+function ExportStep({ exam, onSaved }) {
   const [variants, setVariants] = useState([]);
   const [busy, setBusy] = useState('');
+  const official = exam.can_export_official !== false;
+  const exportTypes = official
+    ? EXPORT_VARIANT_TYPES
+    : EXPORT_VARIANT_TYPES.filter((exportType) => exportType.value === 'de');
 
   useEffect(() => {
     listVariants(exam.id).then((result) => setVariants(result || [])).catch(() => {});
@@ -861,6 +956,9 @@ function ExportStep({ exam }) {
       } else {
         await downloadVariantPdf(exam.id, variantId, type);
       }
+      if (official && !exam.official_exported_at && onSaved) {
+        getExam(exam.id).then(onSaved).catch(() => {});
+      }
     } catch (err) {
       alert(`Xuất ${format.toUpperCase()} thất bại: ${err.message}`);
     } finally {
@@ -872,13 +970,18 @@ function ExportStep({ exam }) {
     <div>
       <h3 className="step-title">Xuất đề thi giấy</h3>
       <p className="empty-note">Bản PDF dùng khổ A4, lề in chuẩn, font serif hỗ trợ tiếng Việt và có số trang. Hãy kiểm tra bản PDF trước khi in chính thức.</p>
+      {official ? (
+        <p className="locked-note">Xuất file là xuất bản chính thức: sau lần xuất đầu tiên không thể xoá mã đề hay mở lại đề.</p>
+      ) : (
+        <p className="locked-note">Bạn chỉ có quyền xem: file xuất là bản xem trước có đóng dấu, không kèm đáp án.</p>
+      )}
       {variants.length === 0 && <p className="empty-note">Chưa có mã đề nào, hãy tạo mã đề ở bước trước.</p>}
       <div className="export-list">
         {variants.map((variant) => (
           <div className="export-item" key={variant.id}>
             <span>Mã đề <b>{variant.exam_code}</b></span>
             <div className="export-actions">
-              {EXPORT_VARIANT_TYPES.map((exportType) => (
+              {exportTypes.map((exportType) => (
                 <div className="export-action-group" key={exportType.value}>
                   <span>{exportType.label}</span>
                   <div>

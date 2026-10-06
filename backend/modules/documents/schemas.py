@@ -33,6 +33,7 @@ class DocumentUpdateRequest(BaseModel):
 
 class DocumentSharingRequest(BaseModel):
     owner_user_id: str | None = None
+    owner_transfer_reason: str | None = Field(None, max_length=500)
     shared_with_user_ids: list[str] = Field(default_factory=list, max_length=100)
     shared_scope: str = Field("PRIVATE", pattern="^(PRIVATE|SUBJECT)$")
 

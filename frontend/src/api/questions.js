@@ -133,16 +133,40 @@ export function updateQuestionSharing(id, payload) {
   return apiRequest(`/questions/${id}/sharing`, { method: 'PATCH', body: payload });
 }
 
+export function transferQuestionOwner(id, newOwnerUserId, reason) {
+  return apiRequest(`/questions/${id}/transfer-owner`, {
+    method: 'POST',
+    body: { new_owner_user_id: newOwnerUserId, reason },
+  });
+}
+
 export function listQuestionVersions(id) {
   return apiRequest(`/questions/${id}/versions`);
 }
 
-export function submitQuestionForReview(id) {
-  return apiRequest(`/questions/${id}/submit-review`, { method: 'POST' });
+export function submitQuestionForReview(id, responseNote = '') {
+  return apiRequest(`/questions/${id}/submit-review`, {
+    method: 'POST',
+    ...(responseNote ? { body: { response_note: responseNote } } : {}),
+  });
 }
 
-export function deleteQuestion(id) {
-  return apiRequest(`/questions/${id}`, { method: 'DELETE' });
+export function deleteQuestion(id, reason = '') {
+  const query = reason ? `?reason=${encodeURIComponent(reason)}` : '';
+  return apiRequest(`/questions/${id}${query}`, { method: 'DELETE' });
+}
+
+export function listArchivedQuestions({ page = 1, pageSize = 20 } = {}) {
+  return apiRequest(`/questions/archived?page=${page}&page_size=${pageSize}`);
+}
+
+export function restoreQuestion(id) {
+  return apiRequest(`/questions/${id}/restore`, { method: 'POST' });
+}
+
+export function withdrawQuestionSubmission(id, expectedVersion) {
+  const query = expectedVersion ? `?expected_version=${expectedVersion}` : '';
+  return apiRequest(`/questions/${id}/withdraw${query}`, { method: 'POST' });
 }
 
 export function autoEvaluateQuestion(id, payload) {
@@ -151,6 +175,10 @@ export function autoEvaluateQuestion(id, payload) {
 
 export function listQuestionEvaluations(id) {
   return apiRequest(`/questions/${id}/evaluations`);
+}
+
+export function listReviewReasons() {
+  return apiRequest('/questions/review-reasons');
 }
 
 export function reviewQuestion(id, payload) {
@@ -169,8 +197,11 @@ export function deleteQuestionReviewDraft(id) {
   return apiRequest(`/questions/${id}/review-draft`, { method: 'DELETE' });
 }
 
-export function claimQuestionReview(id) {
-  return apiRequest(`/questions/${id}/review-assignment/claim`, { method: 'POST' });
+export function claimQuestionReview(id, reason = '') {
+  return apiRequest(`/questions/${id}/review-assignment/claim`, {
+    method: 'POST',
+    ...(reason ? { body: { reason } } : {}),
+  });
 }
 
 export function releaseQuestionReview(id) {

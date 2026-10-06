@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from docx import Document
@@ -143,10 +142,7 @@ def test_pdf_parser_routes_only_risky_pages_to_docling_and_keeps_good_text(tmp_p
             },
         }
 
-    with (
-        patch("modules.documents.ingest.parsers.pdf.PdfReader", return_value=_FakeReader(pages)),
-        patch("modules.documents.ingest.parsers.pdf.settings", SimpleNamespace(pdf_ocr_engine="docling")),
-    ):
+    with patch("modules.documents.ingest.parsers.pdf.PdfReader", return_value=_FakeReader(pages)):
         parsed = PdfParser(ocr_page_extractor=extract).parse(source, _context(source.name, "pdf"))
 
     assert calls == [[2, 3]]
@@ -195,6 +191,36 @@ def test_pdf_parser_accepts_short_clean_text_page_without_unnecessary_ocr(tmp_pa
 def test_pdf_table_signature_recognizes_repeated_two_column_layout_rows():
     layout = "Thao tác                    Thời gian\n\nPush                        O(1)\n\nPop                         O(1)"
     assert _has_table_signature(layout)
+
+
+def test_postgres_restore_keeps_content_hash_ingest_ids_as_strings():
+    from bson import ObjectId
+
+    from db.bson_json import restore
+
+    hash_id = "253d81e41f8df6c5b9ab0e6a"
+    restored = restore({
+        "document_id": hash_id,
+        "asset_ids": [hash_id],
+        "content_blocks": [{"block_id": hash_id, "asset_ids": [hash_id]}],
+        "assets": [{"asset_id": hash_id}],
+    })
+    assert isinstance(restored["document_id"], ObjectId)
+    assert restored["asset_ids"] == [hash_id]
+    assert restored["content_blocks"][0] == {"block_id": hash_id, "asset_ids": [hash_id]}
+    assert restored["assets"][0]["asset_id"] == hash_id
+
+
+def test_pdf_table_signature_ignores_padded_prose_headers_and_code():
+    padded_prose = (
+        "Cấu trúc dữ                                                   ĐẠI HỌC\n"
+        "hết các bài toán là không đơn gi          ản, không rõ ràng. Để\n"
+        "nào  đó  để thể hiện mối liên quan giữa các lố                 i giải\n"
+        "         1.                   Mụ                     c đích yêu cầu"
+    )
+    numbered_code = "/*4*/   đánh dấu v đã được tô màu;\n/*5*/   thêm v vào Newclr;\n/*6*/   found=1;"
+    assert not _has_table_signature(padded_prose)
+    assert not _has_table_signature(numbered_code)
 
 
 def test_pdf_aligned_table_header_is_not_misclassified_as_heading():

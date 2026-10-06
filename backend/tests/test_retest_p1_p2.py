@@ -56,6 +56,8 @@ def test_upload_invalid_chapter_returns_client_error(monkeypatch):
         raise ValueError("Chương không thuộc học phần đã chọn")
 
     monkeypatch.setattr(ocr_module, "create_document_record", reject_document)
+    monkeypatch.setattr(ocr_module, "ensure_document_subjects_usable", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ocr_module, "find_duplicate_upload", lambda *_args: None)
     upload = UploadFile(file=BytesIO(b"lesson"), filename="lesson.txt")
     user = SimpleNamespace(id=ObjectId())
 
@@ -67,6 +69,29 @@ def test_upload_invalid_chapter_returns_client_error(monkeypatch):
 
     assert error.value.status_code == 400
     assert "Chương" in error.value.detail
+    assert upload.file.closed
+
+
+def test_upload_outside_teaching_subjects_is_forbidden(monkeypatch):
+    from modules.users.store import SubjectMembershipError
+
+    def not_teaching(*_args, **_kwargs):
+        raise SubjectMembershipError("Bạn không được phân công học phần này")
+
+    def must_not_create(**_kwargs):
+        raise AssertionError("document must not be created")
+
+    monkeypatch.setattr(ocr_module, "ensure_document_subjects_usable", not_teaching)
+    monkeypatch.setattr(ocr_module, "create_document_record", must_not_create)
+    upload = UploadFile(file=BytesIO(b"lesson"), filename="lesson.txt")
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(ocr_module.queue_document_upload(
+            BackgroundTasks(), upload, SimpleNamespace(id=ObjectId(), role="Teacher"),
+            subject_id=str(ObjectId()),
+        ))
+
+    assert error.value.status_code == 403
     assert upload.file.closed
 
 

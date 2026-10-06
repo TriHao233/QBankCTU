@@ -5,10 +5,10 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faChevronDown, faLayerGroup, faUpload, faWandMagicSparkles, faMicrochip, faRobot, faRotateRight, faBookOpen, faArrowRight, faPlus, faPen, faPaperPlane, faTrashCan, faFloppyDisk, faXmark } from '@fortawesome/free-solid-svg-icons';
 import { chunkDocument } from '../api/chunk';
 import { listAvailableAiModels, listSubjects } from '../api/catalog';
-import { listDocuments } from '../api/documents';
+import { getDocument, listDocuments } from '../api/documents';
 import { enqueueGenerateQuestions, getGenerateStatus, streamGenerateStatus, cancelGenerateJob } from '../api/generate';
 import { getOcrStatus, uploadSourceDocument } from '../api/ocr';
-import { createQuestion, deleteQuestion, submitQuestionForReview, updateQuestion } from '../api/questions';
+import { deleteQuestion, submitQuestionForReview, updateQuestion } from '../api/questions';
 import { deleteGenerationPreset, listGenerationPresets, saveGenerationPreset } from '../api/users';
 import {
   BLOOM_LEVELS,
@@ -23,6 +23,7 @@ import {
   toBackendQuestionType,
 } from '../constants/generationEnums';
 import { pollJob, watchJob } from '../hooks/useJobPoll';
+import { expandDistribution } from '../utils/generationDistribution';
 import { buildGenerationRequest } from '../utils/generationRequest';
 import { modelPresentation } from '../utils/modelPresentation';
 import { formatChoices, mapGeneratedQuestions } from '../utils/mapGeneratedQuestion';
@@ -49,7 +50,16 @@ const PHASE_LABELS = {
   failed: 'Thất bại',
 };
 
-const MAX_TOTAL_QUESTIONS = 7;
+const JOB_OUTCOME_LABEL = {
+  SUCCEEDED: 'Hoàn tất',
+  PARTIAL: 'Hoàn tất một phần',
+  CANCELLED: 'Đã hủy',
+  FAILED: 'Thất bại',
+  DEAD_LETTER: 'Hết lượt thử lại',
+};
+
+const MAX_TOTAL_QUESTIONS = 50;
+const MAX_PLAN_ITEMS = 21;
 const DRAFTS_PER_PAGE = 3;
 const SUPPORTED_SOURCE_EXTENSIONS = ['.pdf', '.doc', '.docx', '.md', '.markdown', '.txt'];
 const PRESET_STORAGE_KEY = 'qbank_generation_presets';
@@ -250,26 +260,7 @@ function canSubmitDraft(draft) {
   return SUBMITTABLE_REVIEW_STATUSES.has(String(draft.reviewStatus || 'DRAFT').toUpperCase());
 }
 
-function generatedDraftPayload(draft, fallbackDocumentId) {
-  return {
-    content: draft.text.trim(),
-    question_type: draft.questionType,
-    bloom_level: Number.parseInt(String(draft.bloomLevel || ''), 10) || null,
-    difficulty: draft.difficulty || null,
-    question_data: {
-      options: draft.rawOptions ?? null,
-      correct_answer: draft.correctAnswer,
-      explanation: draft.explanation,
-      model_source_context: draft.sourceContext,
-      source_keywords: draft.sourceKeywords || [],
-      false_mutation: draft.falseMutation || null,
-      validation_warnings: draft.validationWarnings || [],
-    },
-    document_id: draft.documentId || fallbackDocumentId || null,
-    source_chunk_ids: draft.sourceChunkIds || [],
-    clo_ids: draft.cloIds || [],
-  };
-}
+const UNSAVED_DRAFT_MESSAGE = 'Câu hỏi này chưa được lưu trên máy chủ. Hãy sinh lại câu hỏi.';
 
 function GeneratePage() {
   const abortRef = useRef(null);
@@ -298,6 +289,16 @@ function GeneratePage() {
   const [presetError, setPresetError] = useState('');
   const [teacherInstruction, setTeacherInstruction] = useState('');
   const [targetHeading, setTargetHeading] = useState('');
+  const [targetCloIds, setTargetCloIds] = useState([]);
+  const [extraDocumentIds, setExtraDocumentIds] = useState([]);
+  const [ratioPanelOpen, setRatioPanelOpen] = useState(false);
+  const [ratioDraft, setRatioDraft] = useState({
+    total: 10,
+    questionTypeIds: ['mcq'],
+    bloomRatios: { remember: 30, understand: 40, apply: 30 },
+    difficultyRatios: { de: 30, trung_binh: 50, kho: 20 },
+  });
+  const [ratioError, setRatioError] = useState('');
   const [availableModels, setAvailableModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState('');
@@ -308,6 +309,7 @@ function GeneratePage() {
   const [generationInfo, setGenerationInfo] = useState(null);
   const [drafts, setDrafts] = useState([]);
   const [generationSummary, setGenerationSummary] = useState([]);
+  const [contextWarnings, setContextWarnings] = useState([]);
   const [timings, setTimings] = useState({});
   const [chunkReady, setChunkReady] = useState(false);
   const [presetSectionOpen, setPresetSectionOpen] = useState(false);
@@ -336,6 +338,17 @@ function GeneratePage() {
   const selectedDocumentSubjectName = selectedDocument
     ? subjects.find((item) => (item.id || item._id) === selectedDocument.subject_id)?.subject_name
     : null;
+  const generationSubjectId = sourceMode === 'existing' ? selectedDocument?.subject_id : selectedSubjectId;
+  const generationSubject = subjects.find((item) => (item.id || item._id) === generationSubjectId);
+  const subjectLearningOutcomes = (generationSubject?.learning_outcomes || [])
+    .filter((item) => item.is_active !== false && (item.id || item._id));
+  const sameSubjectDocuments = generationSubjectId
+    ? documents.filter((item) => (
+      item.subject_id === generationSubjectId
+      && item.id !== (documentId || selectedDocumentId)
+      && isDocumentIndexed(item)
+    ))
+    : [];
   const selectedModel = availableModels.find((model) => model.code === selectedModelCode);
   const modelDisplay = modelPresentation(selectedModel);
   const modelIcon = modelDisplay.family === 'gemini' ? faWandMagicSparkles
@@ -423,11 +436,13 @@ function GeneratePage() {
       }
       setDrafts(mapGeneratedQuestions(result.data));
       setGenerationSummary(result.summary || []);
+      setContextWarnings(result.warnings || []);
       setGenerationInfo({
         jobId: saved.jobId,
         documentId: saved.documentId,
         requestedCount: saved.requestedCount,
         generatedCount: result.data.length,
+        outcome: result.outcome,
         createdAt: result.created_at,
         updatedAt: result.updated_at,
         metrics: result.metrics,
@@ -592,6 +607,26 @@ function GeneratePage() {
 
   const addPlanItem = () => {
     setPlanItems((current) => [...current, createPlanItem()]);
+  };
+
+  const toggleListValue = (setter, value) => {
+    setter((current) => (current.includes(value)
+      ? current.filter((item) => item !== value)
+      : [...current, value]));
+  };
+
+  const applyRatioDistribution = () => {
+    try {
+      const rows = expandDistribution({ ...ratioDraft, total: normalizeCount(ratioDraft.total) });
+      if (rows.length > MAX_PLAN_ITEMS) {
+        throw new Error(`Phân bố tạo quá ${MAX_PLAN_ITEMS} dòng; hãy giảm số dạng câu hoặc mức tỷ lệ.`);
+      }
+      setPlanItems(rows.map((row) => createPlanItem(row)));
+      setRatioError('');
+      setRatioPanelOpen(false);
+    } catch (err) {
+      setRatioError(err.message);
+    }
   };
 
   const removePlanItem = (itemId) => {
@@ -801,29 +836,16 @@ function GeneratePage() {
       return;
     }
     setSubmittingDraftId(draft.id);
-    let createdQuestion = null;
     try {
-      const questionId = draft.persistedId;
-      if (!questionId) {
-        const validationError = validateDraftBeforeSave(draft);
-        if (!draft.text.trim() || validationError) {
-          throw new Error(validationError || 'Nội dung câu hỏi không được để trống.');
-        }
-        createdQuestion = await createQuestion(generatedDraftPayload(draft, generationInfo?.documentId || documentId));
+      if (!draft.persistedId) {
+        throw new Error(UNSAVED_DRAFT_MESSAGE);
       }
-      const updatedQuestion = await submitQuestionForReview(questionId || createdQuestion.id);
+      const updatedQuestion = await submitQuestionForReview(draft.persistedId);
       setDrafts((current) => current.map((item) => (
         item.id === draft.id ? mergeUpdatedDraft(item, updatedQuestion) : item
       )));
       setStatusDetail(`Đã gửi ${draft.questionCode || 'câu hỏi nháp'} sang hàng đợi duyệt`);
     } catch (err) {
-      if (createdQuestion?.id) {
-        try {
-          await deleteQuestion(createdQuestion.id);
-        } catch {
-          // Best-effort cleanup: preserve the original submission error.
-        }
-      }
       alert(`Gửi duyệt thất bại: ${err.message}`);
     } finally {
       setSubmittingDraftId(null);
@@ -844,24 +866,16 @@ function GeneratePage() {
       // nhưng KHÔNG dừng ở lỗi đầu — thu lỗi từng câu để báo cáo cuối.
       for (const draft of targets) {
         setSubmittingDraftId(draft.id);
-        let createdQuestion = null;
         try {
           if (!draft.persistedId) {
-            createdQuestion = await createQuestion(generatedDraftPayload(draft, generationInfo?.documentId || documentId));
+            throw new Error(UNSAVED_DRAFT_MESSAGE);
           }
-          const updatedQuestion = await submitQuestionForReview(draft.persistedId || createdQuestion.id);
+          const updatedQuestion = await submitQuestionForReview(draft.persistedId);
           setDrafts((current) => current.map((item) => (
             item.id === draft.id ? mergeUpdatedDraft(item, updatedQuestion) : item
           )));
           successCount += 1;
         } catch (error) {
-          if (createdQuestion?.id) {
-            try {
-              await deleteQuestion(createdQuestion.id);
-            } catch {
-              // Best-effort cleanup: giữ lỗi gốc ở dưới.
-            }
-          }
           failures.push({
             label: draft.questionCode || draft.id,
             message: error?.message || 'Lỗi không rõ',
@@ -1000,6 +1014,7 @@ function GeneratePage() {
     setStatusDetail('');
     setDrafts([]);
     setGenerationSummary([]);
+    setContextWarnings([]);
     setEditingDraftId(null);
     setDraftEditSnapshot(null);
     setSavingDraftId(null);
@@ -1026,6 +1041,7 @@ function GeneratePage() {
     setChunkReady(Boolean(nextDocument && isDocumentIndexed(nextDocument)));
     setDrafts([]);
     setGenerationSummary([]);
+    setContextWarnings([]);
     setEditingDraftId(null);
     setDraftEditSnapshot(null);
     setSavingDraftId(null);
@@ -1064,7 +1080,26 @@ function GeneratePage() {
     }
     markTiming('ocrMs', ocrStartedAt);
 
-    return docId;
+    return { docId, autoChunk: Boolean(ocrResult.auto_chunk) };
+  };
+
+  const waitForAutoChunk = async (docId, signal) => {
+    setPhase('chunking');
+    setStatusDetail('Đang tự động chunk và lưu vector...');
+    const chunkStartedAt = nowMs();
+    const result = await pollJob(async (id) => {
+      const document = await getDocument(id);
+      const pipeline = documentPipeline(document);
+      if (normalizeStatus(pipeline.chunk_status) === 'FAILED' || normalizeStatus(pipeline.index_status) === 'FAILED') {
+        return { status: 'failed' };
+      }
+      return { status: isDocumentIndexed(document) ? 'completed' : 'processing' };
+    }, docId, { signal, timeoutMs: 30 * 60 * 1000 });
+    if (result.status !== 'completed') {
+      throw new Error('Chunk tự động thất bại. Hãy thử lại từ trang quản lý tài liệu.');
+    }
+    markTiming('chunkMs', chunkStartedAt);
+    setChunkReady(true);
   };
 
   const runChunk = async (docId) => {
@@ -1083,6 +1118,8 @@ function GeneratePage() {
 
     const payload = buildGenerationRequest({
       documentId: docId,
+      extraDocumentIds: extraDocumentIds.filter((id) => sameSubjectDocuments.some((item) => item.id === id)),
+      targetCloIds: targetCloIds.filter((id) => subjectLearningOutcomes.some((item) => (item.id || item._id) === id)),
       questionPlan,
       teacherInstruction,
       targetHeading,
@@ -1121,6 +1158,9 @@ function GeneratePage() {
         if (Array.isArray(progress?.summary)) {
           setGenerationSummary(progress.summary);
         }
+        if (Array.isArray(progress?.warnings)) {
+          setContextWarnings(progress.warnings);
+        }
         const progressLabel = progress?.total
           ? ` (${progress.completed || 0}/${progress.total})`
           : '';
@@ -1140,7 +1180,8 @@ function GeneratePage() {
       : streamedResult;
 
     if (genResult.status === 'failed' || genResult.status === 'cancelled') {
-      throw new Error(genResult.error_message || 'Sinh câu hỏi thất bại');
+      const prefix = genResult.outcome === 'DEAD_LETTER' ? 'Đã hết số lần thử lại. ' : '';
+      throw new Error(prefix + (genResult.error_message || 'Sinh câu hỏi thất bại'));
     }
     if (genResult.status !== 'completed' || !Array.isArray(genResult.data) || genResult.data.length === 0) {
       throw new Error(`Job ${genJobId} báo hoàn tất nhưng không trả về câu hỏi. Vui lòng kiểm tra trạng thái job trên server.`);
@@ -1150,6 +1191,7 @@ function GeneratePage() {
     setEditingDraftId(null);
     setDraftEditSnapshot(null);
     setGenerationSummary(genResult.summary || []);
+    setContextWarnings(genResult.warnings || []);
     setDrafts(mapGeneratedQuestions(genResult.data || []));
     setDraftPage(0);
     setGenerationInfo({
@@ -1157,6 +1199,7 @@ function GeneratePage() {
       documentId: docId,
       requestedCount: totalQuestions,
       generatedCount: (genResult.data || []).length,
+      outcome: genResult.outcome,
       createdAt: genResult.created_at,
       updatedAt: genResult.updated_at,
       metrics: genResult.metrics,
@@ -1189,6 +1232,7 @@ function GeneratePage() {
     if (!fromGenerateOnly) {
       setDrafts([]);
       setGenerationSummary([]);
+      setContextWarnings([]);
       setGenerationInfo(null);
       resetTimings();
       setEditingDraftId(null);
@@ -1210,8 +1254,13 @@ function GeneratePage() {
           throw new Error('Tài liệu chưa sẵn sàng để sinh câu hỏi lại');
         }
       } else if (sourceMode === 'upload') {
-        docId = await runOcrPipeline(file, signal);
-        await runChunk(docId);
+        const uploaded = await runOcrPipeline(file, signal);
+        docId = uploaded.docId;
+        if (uploaded.autoChunk) {
+          await waitForAutoChunk(docId, signal);
+        } else {
+          await runChunk(docId);
+        }
         await fetchReusableDocuments();
       } else {
         if (!selectedDocument) {
@@ -1307,6 +1356,7 @@ function GeneratePage() {
     resetTimings();
     setDrafts([]);
     setGenerationSummary([]);
+    setContextWarnings([]);
     setEditingDraftId(null);
     setDraftEditSnapshot(null);
     setSavingDraftId(null);
@@ -1381,6 +1431,7 @@ function GeneratePage() {
                   )}
                   {phase === 'completed' && generationInfo && (
                     <span className="job-badge">
+                      {JOB_OUTCOME_LABEL[generationInfo.outcome] ? `${JOB_OUTCOME_LABEL[generationInfo.outcome]} · ` : ''}
                       {generationInfo.generatedCount}/{generationInfo.requestedCount} câu
                       {generationInfo.updatedAt ? ` · ${formatDateTime(generationInfo.updatedAt)}` : ''}
                     </span>
@@ -1449,6 +1500,7 @@ function GeneratePage() {
                       setDocumentId(null);
                       setDrafts([]);
                       setGenerationSummary([]);
+                      setContextWarnings([]);
                       setEditingDraftId(null);
                       setDraftEditSnapshot(null);
                       setSubmittingDraftId(null);
@@ -1629,7 +1681,88 @@ function GeneratePage() {
             <div className="field-group">
               <div className="field-label-row">
                 <label className="field-label">Ma trận sinh câu hỏi</label>
+                <button
+                  type="button"
+                  className="btn btn--secondary btn--sm"
+                  disabled={isBusy}
+                  onClick={() => setRatioPanelOpen((open) => !open)}
+                >
+                  Phân bố theo tỷ lệ
+                </button>
               </div>
+              {ratioPanelOpen && (
+                <div className="ratio-panel">
+                  <label className="plan-field plan-field--count">
+                    <span>Tổng số câu</span>
+                    <input
+                      className="field-input"
+                      type="number"
+                      min="1"
+                      max={MAX_TOTAL_QUESTIONS}
+                      value={ratioDraft.total}
+                      onChange={(e) => setRatioDraft((draft) => ({ ...draft, total: e.target.value }))}
+                    />
+                  </label>
+                  <div className="ratio-group">
+                    <span>Dạng câu hỏi</span>
+                    {QUESTION_TYPES.map((type) => (
+                      <label key={type.id} className="ratio-check">
+                        <input
+                          type="checkbox"
+                          checked={ratioDraft.questionTypeIds.includes(type.id)}
+                          onChange={() => setRatioDraft((draft) => ({
+                            ...draft,
+                            questionTypeIds: draft.questionTypeIds.includes(type.id)
+                              ? draft.questionTypeIds.filter((id) => id !== type.id)
+                              : [...draft.questionTypeIds, type.id],
+                          }))}
+                        />
+                        {type.label}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="ratio-group">
+                    <span>Tỷ lệ Bloom (%)</span>
+                    {BLOOM_LEVELS.map((bloom) => (
+                      <label key={bloom.id} className="ratio-input">
+                        {bloom.label}
+                        <input
+                          className="field-input"
+                          type="number"
+                          min="0"
+                          value={ratioDraft.bloomRatios[bloom.id] ?? ''}
+                          onChange={(e) => setRatioDraft((draft) => ({
+                            ...draft,
+                            bloomRatios: { ...draft.bloomRatios, [bloom.id]: Number(e.target.value) || 0 },
+                          }))}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <div className="ratio-group">
+                    <span>Tỷ lệ độ khó (%)</span>
+                    {DIFFICULTIES.map((difficulty) => (
+                      <label key={difficulty.id} className="ratio-input">
+                        {difficulty.label}
+                        <input
+                          className="field-input"
+                          type="number"
+                          min="0"
+                          value={ratioDraft.difficultyRatios[difficulty.id] ?? ''}
+                          onChange={(e) => setRatioDraft((draft) => ({
+                            ...draft,
+                            difficultyRatios: { ...draft.difficultyRatios, [difficulty.id]: Number(e.target.value) || 0 },
+                          }))}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  {ratioError && <p className="source-note source-note--error">{ratioError}</p>}
+                  <button type="button" className="btn btn--primary btn--sm" onClick={applyRatioDistribution}>
+                    Tách thành ma trận
+                  </button>
+                </div>
+              )}
               <div className="plan-builder-list">
                 {planItems.map((item, index) => {
                   const count = normalizeCount(item.count);
@@ -1737,7 +1870,7 @@ function GeneratePage() {
               <button
                 type="button"
                 className="btn btn--secondary plan-add-btn"
-                disabled={isBusy || totalQuestions >= MAX_TOTAL_QUESTIONS}
+                disabled={isBusy || totalQuestions >= MAX_TOTAL_QUESTIONS || planItems.length >= MAX_PLAN_ITEMS}
                 onClick={addPlanItem}
               >
                 <FontAwesomeIcon icon={faPlus} aria-hidden="true" /> Thêm dòng
@@ -1779,6 +1912,49 @@ function GeneratePage() {
                 {modelsError || selectedModel?.description || 'Giữ lựa chọn mặc định nếu bạn không chắc.'}
               </p>
             </div>
+
+            {subjectLearningOutcomes.length > 0 && (
+              <div className="field-group">
+                <label className="field-label">CLO cần đánh giá</label>
+                <div className="ratio-group">
+                  {subjectLearningOutcomes.map((clo) => {
+                    const cloId = clo.id || clo._id;
+                    return (
+                      <label key={cloId} className="ratio-check" title={clo.description}>
+                        <input
+                          type="checkbox"
+                          disabled={isBusy}
+                          checked={targetCloIds.includes(cloId)}
+                          onChange={() => toggleListValue(setTargetCloIds, cloId)}
+                        />
+                        {clo.clo_code}
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="source-note">Bỏ trống để hệ thống tự gắn CLO phù hợp nhất.</p>
+              </div>
+            )}
+
+            {sameSubjectDocuments.length > 0 && (
+              <div className="field-group">
+                <label className="field-label">Tài liệu bổ sung cùng học phần</label>
+                <div className="ratio-group">
+                  {sameSubjectDocuments.map((item) => (
+                    <label key={item.id} className="ratio-check">
+                      <input
+                        type="checkbox"
+                        disabled={isBusy || (!extraDocumentIds.includes(item.id) && extraDocumentIds.length >= 4)}
+                        checked={extraDocumentIds.includes(item.id)}
+                        onChange={() => toggleListValue(setExtraDocumentIds, item.id)}
+                      />
+                      {item.title || item.original_filename}
+                    </label>
+                  ))}
+                </div>
+                <p className="source-note">Tối đa 4 tài liệu; các lượt sinh được chia luân phiên giữa các tài liệu.</p>
+              </div>
+            )}
 
             <div className="field-group">
               <label className="field-label">Chương hoặc mục cần tập trung</label>
@@ -1866,6 +2042,16 @@ function GeneratePage() {
               </div>
             </div>
 
+            {contextWarnings.length > 0 && (
+              <div className="gen-summary-list gen-summary-list--warning" role="status">
+                {contextWarnings.map((warning) => (
+                  <div className="gen-summary-item" key={warning}>
+                    <strong>Ngữ cảnh</strong>
+                    <span>{warning}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             {generationSummary.length > 0 && (
               <div className={`gen-summary-list ${generationShortfalls.length ? 'gen-summary-list--warning' : ''}`}>
                 {generationSummary.map((item) => (

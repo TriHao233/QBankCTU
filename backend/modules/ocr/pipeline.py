@@ -10,7 +10,6 @@ from time import perf_counter
 from typing import Any
 
 from core.config import settings
-from core.gpu_coordination import gpu_operation
 from modules.documents.ingest import ParseContext, build_default_registry
 from modules.documents.ingest.quality import validate_parsed_document
 from modules.ocr.pdf_text_extractor import extract_pdf_text_layer
@@ -177,9 +176,8 @@ def run_document_pipeline(
     logger.info("Starting structured extraction: %s (%s)", title, document_type)
     registry = build_default_registry(pdf_ocr_enabled=pdf_ocr_enabled)
     parser = registry.resolve(path, resolved_mime)
-    with gpu_operation("ocr"):
-        parsed = parser.parse(path, context)
-    report = validate_parsed_document(parsed)
+    parsed = parser.parse(path, context)
+    report = validate_parsed_document(parsed, min_text_unit_ratio=settings.document_min_text_unit_ratio)
     if not report.passed:
         raise DocumentQualityError(report.to_dict())
 

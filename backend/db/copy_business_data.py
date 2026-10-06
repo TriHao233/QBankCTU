@@ -38,7 +38,8 @@ SOURCE_ORDER = (
 )
 JSON_COLUMNS = {
     "permissions", "permission_grants", "permission_revokes",
-    "review_subject_ids", "profile", "generation_presets", "task_calendar", "payload",
+    "review_subject_ids", "teaching_subject_ids", "profile", "generation_presets", "task_calendar",
+    "payload",
     "capabilities", "parameters", "weights", "thresholds", "assignment",
     "question_data", "classification", "clos", "sources", "request", "changes",
     "model_snapshot", "prompt_snapshot", "retrieval_snapshot", "result",
@@ -99,6 +100,7 @@ def projected_rows(name: str, item: dict):
             permission_grants=data.get("permission_grants") or [],
             permission_revokes=data.get("permission_revokes") or [],
             review_subject_ids=data.get("review_subject_ids") or [],
+            teaching_subject_ids=data.get("teaching_subject_ids") or [],
             profile=data.get("profile") or {},
             generation_presets=data.get("generation_presets") or [],
             task_calendar=data.get("task_calendar") or [],

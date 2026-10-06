@@ -53,3 +53,7 @@ export function updateDocumentSharing(id, payload) {
 export function deleteDocument(id) {
   return apiRequest(`/documents/${id}`, { method: 'DELETE' });
 }
+
+export function restoreDocument(id) {
+  return apiRequest(`/documents/${id}/restore`, { method: 'POST' });
+}

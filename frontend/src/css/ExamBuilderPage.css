@@ -62,6 +62,7 @@
 .exam-builder-page .exam-status-pill--draft { background: #EAF4FF; color: var(--primary, #0c78d4); }
 .exam-builder-page .exam-status-pill--ready { background: #FFF4E0; color: #B36500; }
 .exam-builder-page .exam-status-pill--finalized { background: #E8FFF0; color: #16A34A; }
+.exam-builder-page .exam-status-pill--published { background: #EEE8FF; color: #6D28D9; }
 .exam-builder-page .exam-status-pill--archived { background: #F3F6FA; color: #5c6f89; }
 .exam-builder-page .locked-note {
   border: 1px solid #EAF3FC;

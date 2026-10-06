@@ -88,8 +88,12 @@ export async function apiRequest(
     const fallbackMessage = [502, 503, 504].includes(response.status)
       ? "Không thể kết nối máy chủ. Vui lòng thử lại."
       : "Yêu cầu API thất bại";
+    const detail = payload?.detail;
+    const detailMessage = detail && typeof detail === "object" && !Array.isArray(detail)
+      ? detail.message
+      : detail;
     throw new ApiError(
-      payload?.detail || payload?.message || fallbackMessage,
+      detailMessage || payload?.message || fallbackMessage,
       response.status,
       payload,
     );

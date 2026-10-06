@@ -7,6 +7,7 @@ import {
   faFileLines,
   faMagnifyingGlass,
   faPen,
+  faRotateLeft,
   faTrashCan,
   faUpload,
   faXmark,
@@ -16,6 +17,7 @@ import {
   listDocumentPages,
   listDocuments,
   reindexDocument,
+  restoreDocument,
   updateDocument,
 } from '../api/documents';
 import { listSubjects } from '../api/catalog';
@@ -29,6 +31,7 @@ const STATUS_OPTIONS = [
   ['PROCESSING', 'Đang xử lý'],
   ['UPLOADED', 'Đã tải lên'],
   ['FAILED', 'Xử lý lỗi'],
+  ['ARCHIVED', 'Đã lưu trữ'],
 ];
 const STATUS_LABELS = Object.fromEntries(STATUS_OPTIONS.slice(1));
 
@@ -145,14 +148,29 @@ function DocumentManagePage() {
   };
 
   const removeDocument = async (document) => {
-    if (!window.confirm(`Xóa tài liệu “${document.title}” khỏi danh sách sử dụng?`)) return;
+    if (!window.confirm(`Lưu trữ tài liệu “${document.title}”? Có thể khôi phục lại ở bộ lọc “Đã lưu trữ”.`)) return;
     setBusyId(document.id);
     try {
       await deleteDocument(document.id);
-      setNotice('Đã xóa tài liệu khỏi danh sách sử dụng.');
+      setNotice('Đã lưu trữ tài liệu; bản xử lý lại chưa kích hoạt (nếu có) đã bị hủy.');
       await loadDocuments();
     } catch (err) {
       setError(err.message || 'Không thể xóa tài liệu');
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const restore = async (document) => {
+    setBusyId(document.id);
+    try {
+      const restored = await restoreDocument(document.id);
+      setNotice(restored?.status === 'READY'
+        ? 'Đã khôi phục tài liệu về trạng thái sẵn sàng.'
+        : 'Đã khôi phục tài liệu; tài liệu chưa có chỉ mục nên cần xử lý lại.');
+      await loadDocuments();
+    } catch (err) {
+      setError(err.message || 'Không thể khôi phục tài liệu');
     } finally {
       setBusyId('');
     }
@@ -248,12 +266,23 @@ function DocumentManagePage() {
                   <span key={idOf(subject)}><FontAwesomeIcon icon={faBook} /> {subject.subject_name}</span>
                 )) : <em>Chưa gắn học phần</em>}
               </div>
+              {document.pipeline_summary?.auto_promotion?.status === 'FAILED' && (
+                <p className="document-original" title={document.pipeline_summary.auto_promotion.reason || ''}>
+                  Bản xử lý lại chưa được kích hoạt tự động; đang giữ bản cũ.
+                </p>
+              )}
+              {document.status === 'ARCHIVED' ? (
+                <div className="document-card-actions">
+                  <button type="button" disabled={!manageable || busyId === document.id} onClick={() => restore(document)}><FontAwesomeIcon icon={faRotateLeft} /> Khôi phục</button>
+                </div>
+              ) : (
               <div className="document-card-actions">
                 <button type="button" onClick={() => openPreview(document)}><FontAwesomeIcon icon={faFileLines} /> Xem OCR</button>
                 <button type="button" disabled={!manageable} onClick={() => openEdit(document)}><FontAwesomeIcon icon={faPen} /> Chỉnh sửa</button>
                 <button type="button" disabled={!manageable || !canReindex || busyId === document.id} onClick={() => reindex(document)} title={!canReindex ? 'Tài liệu cần chunk thành công trước' : ''}><FontAwesomeIcon icon={faArrowsRotate} /> Re-index</button>
                 <button type="button" className="danger" disabled={!manageable || busyId === document.id} onClick={() => removeDocument(document)}><FontAwesomeIcon icon={faTrashCan} /> Xóa</button>
               </div>
+              )}
             </article>
           );
         })}

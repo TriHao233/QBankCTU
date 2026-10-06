@@ -1,12 +1,73 @@
 # QBankCTU — Ứng dụng Web Quản lý Ngân hàng Câu hỏi tích hợp LLM
 
-> Đề tài NCKH cấp cơ sở, Trường CNTT&TT — Đại học Cần Thơ
+> **Đề tài NCKH cấp cơ sở, Trường CNTT&TT — Đại học Cần Thơ**
 > Thời gian thực hiện: 03/2026 – 08/2026
 > Chủ nhiệm đề tài: Trương Trí Hào (B2203553) — GVHD: TS. Phan Phương Lan, KS. Trương Phúc Vĩnh
 
-Tài liệu này tóm tắt lại toàn bộ đề tài từ bản Thuyết minh, dùng làm ngữ cảnh tham chiếu nhanh khi phát triển (vibe code) — không cần mở lại file PDF gốc.
+**QBankCTU** là hệ thống Web hỗ trợ quản lý và tự động hóa quy trình soạn thảo ngân hàng câu hỏi trắc nghiệm từ tài liệu giảng dạy. Hệ thống tận dụng sức mạnh của các mô hình ngôn ngữ lớn (LLM) mã nguồn mở chạy local, kết hợp với kỹ thuật **RAG (Retrieval-Augmented Generation)** để đảm bảo câu hỏi sinh ra luôn bám sát tài liệu gốc, loại bỏ tình trạng ảo giác (hallucination).
+Với cơ chế **Human-in-the-loop**, AI đóng vai trò trợ lý sinh câu hỏi nháp, còn giảng viên là người kiểm duyệt, chỉnh sửa và phê duyệt cuối cùng trước khi đồng bộ trực tiếp lên hệ thống Moodle của trường.
 
-Đang chuyển dữ liệu nghiệp vụ từ MongoDB sang PostgreSQL: đọc [mục 12](#12-refactor-cơ-sở-dữ-liệu-postgresql--mongodb) để biết đã thay đổi gì và cần lưu ý gì khi code.
+---
+
+## Hướng dẫn cài đặt và chạy dự án (Getting Started)
+
+### 1. Yêu cầu hệ thống
+
+- **OS:** Windows, Linux, hoặc macOS.
+- **Phần mềm:**
+  - Docker Desktop (hoặc Docker Engine + Docker Compose).
+  - Git.
+  - **Ollama**: Phải cài đặt trực tiếp trên máy host để chạy LLM cục bộ (Local). Bạn cần kéo các model như `qwen3-8b` hoặc `deepseek-r1` về máy trước (`ollama run qwen3-8b`).
+  - (Tùy chọn) Node.js và Python 3.10+ nếu muốn chạy code local không thông qua Docker.
+- **Phần cứng:** Khuyến nghị có NVIDIA GPU và cài đặt NVIDIA Container Toolkit để tăng tốc model OCR Docling (có thể cấu hình chạy CPU nhưng tốc độ sẽ rất chậm).
+
+### 2. Cài đặt biến môi trường và Firebase
+
+1. Clone dự án về máy: `git clone https://github.com/TriHao233/QBankCTU.git`
+2. Di chuyển vào thư mục dự án: `cd QBankCTU`
+3. Cấu hình Backend:
+   - Copy file `backend/.env.example` thành `backend/.env` và điền các thông số (như `POSTGRES_DSN`, URL DB).
+   - Đặt file `firebase-service-account.json` vào trong thư mục `backend/` để backend có thể xác thực người dùng.
+4. Cấu hình Frontend:
+   - Copy file `frontend/.env.example` thành `frontend/.env`.
+   - Cấu hình các biến Vite (như `VITE_DEMO_MODE=true` nếu muốn bật chế độ demo).
+
+### 3. Khởi chạy bằng Docker (Khuyên dùng)
+
+Đây là cách đơn giản nhất để chạy toàn bộ hệ thống (Frontend, Backend, PostgreSQL, MongoDB, Worker):
+
+```bash
+docker compose up -d --build
+```
+
+Sau khi các container đã khởi động thành công, bạn có thể truy cập:
+
+- **Giao diện Web (Frontend):** [http://localhost:5177](http://localhost:5177)
+- **API Docs (Backend):** [http://localhost:8000/docs](http://localhost:8000/docs)
+
+*(Để dừng hệ thống, chạy `docker compose down`. Nếu chỉ muốn khởi động lại mà không build, dùng `docker compose up -d`)*
+
+### 4. Khởi chạy Development (Chạy local)
+
+Dành cho mục đích code và debug:
+
+**Khởi chạy Backend (FastAPI):**
+
+```bash
+cd backend
+# Tạo file .env và cấu hình như hướng dẫn ở trên
+python scripts/database/bootstrap_v2.py
+python -m db.migrate --apply  # Chạy DB migration cho PostgreSQL
+uvicorn main:app --reload
+```
+
+**Khởi chạy Frontend (React/Vite):**
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
 ---
 
@@ -15,6 +76,7 @@ Tài liệu này tóm tắt lại toàn bộ đề tài từ bản Thuyết minh
 Việc soạn ngân hàng câu hỏi tại các cơ sở giáo dục hiện chủ yếu làm **thủ công**: tốn thời gian, chất lượng không đồng đều, thiếu câu hỏi ở mức tư duy cao. Các mô hình ngôn ngữ lớn (LLMs) có thể tự động sinh câu hỏi từ tài liệu, nhưng rào cản lớn nhất là **hallucination** — AI bịa thông tin nghe có vẻ đúng.
 
 **Giải pháp:** xây dựng một hệ thống Web kết hợp:
+
 - **RAG (Retrieval-Augmented Generation)** để LLM sinh câu hỏi bám sát nội dung tài liệu thật, giảm ảo giác.
 - **Human-in-the-loop**: AI chỉ tạo câu hỏi *nháp*, giảng viên luôn là người kiểm duyệt/chỉnh sửa/phê duyệt cuối cùng trước khi xuất bản.
 
@@ -23,6 +85,7 @@ Việc soạn ngân hàng câu hỏi tại các cơ sở giáo dục hiện ch�
 **Mục tiêu tổng quát:** Xây dựng ứng dụng Web quản lý ngân hàng câu hỏi, dùng LLM hỗ trợ sinh câu hỏi tự động từ tài liệu văn bản, với quy trình kiểm duyệt chặt chẽ trước khi đưa vào sử dụng chính thức.
 
 **Mục tiêu cụ thể:**
+
 1. Nền tảng quản lý ngân hàng câu hỏi tập trung, số hóa và có tổ chức.
 2. Tự động hóa sinh đề bằng LLM + RAG, nhanh hơn nhiều lần so với thủ công.
 3. Đảm bảo chất lượng nội dung qua cơ chế Human-in-the-loop (AI khởi tạo → giảng viên thẩm định).
@@ -31,20 +94,20 @@ Việc soạn ngân hàng câu hỏi tại các cơ sở giáo dục hiện ch�
 
 ## 3. Phạm vi
 
-| Hạng mục | Phạm vi |
-|---|---|
-| Ngôn ngữ tài liệu | Tiếng Việt |
-| Lĩnh vực nội dung | Học phần "Cấu trúc dữ liệu" (Data Structures) |
-| Định dạng đầu vào | PDF, DOC (kể cả PDF dạng scan → cần OCR) |
-| Loại câu hỏi | Trắc nghiệm 4 lựa chọn (MCQ), Đúng/Sai, Điền khuyết, Ghép đôi, Câu hỏi tình huống |
-| Mô hình AI | LLM mã nguồn mở, chạy **local** (ứng viên: Qwen, Llama...) |
-| Kỹ thuật lõi | RAG (truy xuất ngữ cảnh từ tài liệu để giảm ảo giác) |
-| Đầu ra | Lưu trực tiếp vào Question Bank của Moodle qua Plugin |
+| Hạng mục              | Phạm vi                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------- |
+| Ngôn ngữ tài liệu   | Tiếng Việt                                                                                      |
+| Lĩnh vực nội dung    | Học phần "Cấu trúc dữ liệu" (Data Structures)                                               |
+| Định dạng đầu vào | PDF, DOC (kể cả PDF dạng scan → cần OCR)                                                     |
+| Loại câu hỏi         | Trắc nghiệm 4 lựa chọn (MCQ), Đúng/Sai, Điền khuyết, Ghép đôi, Câu hỏi tình huống |
+| Mô hình AI            | LLM mã nguồn mở, chạy **local** (ứng viên: Qwen, Llama...)                           |
+| Kỹ thuật lõi         | RAG (truy xuất ngữ cảnh từ tài liệu để giảm ảo giác)                                   |
+| Đầu ra                | Lưu trực tiếp vào Question Bank của Moodle qua Plugin                                        |
 
 ## 4. Kiến trúc hệ thống & tech stack hiện tại
 
 ```
-NCKH/
+QBankCTU/
 ├── frontend/                  # React + Vite — Admin Dashboard
 │   └── src/
 │       ├── pages/             # HomePage, LoginPage, RegisterPage, GeneratePage,
@@ -58,7 +121,7 @@ NCKH/
 │   ├── common/                 # exceptions, responses, utils dùng chung
 │   ├── modules/                # Feature-based, mỗi module theo router → service → repository
 │   │   ├── auth/                # register / login / profile (Firebase Auth)
-│   │   ├── ocr/                  # EasyOCR + PDFium selective scan OCR
+│   │   ├── ocr/                  # Docling OCR/layout chọn lọc cho trang PDF scan, bảng, hình
 │   │   ├── rag/                   # chunking, chromadb vector store, search
 │   │   ├── generation/            # sinh câu hỏi, prompt builder, LLM factory (gemini/qwen3/deepseek)
 │   │   └── dictionary/             # auto-learning từ khóa
@@ -67,12 +130,13 @@ NCKH/
 ```
 
 **Stack:**
+
 - **Frontend:** React 18 + Vite, React Router, Firebase SDK (auth), FontAwesome.
 - **Backend:** 1 FastAPI app duy nhất (`uvicorn main:app --reload`), Firebase Admin (xác thực người dùng).
-  - OCR: `EasyOCR` + `pypdfium2` (GPU, xử lý chọn lọc các trang PDF scan tiếng Việt, không cần Poppler).
+  - OCR: Docling Serve (container riêng, Tesseract tiếng Việt `vie`), chỉ xử lý các trang PDF scan hoặc có bảng/hình;
   - Vector DB: `chromadb` + `sentence-transformers` (embedding & retrieval cho RAG).
   - LLM: `google-genai` hiện dùng để thử nghiệm (mục tiêu cuối là LLM local qua PyTorch CUDA — `torch`/`torchvision`/`torchaudio` đã có trong requirements).
-  - Lưu trữ dữ liệu: PostgreSQL (`psycopg`) cho dữ liệu nghiệp vụ, MongoDB (`pymongo`) cho chunk/vector RAG — đang trong giai đoạn chuyển đổi, xem [mục 12](#12-refactor-cơ-sở-dữ-liệu-postgresql--mongodb).
+  - Lưu trữ dữ liệu: PostgreSQL (`psycopg`) cho dữ liệu nghiệp vụ, MongoDB (`pymongo`) cho chunk/vector RAG — đang trong giai đoạn chuyển đổi
   - File (tài liệu gốc, artifact OCR, avatar): thư mục local hoặc object storage tương thích S3 (`boto3`).
   - Prompt được tổ chức theo **thang đo BLOOM** và theo **loại câu hỏi** (`prompts/bloom/`, `prompts/question_type/`).
 
@@ -84,7 +148,7 @@ NCKH/
         │
         ▼
 3. Tiền xử lý tài liệu
-   - Nếu là PDF scan → EasyOCR GPU trích xuất văn bản; PDF có text layer không chạy OCR
+   - Nếu là PDF scan hoặc trang có bảng/hình → Docling trích xuất văn bản và bố cục; trang có text layer tốt giữ nguyên văn bản gốc
    - Làm sạch, chuẩn hóa văn bản
         │
         ▼
@@ -116,10 +180,12 @@ NCKH/
 ## 6. Chức năng chính (theo nhóm người dùng)
 
 **Admin:**
+
 - Quản lý người dùng, phân quyền (Admin / Giảng viên).
 - Quản lý học phần, cấu hình tham số AI (model, prompt, RAG settings).
 
 **Giảng viên:**
+
 - Upload tài liệu nguồn (`GeneratePage`) → kích hoạt pipeline sinh câu hỏi.
 - Chỉnh sửa câu hỏi bằng Question Editor.
 - Quản lý ngân hàng câu hỏi cá nhân/môn học (`ManagePage`).
@@ -134,10 +200,10 @@ Các trang frontend hiện có khớp với các chức năng trên: `HomePage`,
 - Đúng kiến thức nguồn (nhờ RAG bám tài liệu), văn phong tự nhiên tiếng Việt.
 - Đúng định dạng nhập liệu Moodle (đáp án, thiết lập xáo trộn, hiển thị tiếng Việt ổn định).
 
-## 8. Timeline nghiên cứu (mốc tham khảo)
+## 8. Timeline nghiên cứu
 
 | Giai đoạn | Thời gian | Nội dung |
-|---|---|---|
+| ------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------ |
 | 1. Thu thập dữ liệu & nghiên cứu công nghệ | 03/2026 | Tìm hiểu LLM/RAG, thu thập giáo trình Cấu trúc dữ liệu, tiền xử lý (clean/OCR) |
 | 2. Phân tích & thiết kế | 03–04/2026 | Đặc tả yêu cầu, thiết kế DB & Moodle mapping, thiết kế UI Dashboard |
 | 3. Module AI (Core) | 04–05/2026 | Pipeline Đọc tài liệu → Chunking → Embedding → LLM Generation; tối ưu prompt |
@@ -156,7 +222,7 @@ Các trang frontend hiện có khớp với các chức năng trên: `HomePage`,
 
 - **RAG là xương sống chống hallucination** — mọi câu hỏi sinh ra phải truy xuất ngữ cảnh từ ChromaDB trước khi gọi LLM, không sinh "chay" từ kiến thức nội tại của model.
 - **LLM mục tiêu là chạy local/mã nguồn mở** (Qwen, Llama...) — `google-genai` trong requirements hiện tại là phương án thử nghiệm/tạm thời, không phải đích cuối.
-- **OCR chỉ cần khi tài liệu là PDF scan** (ảnh) — tài liệu PDF text thuần không cần qua EasyOCR.
+- **OCR chỉ cần khi tài liệu là PDF scan** (ảnh) — tài liệu PDF text thuần không cần qua OCR.
 - **Không được auto-publish câu hỏi AI sinh ra** — luôn phải qua bước duyệt của giảng viên (human-in-the-loop) trước khi vào Moodle.
 - **Chuẩn hóa output theo Moodle**: đáp án, thiết lập xáo trộn, mã hóa tiếng Việt phải đúng ngay từ bước Generation để Plugin xuất bản không cần xử lý lại.
 - Backend đã hợp nhất thành 1 FastAPI app duy nhất (`backend/main.py`), tổ chức theo Feature-based Modular Architecture (`core/`, `common/`, `modules/{auth,ocr,rag,generation,dictionary}/`), mỗi module theo pattern router → service → repository.
@@ -224,7 +290,7 @@ Thiết kế dữ liệu chi tiết xem tại [`docs/DATABASE_DESIGN_V2.md`](doc
 ### Dữ liệu nằm ở đâu sau khi đổi
 
 | Loại dữ liệu | Nơi lưu |
-|---|---|
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | Người dùng, quyền, học phần/chương/CLO, từ điển, cấu hình AI | PostgreSQL |
 | Tài liệu, trang OCR, job OCR/chunk/index | PostgreSQL |
 | Câu hỏi và các phiên bản, đánh giá AI, duyệt, bình luận, draft | PostgreSQL |
@@ -232,7 +298,7 @@ Thiết kế dữ liệu chi tiết xem tại [`docs/DATABASE_DESIGN_V2.md`](doc
 | Thông báo, audit, cấu hình và lịch sử xuất Moodle | PostgreSQL |
 | Chunk, chunk set, metadata embedding (dùng cho RAG) | **Vẫn ở MongoDB** |
 | Vector tìm kiếm | **Vẫn ở ChromaDB** |
-| File gốc, artifact OCR, avatar | Thư mục local, hoặc S3/MinIO/R2/GCS khi bật `STORAGE_PROVIDER=s3` |
+| File gốc, artifact OCR, avatar | Thư mục local, hoặc S3/MinIO/R2/GCS khi bật`STORAGE_PROVIDER=s3` |
 
 ID vẫn là chuỗi ObjectId 24 ký tự như cũ, nên API và frontend **không đổi**.
 
@@ -241,7 +307,7 @@ ID vẫn là chuỗi ObjectId 24 ký tự như cũ, nên API và frontend **khô
 Mỗi nhóm dữ liệu có một cờ riêng, giá trị `postgres` (**mặc định**) hoặc `mongo`. Giá trị `mongo` chỉ dùng để **quay lui** khi có sự cố, không dùng cho công việc thường ngày. Đổi cờ xong phải khởi động lại **cả backend lẫn worker**.
 
 | Cờ | Nhóm dữ liệu | Cần bật thêm |
-|---|---|---|
+| ----------------------- | ---------------------------------------------------- | ------------------------------------- |
 | `USER_STORE` | Người dùng, phiên đăng nhập | — |
 | `CATALOG_STORE` | Học phần, chương, CLO | `USER_STORE` |
 | `DICTIONARY_STORE` | Từ điển từ khóa | — |
@@ -255,7 +321,7 @@ Mỗi nhóm dữ liệu có một cờ riêng, giá trị `postgres` (**mặc đ
 | `REVIEW_POLICY_STORE` | Chính sách duyệt 2 vòng | `USER_STORE` |
 | `MOODLE_TARGET_STORE` | Cấu hình Moodle target | `USER_STORE` |
 | `LLM_SLOT_STORE` | Giới hạn số lời gọi model đồng thời | — |
-| `STORAGE_PROVIDER` | Nơi lưu **file mới**: `local` hoặc `s3` | `S3_BUCKET`, v.v. |
+| `STORAGE_PROVIDER` | Nơi lưu**file mới**: `local` hoặc `s3` | `S3_BUCKET`, v.v. |
 
 Thiếu cờ phụ thuộc thì backend báo lỗi ghi rõ cờ còn thiếu ngay khi tính năng đó được dùng tới. ⚠️ **Trên môi trường thật, bật tất cả cờ cùng một lúc theo runbook**, không bật lẻ từng cờ: các nhóm đọc dữ liệu của nhau, bật lệch sẽ thấy thiếu dữ liệu.
 
@@ -299,50 +365,6 @@ Test S3 dùng thư viện `moto` để giả lập, không cần tài khoản cl
 
 Unit test thường vẫn chạy nhánh MongoDB với dữ liệu giả trong bộ nhớ: `backend/tests/conftest.py` đặt mọi cờ về `mongo` cho từng test; test PostgreSQL tự bật cờ nó cần.
 
-### Quy tắc khi viết code mới
+### Lưu ý về Docker Container
 
-1. **Không đọc/ghi thẳng `db.<collection>` cho dữ liệu nghiệp vụ.** Đi qua repository của module, và rẽ nhánh theo cờ giống code xung quanh (ví dụ `PostgresQuestionRepository` bên cạnh `MongoQuestionRepository`). Nếu chỉ viết cho Mongo, tính năng đó sẽ **mất dữ liệu** sau khi chuyển sang PostgreSQL.
-2. **Đổi cấu trúc bảng = thêm file migration mới** trong `backend/db/migrations/` (đánh số tiếp theo, hiện tới `0017`). **Không sửa file migration cũ:** mỗi file có checksum, sửa là `python -m db.migrate` báo lỗi và backend ở chế độ PostgreSQL từ chối khởi động.
-3. **Thêm collection Mongo nghiệp vụ mới** thì phải khai báo cờ sở hữu trong `POSTGRES_OWNERS` (`backend/core/bootstrap.py`). Test sẽ báo lỗi nếu quên.
-4. **Dữ liệu chunk/vector cho RAG vẫn ở MongoDB/ChromaDB**, không chuyển sang PostgreSQL.
-5. **Lưu file qua `artifact_storage(...)`** trong `modules/documents/storage.py`, không tự ghi đường dẫn. Khi đọc, dùng `storage_for_provider(provider)` theo `provider` đã lưu cùng file (file có thể ở local hoặc S3).
-6. **Thông báo gắn với một thao tác trên câu hỏi** thì ghi trong cùng transaction với thao tác đó; xem cách làm với `notification_outbox()` trong `modules/questions/workflow_service.py`.
-7. **Không lưu secret** (token Moodle, key Gemini, AWS key) vào database hay log. S3 lấy credential từ biến môi trường AWS chuẩn.
-
-### Tiến độ
-
-| Việc | Trạng thái |
-|---|---|
-| Chuyển code của mọi nhóm dữ liệu nghiệp vụ sang PostgreSQL (có cờ bật/tắt) | ✅ Xong |
-| Thông báo ghi cùng transaction với thao tác duyệt câu hỏi | ✅ Xong |
-| Lưu file trên object storage S3 + công cụ chuyển file có kiểm tra checksum | ✅ Xong (mới thử với `moto`, chưa thử bucket thật) |
-| Bootstrap không tạo lại collection nghiệp vụ trong MongoDB | ✅ Xong |
-| Runbook chuyển hẳn sang PostgreSQL | ✅ Xong — [`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md) |
-| Diễn tập chuyển đổi trên bản sao dữ liệu | ⏳ Chưa làm |
-| Chuyển hẳn môi trường thật (cutover) | ⏳ Chưa làm — hệ thống sẽ dừng một khoảng ngắn, sẽ báo lịch trước |
-| Dọn collection nghiệp vụ cũ trong MongoDB | ⏳ Sau cutover và hết thời gian cho phép rollback |
-
-Chi tiết kỹ thuật (schema, công cụ chép/đối soát): [`backend/db/README.md`](backend/db/README.md). Quy trình chuyển đổi từng bước: [`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md).
-
-# Chạy Docker
-
-Trên PowerShell, chạy lệnh sau để build và khởi động backend, worker, MongoDB, PostgreSQL và frontend dev:
-
-```powershell
-docker compose up -d --build
-```
-
-Sau khi thành công, mở `http://localhost:5177`. Backend chạy tại `http://localhost:8000`.
-MongoDB được publish tại cổng `27018` trên máy host; có thể đổi bằng `MONGO_HOST_PORT`.
-
-Chỉ khởi động lại container, không build image:
-
-```powershell
-docker compose up -d
-```
-
-Máy có NVIDIA GPU và NVIDIA Container Toolkit có thể chạy với cấu hình GPU:
-
-```powershell
-docker compose -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.gpu.yml up -d --build
-```
+Toàn bộ cấu hình dịch vụ nằm trong file `docker-compose.yml`. Backend và worker mặc định sẽ sử dụng GPU NVIDIA, do đó máy host cần có NVIDIA GPU và NVIDIA Container Toolkit. Docling cũng dùng GPU (chiếm khoảng 1,7 GB VRAM, có thể chia sẻ chung với Ollama). Nếu cần nhường VRAM cho LLM sinh câu hỏi, bạn có thể thiết lập `DOCLING_DEVICE=cpu` trong cấu hình backend. MongoDB được publish tại cổng `27017` trên máy host (có thể đổi cổng bằng biến `MONGO_HOST_PORT`).

@@ -27,22 +27,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--replay-easyocr", type=Path, help="Reuse EasyOCR output from a same-SHA audit run")
+    parser.add_argument("--replay-docling", type=Path, help="Reuse Docling output from a same-SHA audit run; clearly labeled replay")
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
     source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
     replayed = {}
-    if args.replay_easyocr:
-        baseline = args.replay_easyocr.resolve(strict=True)
+    if args.replay_docling:
+        baseline = args.replay_docling.resolve(strict=True)
         baseline_summary = json.loads((baseline / "summary.json").read_text(encoding="utf-8"))
         if baseline_summary["source_sha256"] != source_sha256:
             raise ValueError("Replay source SHA-256 mismatch")
         with gzip.open(baseline / "extraction.raw.json.gz", "rt", encoding="utf-8") as handle:
             baseline_raw = json.load(handle)
         for unit in baseline_raw["units"]:
-            cached = unit.get("raw_extraction", {}).get("easyocr")
+            cached = unit.get("raw_extraction", {}).get("docling")
             if cached:
-                replayed[unit["page_number"]] = cached
+                replayed[unit["page_number"]] = {
+                    **cached, "raw_document": baseline_raw.get("raw_engine_outputs", {}).get("docling"),
+                }
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     # Set before importing modules whose settings are constructed at import time.
@@ -63,14 +65,14 @@ def main() -> int:
     document_id = "audit-ocr-chunking"
     print(f"[OCR] Starting {source.name}", flush=True)
     with ExitStack() as stack:
-        if args.replay_easyocr:
-            def cached_easyocr(_source, page_numbers, _context=None):
+        if args.replay_docling:
+            def cached_docling(_source, page_numbers):
                 if any(number not in replayed for number in page_numbers):
-                    raise ValueError("Replay lacks a requested EasyOCR page")
+                    raise ValueError("Replay lacks a requested Docling page")
                 return {number: replayed[number] for number in page_numbers}
 
-            stack.enter_context(patch("modules.ocr.easyocr_engine.ocr_pdf_pages", side_effect=cached_easyocr))
-            print("[REPLAY] EasyOCR response reused; PDF extraction and embedding execute normally", flush=True)
+            stack.enter_context(patch("modules.ocr.docling_engine.ocr_pdf_pages", side_effect=cached_docling))
+            print("[REPLAY] Docling response reused; PDF extraction and embedding execute normally", flush=True)
         result = run_document_pipeline(
             str(source), str(output / "extraction.md"), source.stem,
             document_id=document_id, source_uri=str(source),
@@ -133,7 +135,7 @@ def main() -> int:
     contents = Counter(chunk["content"] for chunk in chunks)
     summary = {
         "source_sha256": source_sha256,
-        "easyocr_replayed": bool(args.replay_easyocr),
+        "docling_replayed": bool(args.replay_docling),
         "pages": len(pages), "chunks": len(chunks), "vectors": indexed,
         "chunk_characters": {
             "min": min(len(chunk["content"]) for chunk in chunks),

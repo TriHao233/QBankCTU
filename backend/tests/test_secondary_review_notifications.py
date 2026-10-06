@@ -18,16 +18,20 @@ def test_specialists_exclude_authors_primary_inactive_and_revoked():
     assert recipients == [specialist["_id"]]
 
 
-def test_fallback_reviewers_then_admins_and_limit():
-    author, primary, general, admin = user(), user(), user(), user("Admin")
-    kwargs = {"question": {"created_by_user_id": author["_id"]}, "version": {}, "primary_reviewer_user_id": primary["_id"]}
+def test_fallback_to_admins_and_limit():
+    subject = ObjectId()
+    author, primary, admin = user(), user(), user("Admin")
+    general = user(review_subject_ids=[subject])
+    unassigned = user()
+    kwargs = {"question": {"subject_id": subject, "created_by_user_id": author["_id"]}, "version": {},
+              "primary_reviewer_user_id": primary["_id"]}
     assert secondary_review_recipients([author, primary, general, admin], **kwargs) == [general["_id"]]
-    assert secondary_review_recipients([author, primary, admin], **kwargs) == [admin["_id"]]
+    assert secondary_review_recipients([author, primary, unassigned, admin], **kwargs) == [admin["_id"]]
     assert secondary_review_recipients([author, primary], **kwargs) == []
-    assert len(secondary_review_recipients([user() for _ in range(30)], **kwargs)) == 20
-    editor = user()
+    assert len(secondary_review_recipients([user(review_subject_ids=[subject]) for _ in range(30)], **kwargs)) == 20
+    editor = user(review_subject_ids=[subject])
     assert secondary_review_recipients([editor], **{**kwargs, "version": {"created_by_user_id": editor["_id"]}}) == []
-    granted = user("Teacher", permission_grants=["reviews.manage"])
+    granted = user("Teacher", permission_grants=["reviews.manage"], review_subject_ids=[subject])
     assert secondary_review_recipients([granted], **kwargs) == [granted["_id"]]
 
 

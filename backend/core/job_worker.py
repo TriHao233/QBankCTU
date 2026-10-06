@@ -73,6 +73,15 @@ async def process_available_jobs_once(worker_id: str | None = None) -> bool:
     return found_work
 
 
+async def _requeue_interrupted_generation_jobs(job_ids: list[str], worker_id: str) -> None:
+    from modules.generation.mongodb import requeue_generation_job_for_shutdown
+    for job_id in job_ids:
+        try:
+            await asyncio.to_thread(requeue_generation_job_for_shutdown, job_id, worker_id)
+        except Exception:
+            logger.exception("Cannot requeue generation job [%s] on shutdown", job_id)
+
+
 async def run_job_worker(stop_event: asyncio.Event) -> None:
     """Run independent generation lanes for Ollama and Gemini.
 
@@ -89,6 +98,9 @@ async def run_job_worker(stop_event: asyncio.Event) -> None:
 
     def send_review_sla_reminders() -> int:
         return get_workflow_service().send_review_sla_reminders()
+
+    def escalate_overdue_reviews() -> dict:
+        return get_workflow_service().escalate_overdue_reviews()
 
     worker_id = get_worker_id()
     logger.info("Mongo job worker started: %s", worker_id)
@@ -167,6 +179,12 @@ async def run_job_worker(stop_event: asyncio.Event) -> None:
                         logger.info("Sent review SLA reminders for %s question(s)", reminded)
                 except Exception:
                     logger.exception("Review SLA reminder pass failed")
+                try:
+                    escalated = await asyncio.to_thread(escalate_overdue_reviews)
+                    if escalated.get("notified") or escalated.get("requeued"):
+                        logger.info("Review escalation: %s", escalated)
+                except Exception:
+                    logger.exception("Review escalation pass failed")
 
             try:
                 await asyncio.wait_for(
@@ -176,20 +194,18 @@ async def run_job_worker(stop_event: asyncio.Event) -> None:
             except asyncio.TimeoutError:
                 pass
 
-        from modules.generation.mongodb import cancel_generation_job
-        for job_id, task in generation_tasks.values():
+        interrupted = [job_id for job_id, task in generation_tasks.values() if not task.done()]
+        for _, task in generation_tasks.values():
             if not task.done():
-                await asyncio.to_thread(cancel_generation_job, job_id)
                 task.cancel()
         pending = [task for _, task in generation_tasks.values()]
         if evaluation_task is not None:
             pending.append(evaluation_task)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        await _requeue_interrupted_generation_jobs(interrupted, worker_id)
     except asyncio.CancelledError:
-        from modules.generation.mongodb import cancel_generation_job
-        for job_id, _ in generation_tasks.values():
-            await asyncio.to_thread(cancel_generation_job, job_id)
+        interrupted = [job_id for job_id, task in generation_tasks.values() if not task.done()]
         pending = [task for _, task in generation_tasks.values()]
         if evaluation_task is not None:
             pending.append(evaluation_task)
@@ -197,6 +213,7 @@ async def run_job_worker(stop_event: asyncio.Event) -> None:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        await _requeue_interrupted_generation_jobs(interrupted, worker_id)
         raise
     finally:
         logger.info("Mongo job worker stopped")

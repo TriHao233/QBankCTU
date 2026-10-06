@@ -14,7 +14,20 @@ from core.postgres_audit import write_postgres_audit_event
 from db.bson_json import restore
 from db.copy_business_data import projected_rows, upsert
 from modules.notifications.postgres_repository import insert_notifications
-from modules.questions.repository import object_id, utc_now
+from modules.questions.repository import (
+    normalize_sharing_fields,
+    object_id,
+    review_fields_after_edit,
+    utc_now,
+)
+from modules.questions.review_limits import (
+    MIN_TAKEOVER_REASON_LENGTH,
+    active_holder_id,
+    carried_renewal_count,
+    released_assignment,
+    review_hold_limit_message,
+    review_renewal_limit_message,
+)
 
 
 def _question(row: dict | None) -> dict | None:
@@ -117,7 +130,8 @@ class PostgresQuestionRepository:
                           expected_version_id: ObjectId,
                           evaluation_status: str,
                           quality_summary: dict,
-                          require_active_job: bool = False) -> tuple[dict, dict]:
+                          require_active_job: bool = False,
+                          update_question: bool = True) -> tuple[dict, dict]:
         with postgres_connection() as conn:
             pair = self._pair(conn, evaluation["question_id"], lock=True)
             if not pair or pair[1]["_id"] != expected_version_id:
@@ -139,10 +153,11 @@ class PostgresQuestionRepository:
             for table, row in projected_rows("question_evaluations", evaluation):
                 upsert(conn, table, row)
             before = question.get("quality_summary") or {}
-            question.update(evaluation_status=evaluation_status,
-                            quality_summary=quality_summary,
-                            updated_at=evaluation["created_at"])
-            self._save_question(conn, question)
+            if update_question:
+                question.update(evaluation_status=evaluation_status,
+                                quality_summary=quality_summary,
+                                updated_at=evaluation["created_at"])
+                self._save_question(conn, question)
             write_postgres_audit_event(
                 conn, action="QUESTION_EVALUATED", entity_type="question",
                 entity_id=question["_id"],
@@ -316,7 +331,8 @@ class PostgresQuestionRepository:
                       expected_version_id: ObjectId,
                       expected_latest_review_id: ObjectId | None,
                       actor_role: str, audit_action: str,
-                      notifications: list[dict] | None = None) -> tuple[dict, dict]:
+                      notifications: list[dict] | None = None,
+                      extra_audit: list[dict] | None = None) -> tuple[dict, dict]:
         with postgres_connection() as conn:
             pair = self._pair(conn, review["question_id"], lock=True)
             if not pair:
@@ -327,13 +343,12 @@ class PostgresQuestionRepository:
                     or question.get("latest_review_id") != expected_latest_review_id):
                 raise RuntimeError("VERSION_CONFLICT")
             actor_id = review["reviewer_user_id"]
-            if actor_role != "Admin":
-                assignment = question.get("review_assignment") or {}
-                expires = assignment.get("lock_expires_at")
-                if (assignment.get("status") != "IN_REVIEW"
-                        or assignment.get("reviewer_user_id") != actor_id
-                        or (expires is not None and expires <= utc_now())):
-                    raise PermissionError("Bạn cần claim câu hỏi trước khi kiểm duyệt")
+            assignment = question.get("review_assignment") or {}
+            expires = assignment.get("lock_expires_at")
+            if (assignment.get("status") != "IN_REVIEW"
+                    or assignment.get("reviewer_user_id") != actor_id
+                    or (expires is not None and expires <= utc_now())):
+                raise PermissionError("Bạn cần claim câu hỏi trước khi kiểm duyệt")
             interrupted = review.get("interrupted_evaluation_job_ids") or []
             if interrupted:
                 now = review["reviewed_at"]
@@ -384,6 +399,8 @@ class PostgresQuestionRepository:
                     "self_review_reason": review.get("self_review_reason") or "",
                 },
             )
+            for event in extra_audit or ():
+                write_postgres_audit_event(conn, **event)
             insert_notifications(conn, notifications)
             return question, version
 
@@ -412,22 +429,26 @@ class PostgresQuestionRepository:
 
     def release_reviewer_assignments(self, reviewer_user_id: ObjectId, *, reason: str,
                                      actor_user_id: ObjectId | None,
-                                     actor_role: str | None, now) -> int:
-        """Trả mọi câu hỏi Reviewer đang giữ về hàng đợi chung trong một transaction."""
+                                     actor_role: str | None, now,
+                                     subject_ids: list | None = None) -> int:
+        """Trả câu hỏi Reviewer đang giữ (giới hạn theo học phần nếu có) về hàng đợi chung."""
         empty = {
             "status": "UNASSIGNED", "reviewer_user_id": None,
             "assigned_by_user_id": None, "assigned_at": None, "claimed_at": None,
             "lock_expires_at": None, "last_released_at": now, "release_reason": reason,
         }
-        with postgres_connection() as conn:
-            rows = conn.execute(
-                """SELECT * FROM questions
+        sql = """SELECT * FROM questions
                    WHERE lifecycle_status='ACTIVE' AND review_status='PENDING'
                      AND assignment->>'status' IN ('ASSIGNED','IN_REVIEW')
-                     AND assignment->>'reviewer_user_id'=%s
-                   ORDER BY id FOR UPDATE""",
-                (str(reviewer_user_id),),
-            ).fetchall()
+                     AND assignment->>'reviewer_user_id'=%s"""
+        params: list = [str(reviewer_user_id)]
+        if subject_ids is not None:
+            if not subject_ids:
+                return 0
+            sql += " AND subject_id=ANY(%s)"
+            params.append([str(item) for item in subject_ids])
+        with postgres_connection() as conn:
+            rows = conn.execute(sql + " ORDER BY id FOR UPDATE", params).fetchall()
             for row in rows:
                 question = _question(row)
                 previous = question.get("review_assignment") or {}
@@ -525,6 +546,15 @@ class PostgresQuestionRepository:
         return {ObjectId(row["id"]): restore(row["subject"] or {}, "subject")
                 for row in rows}
 
+    def manual_evaluation_count(self, version_id: ObjectId) -> int:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS total FROM question_evaluations
+                   WHERE question_version_id=%s AND result->>'trigger'='MANUAL'""",
+                (str(version_id),),
+            ).fetchone()
+        return int(row["total"] or 0)
+
     def latest_evaluations(self, version_ids: list[ObjectId]) -> dict[ObjectId, dict]:
         if not version_ids:
             return {}
@@ -532,6 +562,7 @@ class PostgresQuestionRepository:
             rows = conn.execute(
                 """SELECT DISTINCT ON (question_version_id) *
                    FROM question_evaluations WHERE question_version_id=ANY(%s)
+                     AND COALESCE(result->>'trigger', '') <> 'MANUAL'
                    ORDER BY question_version_id, created_at DESC, id DESC""",
                 ([str(item) for item in version_ids],),
             ).fetchall()
@@ -599,6 +630,61 @@ class PostgresQuestionRepository:
                 return False
             question["review_sla"] = {"reminded_submission_at": submitted_at, "reminded_at": now}
             self._save_question(conn, question)
+            insert_notifications(conn, notifications)
+            return True
+
+    def escalation_candidates(self, cutoff, limit: int, *, requeue_cutoff=None, now=None) -> list[dict]:
+        """Pending questions with an escalation step still due for their current submission."""
+        now = now or utc_now()
+        requeue_cutoff = requeue_cutoff or cutoff
+        with postgres_connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM questions
+                   WHERE lifecycle_status='ACTIVE' AND review_status='PENDING'
+                     AND (payload->'review_submission'->>'submitted_at')::timestamptz <= %s
+                     AND NOT (COALESCE(assignment->>'status', '')='IN_REVIEW'
+                              AND COALESCE((assignment->>'lock_expires_at')::timestamptz > %s, false))
+                     AND ((payload->'review_escalation'->>'submitted_at')::timestamptz IS DISTINCT FROM
+                              (payload->'review_submission'->>'submitted_at')::timestamptz
+                          OR payload->'review_escalation'->>'notified_at' IS NULL
+                          OR ((payload->'review_submission'->>'submitted_at')::timestamptz <= %s
+                              AND assignment->>'reviewer_user_id' IS NOT NULL
+                              AND payload->'review_escalation'->>'requeued_at' IS NULL))
+                   ORDER BY (payload->'review_submission'->>'submitted_at')::timestamptz, id
+                   LIMIT %s""",
+                (cutoff, now, requeue_cutoff, limit),
+            ).fetchall()
+        return [_question(row) for row in rows]
+
+    def mark_review_escalation(self, question_id: ObjectId, submitted_at, escalation: dict, *,
+                               assignment: dict | None = None, audit: dict | None = None,
+                               notifications: list[dict] | None = None) -> bool:
+        """Apply one escalation step once per submission; ``assignment`` requeues the question."""
+        with postgres_connection() as conn:
+            pair = self._pair(conn, question_id, lock=True)
+            if not pair or pair[0]["review_status"] != "PENDING":
+                return False
+            question = pair[0]
+            if (question.get("review_submission") or {}).get("submitted_at") != submitted_at:
+                return False
+            current = question.get("review_escalation") or {}
+            if current.get("submitted_at") == submitted_at and all(
+                current.get(key) is not None for key in escalation if key != "submitted_at"
+            ):
+                return False
+            if assignment is not None:
+                held = question.get("review_assignment") or {}
+                expires = held.get("lock_expires_at")
+                if held.get("status") == "IN_REVIEW" and expires is not None and expires > utc_now():
+                    return False
+                question["review_assignment"] = assignment
+            question["review_escalation"] = {
+                **(current if current.get("submitted_at") == submitted_at else {}), **escalation,
+            }
+            question["updated_at"] = utc_now()
+            self._save_question(conn, question)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
             insert_notifications(conn, notifications)
             return True
 
@@ -813,7 +899,9 @@ class PostgresQuestionRepository:
         )
 
     def claim_review(self, question_id: str | ObjectId, *, actor_user_id: ObjectId,
-                     actor_role: str, lock_expires_at, now) -> tuple[dict, dict]:
+                     actor_role: str, lock_expires_at, now,
+                     max_held: int | None = None,
+                     takeover_reason: str | None = None) -> tuple[dict, dict]:
         with postgres_connection() as conn:
             pair = self._pair(conn, question_id, lock=True)
             if not pair:
@@ -821,6 +909,19 @@ class PostgresQuestionRepository:
             question, version = pair
             if question["review_status"] != "PENDING":
                 raise ValueError("Chỉ câu hỏi đang chờ duyệt mới có thể claim")
+            if max_held is not None and actor_role != "Admin":
+                # Serialise claims of one reviewer so two parallel claims cannot both pass the cap.
+                conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"review-claims:{actor_user_id}",))
+                held = conn.execute(
+                    """SELECT count(*) AS n FROM questions
+                       WHERE lifecycle_status='ACTIVE' AND review_status='PENDING' AND id<>%s
+                         AND assignment->>'status'='IN_REVIEW'
+                         AND assignment->>'reviewer_user_id'=%s
+                         AND (assignment->>'lock_expires_at')::timestamptz > %s""",
+                    (str(question["_id"]), str(actor_user_id), now),
+                ).fetchone()["n"]
+                if held >= max_held:
+                    raise ValueError(review_hold_limit_message(max_held))
             secondary = question.get("secondary_review") or {}
             if (secondary.get("status") == "AWAITING_SECONDARY"
                     and secondary.get("primary_reviewer_user_id") == actor_user_id):
@@ -830,23 +931,31 @@ class PostgresQuestionRepository:
             }:
                 raise PermissionError("Bạn không thể kiểm duyệt câu hỏi do chính mình tạo hoặc chỉnh sửa")
             previous = question.get("review_assignment") or {}
-            expires = previous.get("lock_expires_at")
-            if (actor_role != "Admin" and previous.get("status") != "UNASSIGNED"
-                    and previous.get("reviewer_user_id") != actor_user_id
-                    and expires is not None and expires > now):
-                raise PermissionError("Câu hỏi đang được Reviewer khác xử lý")
+            holder = active_holder_id(previous, now)
+            if holder is not None and holder != actor_user_id:
+                if actor_role != "Admin":
+                    raise PermissionError("Câu hỏi đang được Reviewer khác xử lý")
+                if len((takeover_reason or "").strip()) < MIN_TAKEOVER_REASON_LENGTH:
+                    raise ValueError("Câu hỏi đang được Reviewer khác giữ; cần nêu lý do để tiếp nhận")
+            else:
+                holder = None
             assignment = {
                 "status": "IN_REVIEW", "reviewer_user_id": actor_user_id,
                 "assigned_by_user_id": previous.get("assigned_by_user_id") or actor_user_id,
                 "assigned_at": previous.get("assigned_at") or now,
                 "claimed_at": now, "lock_expires_at": lock_expires_at,
+                "renewal_count": carried_renewal_count(previous, actor_user_id),
                 "last_released_at": None, "release_reason": None,
             }
             question["review_assignment"] = assignment
             question["updated_at"] = now
             self._save_question(conn, question)
-            self._assignment_audit(conn, "QUESTION_REVIEW_CLAIMED", question, version,
-                                   actor_user_id, actor_role, previous, assignment)
+            self._assignment_audit(
+                conn, "QUESTION_REVIEW_TAKEN_OVER" if holder else "QUESTION_REVIEW_CLAIMED",
+                question, version, actor_user_id, actor_role, previous, assignment,
+                **({"metadata": {"reason": takeover_reason.strip(),
+                                 "previous_reviewer_user_id": str(holder)}} if holder else {}),
+            )
             return question, version
 
     def release_review(self, question_id: str | ObjectId, *, actor_user_id: ObjectId,
@@ -860,6 +969,7 @@ class PostgresQuestionRepository:
             if (question["review_status"] != "PENDING" or
                     (actor_role != "Admin" and previous.get("reviewer_user_id") != actor_user_id)):
                 raise PermissionError("Bạn không thể release assignment này")
+            assignment = released_assignment(assignment, previous)
             question["review_assignment"] = assignment
             question["updated_at"] = now
             self._save_question(conn, question)
@@ -868,7 +978,7 @@ class PostgresQuestionRepository:
             return question, version
 
     def renew_review(self, question_id: str | ObjectId, *, actor_user_id: ObjectId,
-                     lock_expires_at, now) -> tuple[dict, dict]:
+                     lock_expires_at, now, max_renewals: int | None = None) -> tuple[dict, dict]:
         with postgres_connection() as conn:
             pair = self._pair(conn, question_id, lock=True)
             if not pair:
@@ -879,6 +989,10 @@ class PostgresQuestionRepository:
                     or assignment.get("status") != "IN_REVIEW"
                     or assignment.get("reviewer_user_id") != actor_user_id):
                 raise PermissionError("Bạn không còn giữ khóa kiểm duyệt câu hỏi này")
+            renewals = int(assignment.get("renewal_count") or 0)
+            if max_renewals is not None and renewals >= max_renewals:
+                raise ValueError(review_renewal_limit_message(max_renewals))
+            assignment["renewal_count"] = renewals + 1
             assignment["lock_expires_at"] = lock_expires_at
             question["review_assignment"] = assignment
             question["updated_at"] = now
@@ -922,7 +1036,11 @@ class PostgresQuestionRepository:
         creator_user_id: ObjectId | None = None,
         owner_user_id: ObjectId | None = None,
         visible_to_user_id: ObjectId | None = None,
+        shared_subject_ids=None,
+        include_shared: bool = True,
         approved_current_only: bool = False,
+        approved_version_join: bool = False,
+        reviewer_scope=None,
         waiting_since=None, overdue_at=None,
         override_only: bool = False,
         created_from=None, created_to=None,
@@ -984,13 +1102,30 @@ class PostgresQuestionRepository:
             add("(q.created_by_user_id=%s OR v.created_by_user_id=%s)",
                 str(creator_user_id), str(creator_user_id))
         if owner_user_id is not None:
-            add("(q.created_by_user_id=%s OR v.created_by_user_id=%s)",
+            add("(q.created_by_user_id=%s OR (q.created_by_user_id IS NULL AND v.created_by_user_id=%s))",
                 str(owner_user_id), str(owner_user_id))
+        shared_ids = [str(item) for item in shared_subject_ids or ()] if include_shared else []
+        shared_sql = """OR (%s AND q.payload->'shared_with_user_ids' ? %s)
+                 OR (q.payload->>'shared_scope'='SUBJECT' AND q.approved_version_id IS NOT NULL
+                     AND q.subject_id=ANY(%s))"""
         if visible_to_user_id is not None:
             uid = str(visible_to_user_id)
-            add("""(q.created_by_user_id=%s OR v.created_by_user_id=%s
-                 OR q.payload->'shared_with_user_ids' ? %s
-                 OR q.payload->>'shared_scope'='SUBJECT')""", uid, uid, uid)
+            add("(q.created_by_user_id=%s OR (q.created_by_user_id IS NULL AND v.created_by_user_id=%s) "
+                + shared_sql + ")",
+                uid, uid, include_shared, uid, shared_ids)
+        if reviewer_scope is not None:
+            uid = str(reviewer_scope.user_id)
+            subject_ids = sorted(reviewer_scope.subject_ids)
+            add("(q.created_by_user_id=%s OR (q.created_by_user_id IS NULL AND v.created_by_user_id=%s) "
+                + shared_sql + """
+                 OR q.assignment->>'reviewer_user_id'=%s
+                 OR q.payload->'secondary_review'->>'primary_reviewer_user_id'=%s
+                 OR q.payload->'secondary_review'->>'secondary_reviewer_user_id'=%s
+                 OR (q.review_status='PENDING' AND q.subject_id=ANY(%s))
+                 OR EXISTS (SELECT 1 FROM question_reviews r
+                            WHERE r.question_id=q.id AND r.reviewer_user_id=%s))""",
+                uid, uid, include_shared, uid, shared_ids,
+                uid, uid, uid, subject_ids, uid)
         if question_type:
             add("v.classification->>'assessment_type'=%s", question_type.upper())
         if bloom_level is not None:
@@ -1047,6 +1182,9 @@ class PostgresQuestionRepository:
         }.get(sort_by)
         if order is None:
             raise ValueError("Kiểu sắp xếp hàng kiểm duyệt không hợp lệ")
+        version_column = "approved_version_id" if approved_version_join else "current_version_id"
+        if approved_version_join:
+            source = " FROM questions q JOIN question_versions v ON v.id=q.approved_version_id WHERE "
         with postgres_connection() as conn:
             total = conn.execute(
                 "SELECT count(*) AS n" + source + base_where + status_clause,
@@ -1057,12 +1195,12 @@ class PostgresQuestionRepository:
                 + " ORDER BY " + order + " LIMIT %s OFFSET %s",
                 [*params, *status_params, page_size, (page - 1) * page_size],
             ).fetchall()
-            version_ids = [row["current_version_id"] for row in rows]
+            version_ids = [row[version_column] for row in rows]
             version_rows = conn.execute(
                 "SELECT * FROM question_versions WHERE id=ANY(%s)", (version_ids,),
             ).fetchall() if version_ids else []
             versions = {row["id"]: _version(row) for row in version_rows}
-            pairs = [(_question(row), versions[row["current_version_id"]]) for row in rows]
+            pairs = [(_question(row), versions[row[version_column]]) for row in rows]
             if include_status_counts:
                 counts = conn.execute(
                     "SELECT q.review_status, count(*) AS n" + source + base_where
@@ -1105,6 +1243,28 @@ class PostgresQuestionRepository:
         with postgres_connection() as conn:
             return self._pair(conn, question_id)
 
+    def reviewer_has_decided(self, question_id: str | ObjectId, reviewer_user_id: str | ObjectId) -> bool:
+        with postgres_connection() as conn:
+            return conn.execute(
+                "SELECT 1 FROM question_reviews WHERE question_id=%s AND reviewer_user_id=%s LIMIT 1",
+                (str(object_id(question_id, "question_id")), str(reviewer_user_id)),
+            ).fetchone() is not None
+
+    def find_approved_pair(self, question_id: str | ObjectId) -> tuple[dict, dict] | None:
+        """The question with its last approved version, independent of newer drafts."""
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM questions WHERE id=%s AND lifecycle_status='ACTIVE'",
+                (str(object_id(question_id, "question_id")),),
+            ).fetchone()
+            if not row or not row["approved_version_id"]:
+                return None
+            version_row = conn.execute(
+                "SELECT * FROM question_versions WHERE id=%s AND question_id=%s",
+                (row["approved_version_id"], row["id"]),
+            ).fetchone()
+            return (_question(row), _version(version_row)) if version_row else None
+
     def create(self, aggregate: dict, version: dict) -> tuple[dict, dict]:
         with postgres_connection() as conn:
             self._save_question(conn, aggregate)
@@ -1127,20 +1287,14 @@ class PostgresQuestionRepository:
             new_version.update(_id=ObjectId(), question_id=question["_id"],
                                version=expected_version + 1)
             now = utc_now()
+            review_fields = review_fields_after_edit(question, now, review_submission)
             question.update({
                 "current_version": expected_version + 1,
                 "current_version_id": new_version["_id"],
                 "evaluation_status": "NOT_STARTED",
-                "review_status": "DRAFT",
                 "publication_status": ("STALE" if question["publication_status"] == "PUBLISHED"
                                        else question["publication_status"]),
-                "review_assignment": {
-                    "status": "UNASSIGNED", "reviewer_user_id": None,
-                    "assigned_by_user_id": None, "assigned_at": None,
-                    "claimed_at": None, "lock_expires_at": None,
-                    "last_released_at": None, "release_reason": None,
-                },
-                "review_submission": {}, "secondary_review": {},
+                **review_fields,
                 "quality_summary": {},
                 "subject_id": ((new_version.get("classification") or {}).get("subject") or {}).get("id"),
                 "updated_at": now,
@@ -1177,16 +1331,79 @@ class PostgresQuestionRepository:
             insert_notifications(conn, notifications)
             return question, version
 
-    def archive(self, question_id: str | ObjectId) -> bool:
+    def archive(self, question_id: str | ObjectId, *, audit: dict | None = None,
+                expected_review_status: str | None = None, extra_fields: dict | None = None) -> bool:
         with postgres_connection() as conn:
             pair = self._pair(conn, question_id, lock=True)
-            if not pair:
+            if not pair or pair[0].get("lifecycle_status") != "ACTIVE":
                 return False
             question, _version_record = pair
+            if expected_review_status is not None and question.get("review_status") != expected_review_status:
+                return False
+            question.update(extra_fields or {})
             question.update(lifecycle_status="ARCHIVED", archived_at=utc_now(),
                             updated_at=utc_now())
             self._save_question(conn, question)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
             return True
+
+    def find_archived_pair(self, question_id: str | ObjectId) -> tuple[dict, dict] | None:
+        with postgres_connection() as conn:
+            pair = self._pair(conn, question_id, active_only=False)
+        return pair if pair and pair[0].get("lifecycle_status") == "ARCHIVED" else None
+
+    def list_archived(self, page: int, page_size: int,
+                      owner_user_id: ObjectId | None) -> tuple[list[tuple[dict, dict]], int]:
+        where, params = "WHERE q.lifecycle_status='ARCHIVED'", []
+        if owner_user_id is not None:
+            where += " AND q.created_by_user_id=%s"
+            params.append(str(owner_user_id))
+        with postgres_connection() as conn:
+            total = conn.execute("SELECT count(*) AS n FROM questions q " + where, params).fetchone()["n"]
+        pairs = self._pairs(where + " ORDER BY q.updated_at DESC, q.id DESC LIMIT %s OFFSET %s",
+                            [*params, page_size, (page - 1) * page_size])
+        return pairs, total
+
+    def restore(self, question_id: str | ObjectId, *, audit: dict | None = None) -> tuple[dict, dict] | None:
+        with postgres_connection() as conn:
+            pair = self._pair(conn, question_id, active_only=False, lock=True)
+            if not pair or pair[0].get("lifecycle_status") != "ARCHIVED":
+                return None
+            question, version = pair
+            now = utc_now()
+            question.update(lifecycle_status="ACTIVE", archived_at=None, updated_at=now)
+            if question.get("review_status") == "PENDING":
+                question["review_assignment"] = {
+                    "status": "UNASSIGNED", "reviewer_user_id": None, "assigned_by_user_id": None,
+                    "assigned_at": None, "claimed_at": None, "lock_expires_at": None,
+                    "last_released_at": now, "release_reason": "restored",
+                }
+            self._save_question(conn, question)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
+            return question, version
+
+    def withdraw_submission(self, question_id: str | ObjectId, *, expected_version_id: ObjectId,
+                            fields: dict, audit: dict | None = None) -> tuple[dict, dict] | None:
+        with postgres_connection() as conn:
+            pair = self._pair(conn, question_id, lock=True)
+            if not pair:
+                return None
+            question, version = pair
+            if version["_id"] != expected_version_id or question["review_status"] != "PENDING":
+                raise RuntimeError("VERSION_CONFLICT")
+            assignment = question.get("review_assignment") or {}
+            expires = assignment.get("lock_expires_at")
+            if assignment.get("status") == "IN_REVIEW" and expires is not None and expires > utc_now():
+                raise PermissionError("Reviewer đã nhận câu hỏi này nên không thể rút lại")
+            if (question.get("secondary_review") or {}).get("status") == "AWAITING_SECONDARY":
+                raise PermissionError("Câu hỏi đã có kết quả duyệt lần đầu nên không thể rút lại")
+            question.update(fields)
+            self._save_question(conn, question)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
+            return question, version
 
     def list_versions(self, question_id: str | ObjectId) -> list[dict]:
         key = str(object_id(question_id, "question_id"))
@@ -1199,20 +1416,17 @@ class PostgresQuestionRepository:
             ).fetchall()
         return [_version(row) for row in rows]
 
-    def update_sharing(self, question_id: str | ObjectId,
-                       fields: dict) -> tuple[dict, dict] | None:
+    def update_sharing(self, question_id: str | ObjectId, fields: dict, *,
+                       audit: dict | None = None) -> tuple[dict, dict] | None:
+        """Sharing/ownership fields; ``audit`` is written in the same transaction."""
         with postgres_connection() as conn:
             pair = self._pair(conn, question_id, lock=True)
             if not pair:
                 return None
             question, version = pair
-            normalized = dict(fields)
-            if "shared_with_user_ids" in normalized:
-                normalized["shared_with_user_ids"] = [
-                    object_id(item, "shared_with_user_id")
-                    for item in normalized.get("shared_with_user_ids") or []
-                ]
-            question.update(normalized)
+            question.update(normalize_sharing_fields(fields))
             question["updated_at"] = utc_now()
             self._save_question(conn, question)
+            if audit:
+                write_postgres_audit_event(conn, **audit)
             return question, version

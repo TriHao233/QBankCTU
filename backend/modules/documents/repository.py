@@ -7,12 +7,21 @@ from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.database import Database
 
+from core.audit import write_audit_event
 from core.bootstrap import SCHEMA_VERSION
+from core.database import mongo_transaction
 from modules.catalog.postgres_subject_repository import subject_record, subject_records
+from modules.catalog.subject_approval import subject_usable_by
 
 ACTIVE_DOCUMENT_JOB_STATUSES = {"QUEUED", "PROCESSING"}
 RETRYABLE_DOCUMENT_JOB_STATUSES = {"FAILED", "ERROR", "STALE"}
 RETRYABLE_DOCUMENT_JOB_TYPES = {"OCR", "CHUNK", "INDEX"}
+DUPLICATE_IGNORED_STATUSES = frozenset({"ARCHIVED", "FAILED"})
+DOCUMENT_BUSY_MESSAGE = "Tài liệu đang được xử lý; hãy chờ hoặc hủy job trước khi lưu trữ"
+
+
+class DocumentBusyError(ValueError):
+    """The document still has a queued or running extraction/chunk/index job."""
 
 
 def utc_now() -> datetime:
@@ -149,11 +158,16 @@ class DocumentRepository(Protocol):
         subject_id: ObjectId | None = None,
         uploaded_by_user_id: ObjectId | None = None,
         visible_to_user_id: ObjectId | None = None,
+        shared_subject_ids=None,
     ) -> tuple[list[dict], int]: ...
 
-    def update(self, document_id: str | ObjectId, fields: dict) -> dict | None: ...
+    def update(self, document_id: str | ObjectId, fields: dict, *, audit: dict | None = None) -> dict | None: ...
 
-    def archive(self, document_id: str | ObjectId) -> bool: ...
+    def archive(self, document_id: str | ObjectId, *, audit: dict | None = None) -> bool: ...
+
+    def find_archived(self, document_id: str | ObjectId) -> dict | None: ...
+
+    def restore(self, document_id: str | ObjectId, *, status: str, audit: dict | None = None) -> dict | None: ...
 
     def list_jobs(self, document_id: str | ObjectId, *, limit: int = 20) -> list[dict]: ...
 
@@ -232,6 +246,14 @@ class MongoDocumentRepository:
         if chapter_id not in chapter_ids:
             raise ValueError("Chương không thuộc học phần đã chọn")
 
+    def validate_subjects_usable_by(self, subject_ids: list[ObjectId], user_id: ObjectId | None) -> None:
+        """Only the owner can attach documents to a subject still waiting for admin approval."""
+        if not subject_ids or user_id is None:
+            return
+        for subject in subject_records(self.db, ids=subject_ids):
+            if not subject_usable_by(subject, user_id):
+                raise ValueError("Học phần không tồn tại hoặc đã ngừng hoạt động")
+
     def validate_subject_ids(self, subject_ids: list[ObjectId]) -> None:
         if not subject_ids:
             return
@@ -258,6 +280,7 @@ class MongoDocumentRepository:
         chapter_id = object_id(data["chapter_id"], "chapter_id") if data.get("chapter_id") else None
         self.validate_subject_ids(subject_ids)
         self.validate_subject_chapter(subject_id, chapter_id)
+        self.validate_subjects_usable_by(subject_ids, uploaded_by_user_id)
         artifacts = []
         if data.get("original_uri"):
             artifacts.append(
@@ -326,8 +349,10 @@ class MongoDocumentRepository:
         subject_id: ObjectId | None = None,
         uploaded_by_user_id: ObjectId | None = None,
         visible_to_user_id: ObjectId | None = None,
+        shared_subject_ids=None,
     ) -> tuple[list[dict], int]:
-        query: dict = {"schema_version": SCHEMA_VERSION, "archived_at": None}
+        archived = status == "ARCHIVED"
+        query: dict = {"schema_version": SCHEMA_VERSION, "archived_at": {"$ne": None} if archived else None}
         if uploaded_by_user_id is not None:
             query["uploaded_by_user_id"] = uploaded_by_user_id
         filters = []
@@ -337,7 +362,9 @@ class MongoDocumentRepository:
                     "$or": [
                         {"uploaded_by_user_id": visible_to_user_id},
                         {"shared_with_user_ids": visible_to_user_id},
-                        {"shared_scope": "SUBJECT"},
+                        {"shared_scope": "SUBJECT", "subject_ids": {"$in": [
+                            object_id(item, "subject_id") for item in shared_subject_ids or ()
+                        ]}},
                     ]
                 }
             )
@@ -370,7 +397,7 @@ class MongoDocumentRepository:
         )
         return records, total
 
-    def update(self, document_id: str | ObjectId, fields: dict) -> dict | None:
+    def update(self, document_id: str | ObjectId, fields: dict, *, audit: dict | None = None) -> dict | None:
         current = self.find_by_id(document_id)
         if not current:
             return None
@@ -407,27 +434,67 @@ class MongoDocumentRepository:
             normalized.get("chapter_id", current.get("chapter_id")),
         )
         normalized["updated_at"] = utc_now()
-        return self.collection.find_one_and_update(
+        query = {
+            "_id": object_id(document_id, "document_id"),
+            "schema_version": SCHEMA_VERSION,
+            "archived_at": None,
+        }
+        if not audit:
+            return self.collection.find_one_and_update(
+                query, {"$set": normalized}, return_document=ReturnDocument.AFTER,
+            )
+        with mongo_transaction() as session:
+            updated = self.collection.find_one_and_update(
+                query, {"$set": normalized}, return_document=ReturnDocument.AFTER, session=session,
+            )
+            if updated is not None:
+                write_audit_event(self.db, session=session, **audit)
+        return updated
+
+    def archive(self, document_id: str | ObjectId, *, audit: dict | None = None) -> bool:
+        now = utc_now()
+        document_oid = object_id(document_id, "document_id")
+        with mongo_transaction() as session:
+            if self.db.document_jobs.count_documents(
+                {"document_id": document_oid, "status": {"$in": sorted(ACTIVE_DOCUMENT_JOB_STATUSES)}},
+                session=session,
+            ):
+                raise DocumentBusyError(DOCUMENT_BUSY_MESSAGE)
+            result = self.collection.update_one(
+                {"_id": document_oid, "schema_version": SCHEMA_VERSION, "archived_at": None},
+                # An unpromoted candidate version is abandoned rather than promoted after restore.
+                {"$set": {"status": "ARCHIVED", "archived_at": now, "updated_at": now, "pending_processing": {}}},
+                session=session,
+            )
+            if result.matched_count == 1 and audit:
+                write_audit_event(self.db, session=session, **audit)
+        return result.matched_count == 1
+
+    def find_archived(self, document_id: str | ObjectId) -> dict | None:
+        return self.collection.find_one(
             {
                 "_id": object_id(document_id, "document_id"),
                 "schema_version": SCHEMA_VERSION,
-                "archived_at": None,
-            },
-            {"$set": normalized},
-            return_document=ReturnDocument.AFTER,
+                "archived_at": {"$ne": None},
+            }
         )
 
-    def archive(self, document_id: str | ObjectId) -> bool:
+    def restore(self, document_id: str | ObjectId, *, status: str, audit: dict | None = None) -> dict | None:
         now = utc_now()
-        result = self.collection.update_one(
-            {
-                "_id": object_id(document_id, "document_id"),
-                "schema_version": SCHEMA_VERSION,
-                "archived_at": None,
-            },
-            {"$set": {"status": "ARCHIVED", "archived_at": now, "updated_at": now}},
-        )
-        return result.matched_count == 1
+        with mongo_transaction() as session:
+            restored = self.collection.find_one_and_update(
+                {
+                    "_id": object_id(document_id, "document_id"),
+                    "schema_version": SCHEMA_VERSION,
+                    "archived_at": {"$ne": None},
+                },
+                {"$set": {"status": status, "archived_at": None, "updated_at": now}},
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+            if restored is not None and audit:
+                write_audit_event(self.db, session=session, **audit)
+        return restored
 
     def list_jobs(self, document_id: str | ObjectId, *, limit: int = 20) -> list[dict]:
         document_oid = object_id(document_id, "document_id")
@@ -499,6 +566,18 @@ class MongoDocumentRepository:
                 {"$set": {"updated_at": now}},
             )
         return page
+
+    def find_duplicate_original(self, uploaded_by_user_id, sha256: str) -> dict | None:
+        """An active (not archived, not failed) document of this uploader with the same original file."""
+        return self.collection.find_one(
+            {
+                "uploaded_by_user_id": uploaded_by_user_id,
+                "archived_at": None,
+                "status": {"$nin": list(DUPLICATE_IGNORED_STATUSES)},
+                "artifacts": {"$elemMatch": {"sha256": sha256, "type": {"$regex": "^ORIGINAL_"}}},
+            },
+            {"_id": 1, "title": 1},
+        )
 
     def attach_original_artifact(
         self,
@@ -592,7 +671,7 @@ class MongoDocumentRepository:
         active_pointer = (
             current_processing.get("ocr_job_id")
             if normalized_type == "OCR"
-            else current_processing.get("chunk_set_id") if normalized_type == "CHUNK" else None
+            else current_processing.get("chunk_set_id") if normalized_type in {"CHUNK", "INDEX"} else None
         )
         record = {
             "_id": ObjectId(),

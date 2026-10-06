@@ -5,6 +5,7 @@ import {
   addSubjectLearningOutcome,
   deactivateSubject,
   listSubjects,
+  resubmitSubject,
   saveSubject,
   updateSubject,
   updateSubjectChapter,
@@ -31,8 +32,18 @@ const REVIEW_STATUS_LABEL = {
 const STATUS_FILTERS = [
   { value: 'active', label: 'Đang dùng' },
   { value: 'mine', label: 'Của tôi' },
+  { value: 'pending', label: 'Chờ duyệt' },
   { value: 'all', label: 'Tất cả' },
 ];
+
+const SUBJECT_APPROVAL_LABEL = {
+  PENDING_APPROVAL: 'Chờ Admin duyệt',
+  REJECTED: 'Bị từ chối',
+};
+
+function approvalStatus(subject) {
+  return subject?.approval_status || 'APPROVED';
+}
 
 function refId(value) {
   if (!value) return '';
@@ -74,7 +85,6 @@ function SubjectManage() {
   const { user } = useContext(AuthContext);
   const permissions = permissionsForUser(user);
   const canCreateSubjects = permissions.includes('catalog.subjects.manage_own');
-
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -165,6 +175,7 @@ function SubjectManage() {
     return subjects.filter((subject) => {
       if (statusFilter === 'active' && subject.is_active === false) return false;
       if (statusFilter === 'mine' && !subject.can_manage) return false;
+      if (statusFilter === 'pending' && approvalStatus(subject) === 'APPROVED') return false;
       if (!needle) return true;
       return subjectSearchText(subject).includes(needle);
     });
@@ -235,7 +246,11 @@ function SubjectManage() {
         : await saveSubject(payload);
       const savedId = refId(saved) || refId(editingSubject);
       if (savedId) setSelectedSubjectId(savedId);
-      setNotice(editingSubject ? 'Đã cập nhật học phần.' : 'Đã tạo học phần mới.');
+      setNotice(editingSubject
+        ? 'Đã cập nhật học phần.'
+        : approvalStatus(saved) === 'PENDING_APPROVAL'
+          ? 'Đã tạo học phần, đang chờ Admin duyệt. Trong lúc chờ chỉ bạn dùng được học phần này.'
+          : 'Đã tạo học phần mới.');
       setSubjectModalOpen(false);
       await fetchSubjects();
     } catch (err) {
@@ -267,6 +282,26 @@ function SubjectManage() {
       setBusyId(null);
     }
   };
+
+  const runApprovalAction = async (subject, action, successMessage) => {
+    setBusyId(refId(subject));
+    setError('');
+    try {
+      await action();
+      setNotice(successMessage);
+      await fetchSubjects();
+    } catch (err) {
+      setError(err.message || 'Không thể cập nhật trạng thái duyệt học phần');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleResubmit = (subject) => runApprovalAction(
+    subject,
+    () => resubmitSubject(refId(subject)),
+    'Đã gửi duyệt lại học phần.',
+  );
 
   const handleRestore = async (subject) => {
     const originalId = refId(subject);
@@ -465,6 +500,9 @@ function SubjectManage() {
                           <small>{counts.questions || 0} câu hỏi · {activeChapterCount} chương · {activeCloCount} CLO</small>
                         </span>
                         <span className="subject-row-tags">
+                          {SUBJECT_APPROVAL_LABEL[approvalStatus(subject)] && (
+                            <span>{SUBJECT_APPROVAL_LABEL[approvalStatus(subject)]}</span>
+                          )}
                           {!subject.can_manage && <span>Chỉ xem</span>}
                           {subject.is_active === false && <span>Đã ngừng</span>}
                         </span>
@@ -492,12 +530,37 @@ function SubjectManage() {
                         <span>{selectedSubject.owner_email || 'Chưa có email chủ sở hữu'}</span>
                         <span>{selectedSubject.is_active === false ? 'Đã ngừng sử dụng' : 'Đang sử dụng'}</span>
                         <span>{selectedSubject.can_manage ? 'Có quyền chỉnh sửa' : 'Chỉ xem'}</span>
+                        {SUBJECT_APPROVAL_LABEL[approvalStatus(selectedSubject)] && (
+                          <span>{SUBJECT_APPROVAL_LABEL[approvalStatus(selectedSubject)]}</span>
+                        )}
                       </div>
+                      {approvalStatus(selectedSubject) === 'PENDING_APPROVAL' && (
+                        <p className="subject-alert">
+                          Học phần đang chờ Admin duyệt: chỉ chủ sở hữu dùng được để tải tài liệu và sinh câu hỏi;
+                          chưa thể gửi duyệt câu hỏi, chia sẻ hoặc tạo đề thi.
+                        </p>
+                      )}
+                      {approvalStatus(selectedSubject) === 'REJECTED' && (
+                        <p className="subject-alert subject-alert--error">
+                          Học phần bị từ chối{selectedSubject.approval_reason ? `: ${selectedSubject.approval_reason}` : ''}.
+                          Hãy chỉnh sửa rồi gửi duyệt lại.
+                        </p>
+                      )}
                     </div>
                     <div className="subject-action-stack">
                       <button type="button" className="btn btn--outline" onClick={() => goToQuestionManager()}>
                         Quản lý câu hỏi
                       </button>
+                      {selectedSubject.can_manage && approvalStatus(selectedSubject) === 'REJECTED' && (
+                        <button
+                          type="button"
+                          className="btn btn--primary"
+                          disabled={busyId === selectedSubjectId}
+                          onClick={() => handleResubmit(selectedSubject)}
+                        >
+                          Gửi duyệt lại
+                        </button>
+                      )}
                       {selectedSubject.can_manage && (
                         <>
                           <button type="button" className="btn btn--outline" onClick={() => openEditSubject(selectedSubject)}>

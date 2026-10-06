@@ -56,7 +56,8 @@ def _context_evidence_sections(context_text: str) -> list[str]:
     return [
         match.strip()
         for match in re.findall(
-            r"(?:^|\n)Nội dung:\s*(.*?)(?=\n\s*---\s*(?:\n|$)|\Z)",
+            # A Markdown rule inside a chunk is content; only a rule followed by the next header ends a section.
+            r"(?:^|\n)Nội dung:\s*(.*?)(?=\n\s*---\s*\n\s*Mục lục:|\Z)",
             str(context_text or ""),
             flags=re.DOTALL,
         )
@@ -122,6 +123,21 @@ def _plausible_near_duplicate(first: str, second: str) -> bool:
         return False
     overlap = len(first_tokens & second_tokens) / min(len(first_tokens), len(second_tokens))
     return overlap >= 0.5
+
+
+def duplicate_level(question: str, existing_texts: Iterable[str]) -> str | None:
+    """"exact" or "near" when ``question`` repeats one of ``existing_texts``, else None."""
+    fingerprint = question_fingerprint(question)
+    if not fingerprint:
+        return None
+    level = None
+    for text in existing_texts:
+        other = question_fingerprint(text)
+        if other == fingerprint:
+            return "exact"
+        if level is None and _plausible_near_duplicate(fingerprint, other) and _near_duplicate(fingerprint, other):
+            level = "near"
+    return level
 
 
 def filter_duplicate_questions(

@@ -25,11 +25,21 @@ from modules.notifications.service import (
     NotificationService,
     safe_notify_review_assigned,
     safe_notify_review_decision,
+    safe_notify_review_taken_over,
     safe_notify_secondary_review_pending,
     safe_notify_secondary_review_available,
 )
 from modules.questions.repository import MongoQuestionRepository, json_safe, object_id, serialize_question, utc_now
 from modules.rag.search import get_evaluation_evidence
+from modules.questions.review_limits import (
+    MIN_TAKEOVER_REASON_LENGTH,
+    active_holder_id,
+    carried_renewal_count,
+    released_assignment,
+    review_hold_limit_message,
+    review_renewal_limit_message,
+)
+from modules.questions.review_scope import ReviewerScope, reviewer_can_read
 from modules.questions.workflow_schemas import (
     AutoAssignRequest,
     AutoEvaluationRequest,
@@ -45,7 +55,7 @@ from modules.questions.workflow_schemas import (
     SecondaryReviewRequest,
 )
 from modules.users.store import (
-    active_admin_ids, find_user_record, review_candidate_users, users_by_ids,
+    active_admin_ids, find_user_record, review_candidate_users, teaching_subject_ids, users_by_ids,
 )
 
 DEFAULT_WEIGHTS = {
@@ -96,6 +106,7 @@ EVALUATION_TYPE_PROMPT_PREFIX = "evaluation:question_type"
 EVALUATION_TYPE_PROMPT_DIR = "evaluation/question_type"
 DEFAULT_EVALUATOR_MODEL_CODE = settings.evaluation_model_provider
 EVALUATION_ACTIVE_STATUSES = {"QUEUED", "PROCESSING"}
+MAX_MANUAL_EVALUATIONS_PER_VERSION = 3
 # Ai có thể kiểm duyệt được xác định bằng quyền reviews.manage (không chỉ theo vai trò).
 REVIEWER_CANDIDATE_FILTER = [
     {"role": {"$in": ["Reviewer", "Admin"]}},
@@ -113,12 +124,17 @@ def secondary_review_recipients(users: list[dict], *, question: dict, version: d
     """Prefer subject specialists, excluding all authors and the primary reviewer."""
     excluded = {str(primary_reviewer_user_id), str(question.get("created_by_user_id")), str(version.get("created_by_user_id"))}
     excluded.update(str(item) for item in question.get("author_user_ids") or [])
+    excluded.add(str((question.get("review_submission") or {}).get("submitted_by_user_id")))
     eligible = [user for user in users if str(user["_id"]) not in excluded and _user_can_review(user)]
-    reviewers = [user for user in eligible if user.get("role") != "Admin"]
     subject = (version.get("classification") or {}).get("subject") or {}
     subject_id = str(question.get("subject_id") or (subject.get("id") if isinstance(subject, dict) else subject) or "")
-    specialists = [user for user in reviewers if subject_id in {str(item) for item in user.get("review_subject_ids") or []}]
-    recipients = specialists or reviewers or [user for user in eligible if user.get("role") == "Admin"]
+    # Only reviewers assigned to the subject can claim the second review.
+    specialists = [
+        user for user in eligible
+        if user.get("role") != "Admin"
+        and subject_id in {str(item) for item in user.get("review_subject_ids") or []}
+    ]
+    recipients = specialists or [user for user in eligible if user.get("role") == "Admin"]
     return list(dict.fromkeys(user["_id"] for user in sorted(recipients, key=lambda item: str(item["_id"]))))[:20]
 
 
@@ -326,18 +342,13 @@ class QuestionWorkflowService:
             raise LookupError("Không tìm thấy câu hỏi")
         return pair
 
-    def _owns_question(self, question: dict, version: dict, user_id: ObjectId) -> bool:
-        if question.get("created_by_user_id") == user_id:
-            return True
-        if version.get("created_by_user_id") == user_id:
-            return True
-        document_id = version.get("document_id")
-        if document_id:
-            from modules.documents.store import get_document_repository
-            document = get_document_repository(self.db).find_by_id(document_id)
-            if document and document.get("uploaded_by_user_id") == user_id:
-                return True
-        return False
+    @staticmethod
+    def _owns_question(question: dict, version: dict, user_id: ObjectId) -> bool:
+        """Only the question owner; version authors and document uploaders gain nothing."""
+        owner = question.get("created_by_user_id")
+        if owner is not None:
+            return owner == user_id
+        return version.get("created_by_user_id") == user_id
 
     @staticmethod
     def _can_review_all(current_user: CurrentUser) -> bool:
@@ -347,12 +358,18 @@ class QuestionWorkflowService:
     def _can_manage_all(current_user: CurrentUser) -> bool:
         return current_user.role == "Admin" or has_permission(current_user, "questions.manage_all")
 
-    @staticmethod
-    def _is_shared_question(question: dict, current_user: CurrentUser) -> bool:
+    def _is_shared_question(self, question: dict, current_user: CurrentUser, version: dict | None = None) -> bool:
         if not has_permission(current_user, "questions.use_shared_bank"):
             return False
         shared_with = set(question.get("shared_with_user_ids") or [])
-        return current_user.id in shared_with or question.get("shared_scope") == "SUBJECT"
+        if current_user.id in shared_with:
+            return True
+        if question.get("shared_scope") != "SUBJECT":
+            return False
+        subject_id = question.get("subject_id") or (
+            ((version or {}).get("classification") or {}).get("subject") or {}
+        ).get("id")
+        return bool(subject_id) and str(subject_id) in teaching_subject_ids(self.db, current_user.id)
 
     def _ensure_read_access(
         self,
@@ -360,10 +377,32 @@ class QuestionWorkflowService:
         version: dict,
         current_user: CurrentUser | None,
     ) -> None:
-        if not current_user or self._can_manage_all(current_user) or self._can_review_all(current_user):
+        if not current_user or self._can_manage_all(current_user):
             return
-        if not self._owns_question(question, version, current_user.id) and not self._is_shared_question(question, current_user):
-            raise PermissionError("Bạn không có quyền truy cập câu hỏi này")
+        if self._owns_question(question, version, current_user.id) or self._is_shared_question(
+            question, current_user, version,
+        ):
+            return
+        if self._can_review_all(current_user):
+            record = find_user_record(self.db, current_user.id) or {}
+            scope = ReviewerScope(current_user.id, record.get("review_subject_ids") or [])
+            if not reviewer_can_read(
+                question, version, scope,
+                lambda: self._reviewer_has_decided(question["_id"], current_user.id),
+            ):
+                # Out-of-scope questions look missing rather than forbidden.
+                raise LookupError("Không tìm thấy câu hỏi")
+            return
+        raise LookupError("Không tìm thấy câu hỏi")
+
+    def _reviewer_has_decided(self, question_id, reviewer_user_id) -> bool:
+        if settings.question_store == "postgres":
+            return self.questions.reviewer_has_decided(question_id, reviewer_user_id)
+        if self.db is None:
+            return False
+        return self.db.question_reviews.find_one(
+            {"question_id": question_id, "reviewer_user_id": reviewer_user_id}, {"_id": 1},
+        ) is not None
 
     def _policy(self) -> dict:
         if settings.ai_config_store == "postgres":
@@ -1647,6 +1686,7 @@ class QuestionWorkflowService:
         user_id,
         *,
         require_active_job: bool = False,
+        update_question: bool = True,
     ) -> dict:
         question, version = self._pair(question_id)
         if question["current_version"] != payload.expected_version:
@@ -1782,6 +1822,7 @@ class QuestionWorkflowService:
                 evaluation_status="PASSED" if passed else "FAILED",
                 quality_summary=quality_summary,
                 require_active_job=require_active_job,
+                update_question=update_question,
             )
         else:
             with mongo_transaction() as session:
@@ -1796,31 +1837,86 @@ class QuestionWorkflowService:
                     if not job_touch.matched_count:
                         raise EvaluationInterruptedError("Tác vụ AI đánh giá đã bị dừng")
                 self.db.question_evaluations.insert_one(evaluation, session=session)
-                result = self.db.questions.update_one(
-                    {
-                        "_id": question["_id"],
-                        "current_version_id": version["_id"],
-                        "lifecycle_status": "ACTIVE",
-                    },
-                    {
-                        "$set": {
-                            "evaluation_status": "PASSED" if passed else "FAILED",
-                            "quality_summary": quality_summary,
-                            "updated_at": now,
-                        }
-                    },
-                    session=session,
-                )
-                if not result.matched_count:
+                current = {
+                    "_id": question["_id"],
+                    "current_version_id": version["_id"],
+                    "lifecycle_status": "ACTIVE",
+                }
+                if update_question:
+                    matched = self.db.questions.update_one(
+                        current,
+                        {
+                            "$set": {
+                                "evaluation_status": "PASSED" if passed else "FAILED",
+                                "quality_summary": quality_summary,
+                                "updated_at": now,
+                            }
+                        },
+                        session=session,
+                    ).matched_count
+                else:
+                    matched = self.db.questions.count_documents(current, session=session)
+                if not matched:
                     raise RuntimeError("VERSION_CONFLICT")
                 self.db.audit_logs.insert_one(audit, session=session)
         return json_safe(evaluation)
 
-    async def auto_evaluate(self, question_id: str, payload: AutoEvaluationRequest, user_id) -> dict:
+    def ensure_question_readable(self, question_id: str, current_user: CurrentUser) -> None:
         question, version = self._pair(question_id)
+        self._ensure_read_access(question, version, current_user)
+
+    def evaluate_manual(self, question_id: str, payload: EvaluationCreateRequest,
+                        current_user: CurrentUser) -> dict:
+        """A person's own scoring; recorded in the history without touching the AI evaluation state."""
+        question, version = self._pair(question_id)
+        self._ensure_read_access(question, version, current_user)
+        if not self._may_evaluate_manually(question, version, current_user):
+            raise PermissionError(
+                "Chỉ chủ câu hỏi, người được chia sẻ quyền sửa hoặc reviewer đang giữ câu được tự đánh giá"
+            )
+        if self._manual_evaluation_count(version["_id"]) >= MAX_MANUAL_EVALUATIONS_PER_VERSION:
+            raise ValueError(
+                f"Mỗi phiên bản chỉ được tự đánh giá tối đa {MAX_MANUAL_EVALUATIONS_PER_VERSION} lần"
+            )
+        manual = payload.model_copy(update={
+            "trigger": "MANUAL",
+            "evaluator_model_code": "human",
+            "model_snapshot": {"model_code": "human", "provider": "HUMAN",
+                               "evaluated_by_user_id": str(current_user.id)},
+            "model_execution": {},
+            "raw_model_response": None,
+            "prompt_snapshot": {},
+            "policy_snapshot": {},
+            "evaluation_job_id": None,
+        })
+        return self.evaluate(question_id, manual, current_user.id, update_question=False)
+
+    def _may_evaluate_manually(self, question: dict, version: dict, current_user: CurrentUser) -> bool:
+        if current_user.role == "Admin" or self._owns_question(question, version, current_user.id):
+            return True
+        if current_user.id in set(question.get("shared_edit_user_ids") or []):
+            return True
+        assignment = question.get("review_assignment") or {}
+        return (
+            assignment.get("status") == "IN_REVIEW"
+            and assignment.get("reviewer_user_id") == current_user.id
+            and self._is_claimed(assignment, utc_now())
+        )
+
+    def _manual_evaluation_count(self, version_id: ObjectId) -> int:
+        if settings.question_store == "postgres":
+            return self.questions.manual_evaluation_count(version_id)
+        if self.db is None:
+            return 0
+        return self.db.question_evaluations.count_documents(
+            {"question_version_id": version_id, "trigger": "MANUAL"},
+        )
+
+    async def auto_evaluate(self, question_id: str, payload: AutoEvaluationRequest, user_id) -> dict:
+        question, version = await asyncio.to_thread(self._pair, question_id)
         if question["current_version"] != payload.expected_version:
             raise RuntimeError("VERSION_CONFLICT")
-        source_chunks, retrieval_snapshot = self._retrieve_evaluation_sources(version)
+        source_chunks, retrieval_snapshot = await asyncio.to_thread(self._retrieve_evaluation_sources, version)
         grounded_version = {
             **version,
             "sources": [
@@ -1869,16 +1965,18 @@ class QuestionWorkflowService:
             evaluator_code = "local-heuristic-evaluator-v1"
         else:
             try:
-                model_snapshot = resolve_model_snapshot(
+                model_snapshot = await asyncio.to_thread(
+                    resolve_model_snapshot,
                     evaluator_code,
                     capability=EVALUATION_CAPABILITY,
                     database=self.db,
                 )
                 model_snapshot = _limit_evaluation_output(model_snapshot)
                 llm = get_llm_service(evaluator_code, model_snapshot=model_snapshot)
-                policy = self._policy()
+                policy = await asyncio.to_thread(self._policy)
                 policy_snapshot = self._policy_snapshot(policy)
-                prompt, prompt_snapshot, _ = self._build_evaluation_prompt(
+                prompt, prompt_snapshot, _ = await asyncio.to_thread(
+                    self._build_evaluation_prompt,
                     question,
                     version,
                     policy,
@@ -1887,7 +1985,8 @@ class QuestionWorkflowService:
                 started = time.perf_counter()
                 raw_model_response = await llm.generate_text(prompt)
                 duration_ms = int((time.perf_counter() - started) * 1000)
-                scores, feedback, evidence = self._finalize_llm_evaluation(
+                scores, feedback, evidence = await asyncio.to_thread(
+                    self._finalize_llm_evaluation,
                     raw_model_response,
                     source_chunks,
                     grounded_version,
@@ -1934,7 +2033,8 @@ class QuestionWorkflowService:
                     "fallback_reason": str(exc),
                     "raw_model_response": raw_model_response,
                 }
-        return self.evaluate(
+        return await asyncio.to_thread(
+            self.evaluate,
             question_id,
             EvaluationCreateRequest(
                 expected_version=payload.expected_version,
@@ -2588,7 +2688,8 @@ class QuestionWorkflowService:
             heuristic_fallback = False
             try:
                 raw_model_response = await llm.generate_text(prompt)
-                scores, feedback, evidence = self._finalize_llm_evaluation(
+                scores, feedback, evidence = await asyncio.to_thread(
+                    self._finalize_llm_evaluation,
                     raw_model_response,
                     source_chunks,
                     grounded_version,
@@ -2676,7 +2777,8 @@ class QuestionWorkflowService:
             blocked_evidence = dict(exc.evidence)
             if retrieval_snapshot:
                 blocked_evidence["retrieval"] = json_safe(retrieval_snapshot)
-            return self._mark_evaluation_job_error(
+            return await asyncio.to_thread(
+                self._mark_evaluation_job_error,
                 job,
                 str(exc),
                 status="BLOCKED",
@@ -2724,16 +2826,42 @@ class QuestionWorkflowService:
     def _assignment_expires_at(self, now) -> object:
         return now + timedelta(hours=max(1, settings.review_assignment_timeout_hours))
 
-    def _ensure_not_author(self, question: dict, version: dict, current_user: CurrentUser) -> None:
-        if current_user.id in {
+    def _review_author_ids(self, question: dict, version: dict) -> set[str]:
+        """Everyone who created, edited any version of, submitted, or may edit the question."""
+        submission = question.get("review_submission") or {}
+        ids = {
             question.get("created_by_user_id"),
             version.get("created_by_user_id"),
-        }:
-            raise PermissionError("Bạn không thể kiểm duyệt câu hỏi do chính mình tạo hoặc chỉnh sửa")
+            submission.get("submitted_by_user_id"),
+            question.get("submitted_by_user_id"),
+            *(question.get("author_user_ids") or []),
+            *(question.get("shared_edit_user_ids") or []),
+        }
+        list_versions = getattr(self.questions, "list_versions", None)
+        if list_versions is not None and question.get("_id") is not None:
+            ids.update(item.get("created_by_user_id") for item in list_versions(question["_id"]) or [])
+        return {str(item) for item in ids if item}
+
+    def _ensure_not_author(self, question: dict, version: dict, current_user: CurrentUser) -> None:
+        if str(current_user.id) in self._review_author_ids(question, version):
+            raise PermissionError("Bạn không thể kiểm duyệt câu hỏi do chính mình tạo, chỉnh sửa hoặc gửi duyệt")
+
+    @staticmethod
+    def _reviewer_covers(question: dict, version: dict, reviewer: dict) -> bool:
+        if reviewer.get("role") == "Admin":
+            return True
+        scope = ReviewerScope(reviewer["_id"], reviewer.get("review_subject_ids") or [])
+        return scope.covers_question(question, version)
+
+    def _ensure_reviewer_covers(self, question: dict, version: dict, current_user: CurrentUser) -> None:
+        """Reviewers act only on subjects in review_subject_ids (empty means none)."""
+        if current_user.role == "Admin":
+            return
+        record = find_user_record(self.db, current_user.id) or {"_id": current_user.id}
+        if not self._reviewer_covers(question, version, record):
+            raise PermissionError("Câu hỏi không thuộc học phần bạn được phân công kiểm duyệt")
 
     def _assignment_available_filter(self, current_user: CurrentUser, now) -> list[dict]:
-        if current_user.role == "Admin":
-            return []
         return [
             {"review_assignment": {"$exists": False}},
             {"review_assignment.status": "UNASSIGNED"},
@@ -2742,9 +2870,67 @@ class QuestionWorkflowService:
             {"review_assignment.lock_expires_at": {"$lte": now}},
         ]
 
+    def _other_eligible_reviewer_exists(self, question: dict, version: dict, current_user: CurrentUser) -> bool:
+        excluded = self._review_author_ids(question, version) | {str(current_user.id)}
+        for user in review_candidate_users(self.db):
+            if str(user["_id"]) in excluded or not _user_can_review(user):
+                continue
+            if self._reviewer_covers(question, version, user):
+                return True
+        return False
+
+    def _ensure_break_glass_allowed(
+        self, question: dict, version: dict, current_user: CurrentUser, reason: str,
+    ) -> None:
+        """An Admin may decide on their own question only when nobody else can."""
+        if not settings.admin_self_review_break_glass:
+            raise PermissionError("Bạn là người tạo/sửa câu này nên không thể tự kiểm duyệt")
+        if self._other_eligible_reviewer_exists(question, version, current_user):
+            raise PermissionError("Còn reviewer khác phụ trách câu này; hãy phân công cho họ thay vì tự duyệt")
+        if len(reason) < 10:
+            raise ValueError("Tự duyệt khẩn cấp cần ghi lý do tối thiểu 10 ký tự")
+
+    @staticmethod
+    def _break_glass_audit_fields(question: dict, version: dict, review: dict, current_user: CurrentUser) -> dict:
+        return {
+            "action": "QUESTION_BREAK_GLASS_REVIEW",
+            "entity_type": "question",
+            "entity_id": question["_id"],
+            "entity_version_id": version["_id"],
+            "actor_user_id": current_user.id,
+            "actor_role": current_user.role,
+            "metadata": {
+                "review_id": review["_id"],
+                "decision": review["decision"],
+                "reason": review["self_review_reason"],
+                "severity": "HIGH",
+            },
+            "created_at": review["reviewed_at"],
+        }
+
+    def _notify_admins_break_glass(
+        self, question: dict, version: dict, review: dict, current_user: CurrentUser,
+    ) -> None:
+        try:
+            recipients = [item for item in active_admin_ids(self.db) if item != current_user.id]
+            code = question.get("question_code", "Câu hỏi")
+            NotificationService(self.db).create_many([
+                {
+                    "recipient_user_id": admin_id,
+                    "actor_user_id": current_user.id,
+                    "type": "QUESTION_BREAK_GLASS_REVIEW",
+                    "title": f"{code}: quản trị viên tự duyệt khẩn cấp",
+                    "body": f"Lý do: {review['self_review_reason']}",
+                    "link": f"/kiem-duyet?questionId={question['_id']}",
+                    "entity": {"type": "question", "id": str(question["_id"]), "version_id": str(version["_id"])},
+                }
+                for admin_id in recipients
+            ])
+        except Exception as exc:  # noqa: BLE001 - notification is best-effort
+            logger.warning("Break-glass notification failed for %s: %s", question["_id"], exc)
+
     def _ensure_review_lock(self, question: dict, current_user: CurrentUser, now) -> None:
-        if current_user.role == "Admin":
-            return
+        """Every decision, Admin included, requires holding the claim."""
         assignment = question.get("review_assignment") or {}
         if assignment.get("status") != "IN_REVIEW":
             raise PermissionError("Bạn cần claim câu hỏi trước khi kiểm duyệt")
@@ -2787,27 +2973,63 @@ class QuestionWorkflowService:
             metadata=metadata or {},
         )
 
-    def claim_review(self, question_id: str, current_user: CurrentUser) -> dict:
+    def _takeover_reason(self, question: dict, current_user: CurrentUser, reason: str | None, now):
+        """Return (holder, reason) when an admin takes a question another reviewer holds."""
+        holder = active_holder_id(question.get("review_assignment") or {}, now)
+        if holder is None or holder == current_user.id:
+            return None, None
+        if current_user.role != "Admin":
+            raise PermissionError("Câu hỏi đang được Reviewer khác xử lý")
+        reason = (reason or "").strip()
+        if len(reason) < MIN_TAKEOVER_REASON_LENGTH:
+            raise ValueError("Câu hỏi đang được Reviewer khác giữ; cần nêu lý do để tiếp nhận")
+        return holder, reason
+
+    def notify_takeover(self, question: dict, version: dict, holder, current_user: CurrentUser,
+                         reason: str, *, archived: bool = False) -> None:
+        safe_notify_review_taken_over(
+            database=self.db, question=question, version=version, reviewer_user_id=holder,
+            actor_user_id=current_user.id, reason=reason, archived=archived,
+        )
+
+    def claim_review(self, question_id: str, current_user: CurrentUser, reason: str | None = None) -> dict:
+        question, version = self._pair(question_id)
+        if current_user.role != "Admin":
+            self._ensure_reviewer_covers(question, version, current_user)
+            self._ensure_not_author(question, version, current_user)
+        holder, takeover_reason = self._takeover_reason(question, current_user, reason, utc_now())
         if settings.question_store == "postgres":
             now = utc_now()
             updated = self.questions.claim_review(
                 question_id, actor_user_id=current_user.id,
                 actor_role=current_user.role,
                 lock_expires_at=self._lock_expires_at(now), now=now,
+                max_held=max(1, settings.review_max_held_questions),
+                takeover_reason=takeover_reason,
             )
+            if holder is not None:
+                self.notify_takeover(updated[0], updated[1], holder, current_user, takeover_reason)
             return serialize_question(*updated)
-        pair = self._pair(question_id)
-        question, version = pair
         if question["review_status"] != "PENDING":
             raise ValueError("Chỉ câu hỏi đang chờ duyệt mới có thể claim")
+        if current_user.role != "Admin":
+            max_held = max(1, settings.review_max_held_questions)
+            held = self.db.questions.count_documents({
+                "_id": {"$ne": question["_id"]},
+                "lifecycle_status": "ACTIVE",
+                "review_status": "PENDING",
+                "review_assignment.status": "IN_REVIEW",
+                "review_assignment.reviewer_user_id": current_user.id,
+                "review_assignment.lock_expires_at": {"$gt": utc_now()},
+            })
+            if held >= max_held:
+                raise ValueError(review_hold_limit_message(max_held))
         secondary = question.get("secondary_review") or {}
         if (
             secondary.get("status") == "AWAITING_SECONDARY"
             and secondary.get("primary_reviewer_user_id") == current_user.id
         ):
             raise PermissionError("Người duyệt lần đầu không được nhận lượt duyệt lần hai")
-        if current_user.role != "Admin":
-            self._ensure_not_author(question, version, current_user)
         now = utc_now()
         previous_assignment = question.get("review_assignment") or {}
         assignment = {
@@ -2818,6 +3040,7 @@ class QuestionWorkflowService:
             "assigned_at": previous_assignment.get("assigned_at") or now,
             "claimed_at": now,
             "lock_expires_at": self._lock_expires_at(now),
+            "renewal_count": carried_renewal_count(previous_assignment, current_user.id),
             "last_released_at": None,
             "release_reason": None,
         }
@@ -2827,9 +3050,11 @@ class QuestionWorkflowService:
             "lifecycle_status": "ACTIVE",
             "review_status": "PENDING",
         }
-        available_filter = self._assignment_available_filter(current_user, now)
-        if available_filter:
-            query["$or"] = available_filter
+        if holder is not None:
+            # The takeover applies only to the holder the admin saw.
+            query["review_assignment.reviewer_user_id"] = holder
+        else:
+            query["$or"] = self._assignment_available_filter(current_user, now)
         updated = self.db.questions.find_one_and_update(
             query,
             {"$set": {"review_assignment": assignment, "updated_at": now}},
@@ -2838,13 +3063,16 @@ class QuestionWorkflowService:
         if not updated:
             raise PermissionError("Câu hỏi đang được Reviewer khác xử lý")
         self._assignment_audit(
-            action="QUESTION_REVIEW_CLAIMED",
+            action="QUESTION_REVIEW_TAKEN_OVER" if holder is not None else "QUESTION_REVIEW_CLAIMED",
             question=updated,
             version=version,
             current_user=current_user,
             before=question.get("review_assignment"),
             after=assignment,
+            metadata={"reason": takeover_reason, "previous_reviewer_user_id": str(holder)} if holder else None,
         )
+        if holder is not None:
+            self.notify_takeover(updated, version, holder, current_user, takeover_reason)
         return serialize_question(updated, version)
 
     def release_review(self, question_id: str, current_user: CurrentUser) -> dict:
@@ -2867,7 +3095,9 @@ class QuestionWorkflowService:
         }
         if current_user.role != "Admin":
             query["review_assignment.reviewer_user_id"] = current_user.id
-        assignment = _empty_review_assignment(now, "released")
+        assignment = released_assignment(
+            _empty_review_assignment(now, "released"), question.get("review_assignment") or {},
+        )
         updated = self.db.questions.find_one_and_update(
             query,
             {"$set": {"review_assignment": assignment, "updated_at": now}},
@@ -2889,35 +3119,48 @@ class QuestionWorkflowService:
         """Extend the caller's review lock while the review desk stays open.
 
         An expired lock can still be renewed as long as nobody else has
-        claimed the question in the meantime.
+        claimed the question in the meantime. Each claim allows at most
+        ``REVIEW_MAX_LOCK_RENEWALS`` renewals.
         """
+        max_renewals = max(0, settings.review_max_lock_renewals)
         if settings.question_store == "postgres":
             now = utc_now()
             updated = self.questions.renew_review(
                 question_id, actor_user_id=current_user.id,
                 lock_expires_at=self._lock_expires_at(now), now=now,
+                max_renewals=max_renewals,
             )
             return serialize_question(*updated)
         question, version = self._pair(question_id)
         now = utc_now()
+        held_by_caller = {
+            "_id": question["_id"],
+            "current_version_id": version["_id"],
+            "lifecycle_status": "ACTIVE",
+            "review_status": "PENDING",
+            "review_assignment.status": "IN_REVIEW",
+            "review_assignment.reviewer_user_id": current_user.id,
+        }
         updated = self.db.questions.find_one_and_update(
             {
-                "_id": question["_id"],
-                "current_version_id": version["_id"],
-                "lifecycle_status": "ACTIVE",
-                "review_status": "PENDING",
-                "review_assignment.status": "IN_REVIEW",
-                "review_assignment.reviewer_user_id": current_user.id,
+                **held_by_caller,
+                "$or": [
+                    {"review_assignment.renewal_count": {"$exists": False}},
+                    {"review_assignment.renewal_count": {"$lt": max_renewals}},
+                ],
             },
             {
                 "$set": {
                     "review_assignment.lock_expires_at": self._lock_expires_at(now),
                     "updated_at": now,
-                }
+                },
+                "$inc": {"review_assignment.renewal_count": 1},
             },
             return_document=ReturnDocument.AFTER,
         )
         if not updated:
+            if self.db.questions.find_one(held_by_caller, {"_id": 1}):
+                raise ValueError(review_renewal_limit_message(max_renewals))
             raise PermissionError("Bạn không còn giữ khóa kiểm duyệt câu hỏi này")
         return serialize_question(updated, version)
 
@@ -2926,25 +3169,32 @@ class QuestionWorkflowService:
         reviewer_user_id,
         current_user: CurrentUser | None,
         reason: str,
+        subject_ids: list | None = None,
     ) -> int:
-        """Return every pending question held by a reviewer to the shared queue."""
+        """Return pending questions held by a reviewer to the shared queue.
+
+        ``subject_ids`` limits the release to those subjects (None means all).
+        """
         now = utc_now()
         if settings.question_store == "postgres":
             return self.questions.release_reviewer_assignments(
                 reviewer_user_id, reason=reason,
                 actor_user_id=current_user.id if current_user else None,
                 actor_role=current_user.role if current_user else None, now=now,
+                subject_ids=subject_ids,
             )
-        held = list(
-            self.db.questions.find(
-                {
-                    "lifecycle_status": "ACTIVE",
-                    "review_status": "PENDING",
-                    "review_assignment.status": {"$in": ["ASSIGNED", "IN_REVIEW"]},
-                    "review_assignment.reviewer_user_id": reviewer_user_id,
-                }
-            )
-        )
+        query = {
+            "lifecycle_status": "ACTIVE",
+            "review_status": "PENDING",
+            "review_assignment.status": {"$in": ["ASSIGNED", "IN_REVIEW"]},
+            "review_assignment.reviewer_user_id": reviewer_user_id,
+        }
+        if subject_ids is not None:
+            if not subject_ids:
+                return 0
+            values = [str(item) for item in subject_ids]
+            query["subject_id"] = {"$in": [*values, *(ObjectId(item) for item in values if ObjectId.is_valid(item))]}
+        held = list(self.db.questions.find(query))
         released = 0
         for question in held:
             assignment = _empty_review_assignment(now, reason)
@@ -2994,11 +3244,10 @@ class QuestionWorkflowService:
         now = utc_now()
         if payload.reviewer_user_id:
             reviewer = self._find_assignable_reviewer(payload.reviewer_user_id)
-            if reviewer["_id"] in {
-                question.get("created_by_user_id"),
-                version.get("created_by_user_id"),
-            }:
-                raise ValueError("Không thể giao câu hỏi cho chính tác giả kiểm duyệt")
+            if str(reviewer["_id"]) in self._review_author_ids(question, version):
+                raise ValueError("Không thể giao câu hỏi cho người đã tạo, chỉnh sửa hoặc gửi duyệt câu này")
+            if not self._reviewer_covers(question, version, reviewer):
+                raise ValueError("Reviewer không được phân công kiểm duyệt học phần của câu hỏi này")
             secondary = question.get("secondary_review") or {}
             if (
                 secondary.get("status") == "AWAITING_SECONDARY"
@@ -3075,7 +3324,8 @@ class QuestionWorkflowService:
         question goes to an eligible reviewer (not its author, not the primary
         reviewer of a pending second review), preferring reviewers whose
         review_subject_ids cover the question's subject, then the lightest
-        current load. Reviewers without review_subject_ids take any subject.
+        current load. Non-Admin reviewers only take subjects in their
+        review_subject_ids; with none assigned they take nothing.
         """
         now = utc_now()
         question_ids = (
@@ -3127,7 +3377,7 @@ class QuestionWorkflowService:
         ]
         strict = payload.subject_mode == "strict"
         covered_subjects = {
-            subject_id
+            str(subject_id)
             for reviewer in reviewers
             for subject_id in reviewer.get("review_subject_ids") or []
         }
@@ -3157,22 +3407,22 @@ class QuestionWorkflowService:
             if not reviewers:
                 skipped.append({"question_id": question["_id"], "question_code": code, "reason": "NO_REVIEWERS"})
                 continue
-            excluded = {
-                question.get("created_by_user_id"),
-                version_authors.get(question.get("current_version_id")),
-            }
+            excluded = self._review_author_ids(
+                question, {"created_by_user_id": version_authors.get(question.get("current_version_id"))},
+            )
             secondary = question.get("secondary_review") or {}
-            if secondary.get("status") == "AWAITING_SECONDARY":
-                excluded.add(secondary.get("primary_reviewer_user_id"))
-            subject_id = question.get("subject_id")
+            if secondary.get("status") == "AWAITING_SECONDARY" and secondary.get("primary_reviewer_user_id"):
+                excluded.add(str(secondary["primary_reviewer_user_id"]))
+            subject_id = str(question["subject_id"]) if question.get("subject_id") else None
             candidates = []
             for reviewer in reviewers:
-                if reviewer["_id"] in excluded or loads[reviewer["_id"]] >= payload.max_load_per_reviewer:
+                if str(reviewer["_id"]) in excluded or loads[reviewer["_id"]] >= payload.max_load_per_reviewer:
                     continue
-                subjects = reviewer.get("review_subject_ids") or []
-                if subjects and subject_id not in subjects:
+                specialist = subject_id is not None and subject_id in {
+                    str(item) for item in reviewer.get("review_subject_ids") or []
+                }
+                if not specialist and reviewer.get("role") != "Admin":
                     continue
-                specialist = bool(subjects)
                 if strict and not specialist:
                     continue
                 candidates.append((0 if specialist else 1, loads[reviewer["_id"]], str(reviewer["_id"]), reviewer))
@@ -3223,6 +3473,7 @@ class QuestionWorkflowService:
                     "decision": 1,
                     "override.applied": 1,
                     "revision_issues": 1,
+                    "reason_codes": 1,
                     "review_form.criterion_assessments": 1,
                     "review_form.checklist": 1,
                     "bulk": 1,
@@ -3294,6 +3545,8 @@ class QuestionWorkflowService:
         policy["updated_by_user_id"] = stored.get("updated_by_user_id")
         # Thời hạn giữ câu lấy từ cấu hình để giao diện không phải viết cứng.
         policy["lock_timeout_minutes"] = settings.review_lock_timeout_minutes
+        policy["max_held_questions"] = settings.review_max_held_questions
+        policy["max_lock_renewals"] = settings.review_max_lock_renewals
         policy["assignment_timeout_hours"] = settings.review_assignment_timeout_hours
         return json_safe(policy)
 
@@ -3443,14 +3696,23 @@ class QuestionWorkflowService:
             raise ValueError(
                 "AI đề xuất xem lại: phải ghi rõ lý do (override) khi vẫn duyệt"
             )
+        submission_flags = list(dict.fromkeys(
+            str(flag) for flag in (((question.get("review_submission") or {}).get("checks") or {}).get("flags") or [])
+        ))
+        if payload.decision == "APPROVED":
+            unacknowledged = [flag for flag in submission_flags if flag not in payload.acknowledged_flags]
+            if unacknowledged:
+                raise ValueError(
+                    "Phải xác nhận đã xem từng cảnh báo tự động trước khi duyệt: " + ", ".join(unacknowledged)
+                )
         self_review_reason = payload.self_review_reason.strip()
-        is_author = current_user.id in {question.get("created_by_user_id"), version.get("created_by_user_id")}
-        if is_author and current_user.role == "Admin":
-            # Quản trị viên chỉ tự duyệt câu của mình khi ghi rõ lý do (hoặc override cũ).
-            if not (self_review_reason or payload.override.applied):
-                raise PermissionError("Bạn là người tạo/sửa câu này: ghi lý do tự duyệt để tiếp tục")
+        is_author = str(current_user.id) in self._review_author_ids(question, version)
+        break_glass = is_author and current_user.role == "Admin"
+        if break_glass:
+            self._ensure_break_glass_allowed(question, version, current_user, self_review_reason)
         else:
             self._ensure_not_author(question, version, current_user)
+        self._ensure_reviewer_covers(question, version, current_user)
         now = utc_now()
         self._ensure_review_lock(question, current_user, now)
         secondary = question.get("secondary_review") or {}
@@ -3464,10 +3726,13 @@ class QuestionWorkflowService:
         # approval: the next approval becomes the primary one.
         request_secondary = (
             payload.decision == "APPROVED"
-            and (payload.secondary_required or secondary.get("status") == "REQUESTED")
+            and (payload.secondary_required or secondary.get("status") == "REQUESTED" or break_glass)
             and not awaiting_secondary
         )
         secondary_reason = payload.secondary_reason or secondary.get("reason") or ""
+        if break_glass and payload.decision == "APPROVED" and not awaiting_secondary:
+            break_glass_text = "Quản trị viên tự duyệt khẩn cấp (break-glass): cần reviewer khác duyệt vòng 2"
+            secondary_reason = f"{secondary_reason}. {break_glass_text}" if secondary_reason else break_glass_text
         if payload.decision == "APPROVED" and not awaiting_secondary:
             policy_reasons = self._policy_secondary_reasons(question, payload)
             if policy_reasons:
@@ -3487,8 +3752,11 @@ class QuestionWorkflowService:
             "note": review_note,
             "override": payload.override.model_dump(),
             "review_form": review_form,
-            "self_review_reason": self_review_reason if is_author else "",
+            "self_review_reason": self_review_reason if break_glass else "",
+            "break_glass": break_glass,
             "revision_issues": review_form.get("revision_issues", []),
+            "reason_codes": list(payload.reason_codes),
+            "acknowledged_flags": submission_flags if payload.decision == "APPROVED" else [],
             "review_stage": "SECONDARY" if awaiting_secondary else "PRIMARY",
             "bulk": bool(payload.bulk),
             "secondary_required": bool(request_secondary or awaiting_secondary),
@@ -3501,11 +3769,19 @@ class QuestionWorkflowService:
         question_fields = {
             "latest_review_id": review["_id"],
             "updated_at": now,
-            "review_assignment": _empty_review_assignment(
+                "review_assignment": _empty_review_assignment(
                 now,
                 f"review_{payload.decision.lower()}",
             ),
         }
+        if break_glass:
+            question_fields["break_glass_review"] = {
+                "review_id": review["_id"],
+                "reviewer_user_id": current_user.id,
+                "decision": payload.decision,
+                "reason": self_review_reason,
+                "reviewed_at": now,
+            }
         if request_secondary:
             designated_secondary = (
                 secondary.get("secondary_reviewer_user_id")
@@ -3648,6 +3924,8 @@ class QuestionWorkflowService:
                 expected_latest_review_id=question.get("latest_review_id"),
                 actor_role=current_user.role, audit_action=audit_action,
                 notifications=outbox,
+                **({"extra_audit": [self._break_glass_audit_fields(question, version, review, current_user)]}
+                   if break_glass else {}),
             )
         else:
             with mongo_transaction() as session:
@@ -3679,12 +3957,16 @@ class QuestionWorkflowService:
                         session=session,
                     )
                 self.db.question_reviews.insert_one(review, session=session)
+                # Re-check state at write time: a concurrent withdraw, archive or takeover must win.
                 result = self.db.questions.update_one(
                     {
                         "_id": question["_id"],
                         "current_version_id": version["_id"],
                         "lifecycle_status": "ACTIVE",
+                        "review_status": "PENDING",
                         "latest_review_id": question.get("latest_review_id"),
+                        "review_assignment.status": "IN_REVIEW",
+                        "review_assignment.reviewer_user_id": current_user.id,
                     },
                     {"$set": question_fields},
                     session=session,
@@ -3692,6 +3974,13 @@ class QuestionWorkflowService:
                 if not result.matched_count:
                     raise RuntimeError("VERSION_CONFLICT")
                 self.db.audit_logs.insert_one(audit, session=session)
+                if break_glass:
+                    self.db.audit_logs.insert_one(
+                        build_audit_event(**self._break_glass_audit_fields(question, version, review, current_user)),
+                        session=session,
+                    )
+        if break_glass:
+            self._notify_admins_break_glass(question, version, review, current_user)
         if outbox is None:
             if not request_secondary:
                 safe_notify_review_decision(
@@ -3903,6 +4192,7 @@ class QuestionWorkflowService:
         current_user: CurrentUser,
     ) -> dict:
         question, version = self._pair(question_id)
+        self._ensure_read_access(question, version, current_user)
         review_status = question["review_status"]
         if review_status not in {"PENDING", "APPROVED"}:
             raise ValueError("Chỉ cấu hình duyệt lần hai cho câu đang chờ hoặc đã duyệt")
@@ -3913,6 +4203,16 @@ class QuestionWorkflowService:
             )
         current_secondary = question.get("secondary_review") or {}
         now = utc_now()
+        assignment = question.get("review_assignment") or {}
+        claimed_by_other = (
+            self._is_claimed(assignment, now) and assignment.get("reviewer_user_id") != current_user.id
+        )
+        if not is_admin:
+            self._ensure_reviewer_covers(question, version, current_user)
+            if current_secondary.get("status") == "AWAITING_SECONDARY" or claimed_by_other or not (
+                self._is_claimed(assignment, now) and assignment.get("reviewer_user_id") == current_user.id
+            ):
+                raise PermissionError("Chỉ reviewer đang giữ câu ở vòng duyệt đầu được yêu cầu duyệt lần hai")
 
         if not payload.required:
             secondary = {
@@ -3953,11 +4253,12 @@ class QuestionWorkflowService:
                 reviewer = self._find_assignable_reviewer(payload.reviewer_user_id)
                 if reviewer["_id"] == primary_reviewer_user_id:
                     raise ValueError("Người duyệt lần hai phải khác người duyệt lần đầu")
-                if reviewer["_id"] in {
-                    question.get("created_by_user_id"),
-                    version.get("created_by_user_id"),
-                }:
-                    raise ValueError("Không thể giao duyệt lần hai cho chính tác giả")
+                if str(reviewer["_id"]) in self._review_author_ids(question, version):
+                    raise ValueError("Không thể giao duyệt lần hai cho tác giả, người sửa hoặc người gửi duyệt")
+                if not self._reviewer_covers(question, version, reviewer):
+                    raise ValueError("Người duyệt lần hai không phụ trách học phần của câu hỏi")
+                if not is_admin and reviewer["_id"] == current_user.id:
+                    raise ValueError("Người duyệt lần hai phải khác người đang duyệt")
 
             secondary = {
                 "required": True,
@@ -3973,13 +4274,15 @@ class QuestionWorkflowService:
             }
             fields = {"secondary_review": secondary, "updated_at": now}
             if review_status == "APPROVED":
+                # The approved pointer stays: only a new human decision may move or clear it.
                 fields["review_status"] = "PENDING"
-                fields["approved_version_id"] = None
                 fields["review_assignment"] = _empty_review_assignment(
                     now,
                     payload.reason or "secondary_review",
                 )
             if status == "AWAITING_SECONDARY" and reviewer:
+                if claimed_by_other:
+                    raise ValueError("Câu đang được reviewer khác giữ; chờ họ nhả câu trước khi giao lại")
                 fields["review_assignment"] = {
                     "status": "ASSIGNED",
                     "reviewer_user_id": reviewer["_id"],
@@ -4548,6 +4851,7 @@ class QuestionWorkflowService:
         override_count = 0
         bulk_count = 0
         revision_issues = 0
+        reason_counts: dict[str, int] = {}
         reviews_last_7d = 0
         per_reviewer: dict = {}
 
@@ -4579,6 +4883,8 @@ class QuestionWorkflowService:
             if review.get("bulk"):
                 bulk_count += 1
             revision_issues += len(review.get("revision_issues") or [])
+            for code in review.get("reason_codes") or []:
+                reason_counts[code] = reason_counts.get(code, 0) + 1
             reviewed_at = _as_aware_utc(review.get("reviewed_at"))
             recent = bool(reviewed_at and reviewed_at >= since_7d)
             if recent:
@@ -4743,6 +5049,10 @@ class QuestionWorkflowService:
             "override_count": override_count,
             "bulk_count": bulk_count,
             "revision_issues": revision_issues,
+            "top_reasons": [
+                {"code": code, "count": count}
+                for code, count in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:6]
+            ],
             "average_review_hours": average_review_hours,
             "duration_sample_size": len(durations),
         }
@@ -4973,6 +5283,148 @@ class QuestionWorkflowService:
                 notifications.create_many(reminders)
             sent += 1
         return sent
+
+    @staticmethod
+    def _is_claimed(assignment: dict, now) -> bool:
+        expires = _as_aware_utc(assignment.get("lock_expires_at"))
+        return assignment.get("status") == "IN_REVIEW" and expires is not None and expires > now
+
+    def _mark_mongo_escalation(self, question: dict, submitted_at, escalation: dict, *,
+                               assignment: dict | None, audit: dict | None) -> bool:
+        step = next(key for key in escalation if key != "submitted_at")
+        query: dict = {
+            "_id": question["_id"],
+            "review_status": "PENDING",
+            "review_submission.submitted_at": submitted_at,
+            "$or": [
+                {"review_escalation.submitted_at": {"$ne": submitted_at}},
+                {f"review_escalation.{step}": None},
+            ],
+        }
+        updates = {f"review_escalation.{key}": value for key, value in escalation.items()}
+        if assignment is not None:
+            query["$nor"] = [{
+                "review_assignment.status": "IN_REVIEW",
+                "review_assignment.lock_expires_at": {"$gt": utc_now()},
+            }]
+            updates["review_assignment"] = assignment
+        if (question.get("review_escalation") or {}).get("submitted_at") != submitted_at:
+            updates = {"review_escalation": escalation, **{
+                key: value for key, value in updates.items() if not key.startswith("review_escalation.")
+            }}
+        with mongo_transaction() as session:
+            marked = self.db.questions.update_one(query, {"$set": updates}, session=session)
+            if marked.matched_count and audit:
+                write_audit_event(self.db, session=session, **audit)
+        return bool(marked.matched_count)
+
+    def escalate_overdue_reviews(self, now=None) -> dict:
+        """Escalate pending questions nobody has claimed.
+
+        After ``REVIEW_ESCALATION_HOURS`` active Admins are notified once per
+        submission; after ``REVIEW_REQUEUE_DAYS`` an assignment that was never
+        claimed is removed and the question returns to the shared queue.
+        """
+        now = now or utc_now()
+        notify_cutoff = now - timedelta(hours=max(1, settings.review_escalation_hours))
+        requeue_cutoff = now - timedelta(days=max(1, settings.review_requeue_days))
+        postgres = settings.question_store == "postgres"
+        # Only questions with an escalation step still due, so handled ones cannot fill the batch forever.
+        candidates = self.questions.escalation_candidates(
+            notify_cutoff, SLA_REMINDER_BATCH_SIZE, requeue_cutoff=requeue_cutoff, now=now,
+        ) if postgres else list(
+            self.db.questions.find(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "lifecycle_status": "ACTIVE",
+                    "review_status": "PENDING",
+                    "review_submission.submitted_at": {"$lte": notify_cutoff},
+                    "$nor": [{"review_assignment.status": "IN_REVIEW",
+                              "review_assignment.lock_expires_at": {"$gt": now}}],
+                    "$or": [
+                        {"$expr": {"$ne": ["$review_escalation.submitted_at", "$review_submission.submitted_at"]}},
+                        {"review_escalation.notified_at": None},
+                        {
+                            "review_submission.submitted_at": {"$lte": requeue_cutoff},
+                            "review_assignment.reviewer_user_id": {"$ne": None},
+                            "review_escalation.requeued_at": None,
+                        },
+                    ],
+                },
+            ).sort([("review_submission.submitted_at", 1), ("_id", 1)]).limit(SLA_REMINDER_BATCH_SIZE)
+        )
+        admin_ids: list | None = None
+        result = {"notified": 0, "requeued": 0}
+        for question in candidates:
+            submitted_at = (question.get("review_submission") or {}).get("submitted_at")
+            assignment = question.get("review_assignment") or {}
+            if submitted_at is None or self._is_claimed(assignment, now):
+                continue
+            escalation = question.get("review_escalation") or {}
+            same_submission = escalation.get("submitted_at") == submitted_at
+            question_code = question.get("question_code", "Câu hỏi")
+            if (
+                _as_aware_utc(submitted_at) <= requeue_cutoff
+                and assignment.get("reviewer_user_id")
+                and not (same_submission and escalation.get("requeued_at"))
+            ):
+                released = _empty_review_assignment(now, "escalation_requeued")
+                audit = {
+                    "action": "QUESTION_REVIEW_RELEASED",
+                    "entity_type": "question",
+                    "entity_id": question["_id"],
+                    "entity_version_id": question.get("current_version_id"),
+                    "actor_type": "SYSTEM",
+                    "service_name": "review_escalation",
+                    "before": {"review_assignment": json_safe(assignment)},
+                    "after": {"review_assignment": json_safe(released)},
+                    "metadata": {"reason": "escalation_requeued"},
+                }
+                step = {"submitted_at": submitted_at, "requeued_at": now}
+                applied = (
+                    self.questions.mark_review_escalation(question["_id"], submitted_at, step,
+                                                          assignment=released, audit=audit)
+                    if postgres else
+                    self._mark_mongo_escalation(question, submitted_at, step, assignment=released, audit=audit)
+                )
+                if applied:
+                    result["requeued"] += 1
+                continue
+            if same_submission and escalation.get("notified_at"):
+                continue
+            if admin_ids is None:
+                admin_ids = active_admin_ids(self.db)
+            alerts = [
+                {
+                    "recipient_user_id": admin_id,
+                    "type": "QUESTION_REVIEW_ESCALATED",
+                    "title": f"{question_code} chờ duyệt quá {settings.review_escalation_hours} giờ chưa ai nhận",
+                    "body": "Hãy phân công reviewer hoặc tự xử lý câu hỏi này.",
+                    "link": f"/kiem-duyet?questionId={question['_id']}",
+                    "entity": json_safe({
+                        "type": "QUESTION",
+                        "id": question["_id"],
+                        "version_id": question.get("current_version_id"),
+                        "question_code": question_code,
+                    }),
+                }
+                for admin_id in admin_ids
+            ]
+            step = {"submitted_at": submitted_at, "notified_at": now}
+            outbox = notification_outbox()
+            if outbox is not None:
+                NotificationService(self.db, sink=outbox).create_many(alerts)
+            applied = (
+                self.questions.mark_review_escalation(question["_id"], submitted_at, step, notifications=outbox)
+                if postgres else
+                self._mark_mongo_escalation(question, submitted_at, step, assignment=None, audit=None)
+            )
+            if not applied:
+                continue
+            if outbox is None:
+                NotificationService(self.db).create_many(alerts)
+            result["notified"] += 1
+        return result
 
 
 def get_workflow_service() -> QuestionWorkflowService:

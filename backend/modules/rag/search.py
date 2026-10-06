@@ -17,7 +17,19 @@ MIN_EVIDENCE_CHARS = 24
 MIN_EVIDENCE_WORDS = 4
 
 
-def _active_vector_snapshot(document_id: str, collection_name: str) -> tuple[str, str, str]:
+def _stored_id(value):
+    text = str(value)
+    return ObjectId(text) if ObjectId.is_valid(text) else value
+
+
+def _active_vector_snapshot(
+    document_id: str, collection_name: str, pinned: dict | None = None,
+) -> tuple[str, str, str]:
+    """Resolve the chunk set / vector collection to search.
+
+    ``pinned`` (from a generation job) keeps retrieval on the snapshot that was
+    active when the job was created, even if the document is re-indexed meanwhile.
+    """
     try:
         document_oid = ObjectId(document_id)
     except Exception as exc:
@@ -28,15 +40,19 @@ def _active_vector_snapshot(document_id: str, collection_name: str) -> tuple[str
     if not document:
         raise ValueError("Không tìm thấy tài liệu")
 
-    current = document.get("current_processing") or {}
-    chunk_set_id = current.get("chunk_set_id")
-    vector_collection_id = current.get("vector_collection_id")
+    if pinned:
+        chunk_set_id = pinned.get("chunk_set_id")
+        vector_collection_id = _stored_id(pinned.get("vector_collection_id"))
+        vector_query = {"_id": vector_collection_id}
+    else:
+        current = document.get("current_processing") or {}
+        chunk_set_id = current.get("chunk_set_id")
+        vector_collection_id = current.get("vector_collection_id")
+        vector_query = {"_id": vector_collection_id, "is_active": True}
     if not chunk_set_id or not vector_collection_id:
         raise ValueError("Tài liệu chưa có chunk set đã được index")
 
-    vector = db.vector_collections.find_one(
-        {"_id": vector_collection_id, "is_active": True}
-    )
+    vector = db.vector_collections.find_one(vector_query)
     if not vector:
         raise ValueError("Không tìm thấy cấu hình vector hiện hành")
     active_collection_name = vector.get("collection_name")
@@ -146,27 +162,53 @@ def _evidence_text(doc: str) -> str:
     return str(doc or "").strip()
 
 
+def _heading_words(text: str) -> str:
+    """Normalized heading reduced to words, so "2.1. Ngăn xếp" and "2.1 - ngan xep" compare equal."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9.]+", " ", _normalize_heading_text(text))).strip(" .")
+
+
+def _section_number(text: str) -> str | None:
+    match = re.match(r"^(?:chuong|phan|muc|bai)?\s*(\d+(?:\.\d+)*)\b", text)
+    return match.group(1) if match else None
+
+
 def _heading_matches_target(meta: dict, normalized_target: str) -> bool:
+    """A chunk belongs to the selected section when that section is its heading or any ancestor."""
     if not normalized_target:
         return True
-    heading_candidates = []
-    heading = meta.get("heading", "") or ""
-    if heading:
-        heading_candidates.append(_normalize_heading_text(heading))
-    heading_path_text = meta.get("heading_path_text", "") or ""
-    if heading_path_text:
-        heading_candidates.append(_normalize_heading_text(heading_path_text))
     heading_path = _coerce_heading_path(meta)
-    if heading_path:
-        heading_candidates.append(_normalize_heading_text(" > ".join(heading_path)))
+    heading_candidates = [
+        _normalize_heading_text(value)
+        for value in (
+            meta.get("heading", "") or "",
+            meta.get("heading_path_text", "") or "",
+            " > ".join(heading_path),
+        )
+        if value
+    ]
     target_chapter = re.search(r"\bchuong\s+(\d+)\b", normalized_target)
     for candidate in heading_candidates:
-        if not candidate:
-            continue
         if normalized_target in candidate or candidate in normalized_target:
             return True
         candidate_chapter = re.search(r"\bchuong\s+(\d+)\b", candidate)
         if target_chapter and candidate_chapter and target_chapter.group(1) == candidate_chapter.group(1):
+            return True
+    # Compare each level of the path (sub-headings included) ignoring punctuation
+    # and numbering style; "2.1" also covers its sub-sections "2.1.3".
+    target_leaf = _heading_words(normalized_target.split(">")[-1])
+    target_number = _section_number(target_leaf)
+    if not target_leaf:
+        return False
+    for level in [*heading_path, meta.get("heading", "") or ""]:
+        words = _heading_words(level)
+        if not words:
+            continue
+        if target_leaf == words or target_leaf in words:
+            return True
+        level_number = _section_number(words)
+        if target_number and level_number and (
+            level_number == target_number or level_number.startswith(f"{target_number}.")
+        ):
             return True
     return False
 
@@ -218,11 +260,13 @@ def get_context_snapshot(
     min_density: float = 0.0,
     limit: int = 5,
     avoid_ollama_gpu_wait: bool = False,
+    pinned_snapshot: dict | None = None,
 ) -> dict:
     """Truy xuất các chunk từ ChromaDB làm Context cho LLM"""
     active_snapshot = _active_vector_snapshot(
         document_id,
         collection_name,
+        pinned_snapshot,
     )
     if len(active_snapshot) == 2:
         chunk_set_id, vector_collection_id = active_snapshot
@@ -368,10 +412,19 @@ def get_context_snapshot(
         filtered_chunks = heading_matched_chunks or candidate_chunks
         if not filtered_chunks:
             raise ValueError("Không tìm thấy đoạn văn nào hợp lệ theo tiêu chí đã chọn.")
-        if normalized_target and not heading_matched_chunks:
+        if not normalized_target:
+            heading_scope = {"target": None, "status": "NOT_REQUESTED", "matched_chunks": 0}
+        elif heading_matched_chunks:
+            heading_scope = {
+                "target": target_heading,
+                "status": "MATCHED" if len(heading_matched_chunks) >= limit else "NARROW",
+                "matched_chunks": len(heading_matched_chunks),
+            }
+        else:
             logger.info(
                 "Không có heading khớp target_heading; dùng kết quả vector query làm fallback."
             )
+            heading_scope = {"target": target_heading, "status": "NO_MATCH", "matched_chunks": 0}
 
         filtered_chunks.sort(
             key=lambda x: (-(x[1].get("_hybrid_score") or 0.0), x[1].get("page_start") or 0)
@@ -405,9 +458,12 @@ def get_context_snapshot(
 
         return {
             "context_text": "\n\n---\n\n".join(assembled_context),
+            # Chunks may contain Markdown rules (`---`), so consumers use this list instead of re-splitting.
+            "context_sections": assembled_context,
             "results": retrieval_results,
             "chunk_set_id": chunk_set_id,
             "vector_collection_id": vector_collection_id,
+            "heading_scope": heading_scope,
         }
 
     except Exception as e:

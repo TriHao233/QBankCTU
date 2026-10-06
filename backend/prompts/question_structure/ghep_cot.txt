@@ -1,5 +1,5 @@
 CẤU TRÚC: ghep_cot
-1. `question` yêu cầu ghép nhóm số với nhóm chữ; `options` chứa cả hai nhóm trong một object.
-2. Tạo 3-4 mục cùng loại ở nhóm số và nhiều hơn đúng 1 mục ở nhóm chữ để làm nhiễu.
+1. `question` yêu cầu ghép nhóm số với nhóm chữ; `options` là một object phẳng chứa cả hai nhóm, không lồng cột.
+2. Nhóm số có đúng 3 mục cùng loại với khóa "1", "2", "3"; nhóm chữ có đúng 4 mục với khóa "a", "b", "c", "d", trong đó 1 mục làm nhiễu.
 3. `correct_answer` liệt kê đủ cặp theo dạng `1-b, 2-a, 3-c`, không gồm mục nhiễu.
 4. Ghép theo ý nghĩa và tránh lặp từ khóa làm lộ đáp án.

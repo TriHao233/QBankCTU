@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,11 @@ from core.database import get_database
 from modules.catalog.postgres_subject_repository import subject_record
 from modules.documents.repository import object_id
 from modules.documents.store import get_document_repository
+from modules.generation.job_outcome import CANCEL_REASON_USER, CANCEL_REASON_USER_DEACTIVATED
 from modules.questions.schemas import QuestionDifficulty
+
+logger = logging.getLogger(__name__)
+
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -60,7 +65,15 @@ def _resolve_clo_ids(
     document_id: str,
     question: dict,
     outcomes: list[dict] | None = None,
+    *,
+    round_robin_slot: int | None = None,
 ) -> list[str]:
+    """Keep valid CLO codes chosen by the model; otherwise the server assigns them.
+
+    With target CLOs (``round_robin_slot`` given) a question without a valid code gets
+    the target at its slot, so targets are covered evenly; without targets the best
+    lexical match is used.
+    """
     outcomes = outcomes if outcomes is not None else get_document_learning_outcomes(document_id)
     if not outcomes:
         return []
@@ -72,6 +85,8 @@ def _resolve_clo_ids(
             selected.append(item["id"])
     if selected:
         return selected[:2]
+    if round_robin_slot is not None:
+        return [outcomes[round_robin_slot % len(outcomes)]["id"]]
 
     question_text = " ".join(
         str(question.get(field) or "")
@@ -121,6 +136,8 @@ def create_generation_run(
     retrieval_results: list[dict],
     chunk_set_id: str,
     vector_collection_id: str,
+    generation_job_id: str | None = None,
+    plan_index: int | None = None,
 ) -> str:
     document_oid = object_id(document_id, "document_id")
     db = get_database()
@@ -158,6 +175,8 @@ def create_generation_run(
     record = {
         "_id": ObjectId(),
         "schema_version": SCHEMA_VERSION,
+        "generation_job_id": object_id(generation_job_id, "generation_job_id") if generation_job_id else None,
+        "plan_index": plan_index,
         "requested_by_user_id": requested_by_user_id,
         "document_id": document_oid,
         "document_version": document.get("current_version", 1),
@@ -207,6 +226,7 @@ def finish_generation_run(
     validation_errors: list[dict] | None = None,
     post_processing: dict | None = None,
     model_execution: dict | None = None,
+    accepted_questions: list[dict] | None = None,
 ) -> None:
     now = utc_now()
     fields = {
@@ -223,6 +243,8 @@ def finish_generation_run(
         fields["post_processing"] = post_processing
     if model_execution is not None:
         fields["execution.model"] = model_execution
+    if accepted_questions is not None:
+        fields["accepted_questions"] = accepted_questions
     store = _postgres_store()
     if store is not None:
         execution = {"latency_ms": fields.pop("execution.latency_ms")}
@@ -236,27 +258,165 @@ def finish_generation_run(
     )
 
 
-def get_existing_question_texts(document_id: str, *, limit: int = 2000) -> list[str]:
-    """Load current active question text for post-generation deduplication only."""
-    document_oid = object_id(document_id, "document_id")
+def completed_generation_runs(generation_job_id: str) -> list[dict]:
+    """Completed runs of a job, oldest first; their accepted drafts are not generated again on retry."""
+    store = _postgres_store()
+    if store is not None:
+        return store.completed_runs(generation_job_id)
+    return list(
+        get_database().generation_runs.find(
+            {"generation_job_id": object_id(generation_job_id, "generation_job_id"), "status": "COMPLETED"},
+            {"plan_index": 1, "accepted_questions": 1, "generated_count": 1},
+        ).sort("created_at", 1)
+    )
+
+
+def teaching_subject_ids_for(user_id) -> set[str]:
+    if user_id is None:
+        return set()
+    from modules.users.store import teaching_subject_ids
+    return teaching_subject_ids(get_database(), user_id)
+
+
+def document_subject_id(document_id) -> str | None:
+    try:
+        document = get_document_repository(get_database()).find_by_id(object_id(document_id, "document_id"))
+    except ValueError:
+        return None
+    subject_id = (document or {}).get("subject_id")
+    return str(subject_id) if subject_id else None
+
+
+class DocumentNotIndexedError(RuntimeError):
+    """A source document has no active chunk/vector snapshot yet."""
+
+
+class ActiveJobLimitError(RuntimeError):
+    """The requester already has the maximum number of queued/processing jobs."""
+
+
+def generation_index_snapshot(document_ids: list[str]) -> dict[str, dict]:
+    """Pin each source document's active chunk set and vector collection at job creation."""
+    repository = get_document_repository(get_database())
+    pinned: dict[str, dict] = {}
+    for document_id in document_ids:
+        try:
+            document = repository.find_by_id(object_id(document_id, "document_id"))
+        except ValueError:
+            document = None
+        current = (document or {}).get("current_processing") or {}
+        if not current.get("chunk_set_id") or not current.get("vector_collection_id"):
+            raise DocumentNotIndexedError(
+                "Tài liệu chưa được index xong; hãy chờ xử lý hoàn tất rồi sinh câu hỏi"
+            )
+        pinned[str(document_id)] = {
+            "chunk_set_id": str(current["chunk_set_id"]),
+            "vector_collection_id": str(current["vector_collection_id"]),
+        }
+    return pinned
+
+
+def validate_generation_scope(document_ids: list[str], target_clo_ids: list[str]) -> None:
+    """Extra documents must share the primary document's subject; target CLOs must belong to it."""
+    if len(document_ids) > 1:
+        primary_subject = document_subject_id(document_ids[0])
+        if not primary_subject:
+            raise ValueError("Tài liệu chính chưa gắn học phần nên không thể kết hợp nhiều tài liệu")
+        for document_id in document_ids[1:]:
+            if document_subject_id(document_id) != primary_subject:
+                raise ValueError("Các tài liệu sinh câu hỏi phải thuộc cùng một học phần")
+    if target_clo_ids:
+        available = {item["id"] for item in get_document_learning_outcomes(document_ids[0])}
+        missing = [clo_id for clo_id in target_clo_ids if clo_id not in available]
+        if missing:
+            raise ValueError("CLO được chọn không thuộc học phần của tài liệu hoặc đã ngừng sử dụng")
+
+
+def get_existing_question_texts(
+    document_id: str | None,
+    *,
+    viewer_user_id,
+    include_shared: bool = False,
+    shared_subject_ids=(),
+    limit: int = 2000,
+    exclude_question_id=None,
+    subject_id: str | None = None,
+) -> list[str]:
+    """Active question texts of a document (or a whole subject) that ``viewer_user_id`` may read.
+
+    ``include_shared=False`` returns only the viewer's own questions; these are the
+    only texts allowed into an LLM prompt. ``include_shared=True`` adds questions
+    shared with the viewer by name or by one of ``shared_subject_ids``, for local
+    deduplication. Other users' private questions are never returned, and a missing
+    viewer returns nothing. ``subject_id`` widens the scope from one document to
+    every document of that subject.
+    """
+    if viewer_user_id is None:
+        return []
+    if subject_id is None and document_id is None:
+        return []
+    document_oid = object_id(document_id, "document_id") if subject_id is None else None
+    viewer_oid = object_id(viewer_user_id, "viewer_user_id")
+    subject_ids = sorted({str(item) for item in shared_subject_ids or () if item})
     if settings.question_store == "postgres":
         from core.postgres import postgres_connection
+        uid = str(viewer_oid)
+        visibility = "(q.created_by_user_id=%s OR (q.created_by_user_id IS NULL AND v.created_by_user_id=%s))"
+        scope = "v.payload->>'document_id'=%s" if subject_id is None else "q.subject_id=%s"
+        params: list = [str(document_oid) if subject_id is None else str(subject_id), uid, uid]
+        if include_shared:
+            visibility += " OR q.payload->'shared_with_user_ids' ? %s"
+            params.append(uid)
+            if subject_ids:
+                visibility += " OR (q.payload->>'shared_scope'='SUBJECT' AND q.subject_id = ANY(%s))"
+                params.append(subject_ids)
+        excluded = ""
+        if exclude_question_id is not None:
+            excluded = " AND q.id <> %s"
+            params.append(str(exclude_question_id))
         with postgres_connection() as conn:
             rows = conn.execute(
-                """SELECT v.content FROM questions q
+                f"""SELECT v.content FROM questions q
                    JOIN question_versions v ON v.id=q.current_version_id
-                   WHERE q.lifecycle_status='ACTIVE' AND v.payload->>'document_id'=%s
+                   WHERE q.lifecycle_status='ACTIVE' AND {scope}
+                   AND ({visibility}){excluded}
                    LIMIT %s""",
-                (str(document_oid), max(1, limit)),
+                (*params, max(1, limit)),
             ).fetchall()
         return [str(row["content"] or "").strip() for row in rows
                 if str(row["content"] or "").strip()]
+    visible: list[dict] = [
+        {"created_by_user_id": viewer_oid},
+        {"created_by_user_id": None, "current_version.created_by_user_id": viewer_oid},
+    ]
+    if include_shared:
+        visible.append({"shared_with_user_ids": viewer_oid})
+        if subject_ids:
+            subject_values = [*subject_ids]
+            subject_values.extend(ObjectId(item) for item in subject_ids if ObjectId.is_valid(item))
+            visible.append({
+                "shared_scope": "SUBJECT",
+                "$or": [
+                    {"subject_id": {"$in": subject_values}},
+                    {"current_version.classification.subject.id": {"$in": subject_values}},
+                ],
+            })
+    if subject_id is None:
+        scope_match: dict = {"current_version.document_id": document_oid}
+    else:
+        scope_values = [str(subject_id), *([ObjectId(str(subject_id))] if ObjectId.is_valid(str(subject_id)) else [])]
+        scope_match = {"$and": [{"$or": [
+            {"subject_id": {"$in": scope_values}},
+            {"current_version.classification.subject.id": {"$in": scope_values}},
+        ]}]}
     pipeline = [
         {
             "$match": {
                 "schema_version": SCHEMA_VERSION,
                 "lifecycle_status": "ACTIVE",
                 "current_version_id": {"$exists": True},
+                **({"_id": {"$ne": object_id(exclude_question_id, "question_id")}}
+                   if exclude_question_id is not None else {}),
             }
         },
         {
@@ -268,7 +428,7 @@ def get_existing_question_texts(document_id: str, *, limit: int = 2000) -> list[
             }
         },
         {"$unwind": "$current_version"},
-        {"$match": {"current_version.document_id": document_oid}},
+        {"$match": {**scope_match, "$or": visible}},
         {"$project": {"_id": 0, "content": "$current_version.content"}},
         {"$limit": max(1, limit)},
     ]
@@ -287,28 +447,64 @@ def save_generated_questions(
     requested_by_user_id,
     source_chunk_ids: list[str],
     learning_outcomes: list[dict] | None = None,
+    rejections: list[dict] | None = None,
+    clo_slot_start: int | None = None,
 ) -> list[dict]:
-    # Generated candidates stay attached to the generation job until the
-    # teacher explicitly submits them. This prevents unreviewed AI output
-    # from filling the question bank with draft records.
-    prepared_questions = []
+    """Store accepted candidates as DRAFT questions owned by the requester.
+
+    Each draft has its own immutable version #1 (origin AI) whose sources are
+    selected by the server; a candidate that cannot be stored is skipped and,
+    when ``rejections`` is given, reported there as ``{"code", "message"}``.
+    ``clo_slot_start`` (target-CLO runs) is the job-wide slot of the first candidate.
+    """
+    from modules.questions.service import get_question_service
+
+    if requested_by_user_id is None:
+        raise ValueError("Generated questions need the requesting user as owner")
+    owner_id = object_id(requested_by_user_id, "requested_by_user_id")
+    service = get_question_service()
+    run_oid = ObjectId(generation_run_id) if generation_run_id and ObjectId.is_valid(str(generation_run_id)) else None
+    saved_questions = []
     allowed_difficulties = {item.value for item in QuestionDifficulty}
-    for question in questions:
+    for index, question in enumerate(questions):
         difficulty = question.get("difficulty")
         if difficulty not in allowed_difficulties:
             difficulty = None
-        prepared_questions.append(
-            {
-                **question,
-                "difficulty": difficulty,
-                "document_id": document_id,
-                "generation_run_id": generation_run_id,
-                "source_chunk_ids": source_chunk_ids,
-                "clo_ids": _resolve_clo_ids(document_id, question, learning_outcomes),
-                "validation_warnings": question.get("validation_warnings") or [],
-            }
-        )
-    return prepared_questions
+        slot = clo_slot_start + index if clo_slot_start is not None else None
+        prepared = {
+            **question,
+            "difficulty": difficulty,
+            "document_id": document_id,
+            "generation_run_id": generation_run_id,
+            "clo_ids": _resolve_clo_ids(document_id, question, learning_outcomes, round_robin_slot=slot),
+            "validation_warnings": question.get("validation_warnings") or [],
+        }
+        try:
+            stored = service.create_generated_draft(
+                prepared,
+                created_by_user_id=owner_id,
+                generation_run_id=run_oid,
+                candidate_chunk_ids=source_chunk_ids,
+            )
+        except (ValueError, PermissionError) as exc:
+            logger.warning("Skipped generated question that could not be stored: %s", exc)
+            if rejections is not None:
+                rejections.append({"code": getattr(exc, "code", None) or "DRAFT_NOT_STORED", "message": str(exc)})
+            continue
+        question_data = stored.get("question_data") or {}
+        saved_questions.append({
+            **prepared,
+            "question_id": stored["id"],
+            "question_code": stored["question_code"],
+            "current_version": stored["current_version"],
+            "current_version_id": stored["current_version_id"],
+            "review_status": stored["review_status"],
+            "source_chunk_ids": [
+                str(source.get("chunk_id")) for source in stored.get("sources") or [] if source.get("chunk_id")
+            ],
+            "validation_warnings": question_data.get("validation_warnings") or prepared["validation_warnings"],
+        })
+    return saved_questions
 
 
 def create_generation_job(
@@ -319,19 +515,29 @@ def create_generation_job(
     model_snapshot: dict | None = None,
     code_model_snapshot: dict | None = None,
     fallback_model_snapshot: dict | None = None,
+    index_snapshot: dict | None = None,
+    request_hash: str | None = None,
+    max_active: int | None = None,
 ) -> str:
-    """Tạo job sinh câu hỏi với trạng thái queued (dùng cho polling ở FE)."""
+    """Tạo job sinh câu hỏi với trạng thái queued (dùng cho polling ở FE).
+
+    With ``max_active`` the per-user active-job limit is enforced atomically and
+    ActiveJobLimitError is raised when it is reached.
+    """
     store = _postgres_store()
     if store is not None:
         return store.create_job(
             request, requested_by_user_id, idempotency_key,
             model_snapshot=model_snapshot, code_model_snapshot=code_model_snapshot,
             fallback_model_snapshot=fallback_model_snapshot,
+            index_snapshot=index_snapshot, request_hash=request_hash, max_active=max_active,
         )
     db = get_database()
     now = utc_now()
     doc = {
         "request": request,
+        "request_hash": request_hash,
+        "index_snapshot": index_snapshot,
         "model_snapshot": model_snapshot,
         "code_model_snapshot": code_model_snapshot,
         "fallback_model_snapshot": fallback_model_snapshot,
@@ -360,6 +566,16 @@ def create_generation_job(
         if not existing:
             raise
         return str(existing["_id"])
+    if max_active is not None:
+        # Concurrent requests both insert; only the earliest max_active stay.
+        ahead = db.generation_jobs.count_documents({
+            "requested_by_user_id": requested_by_user_id,
+            "status": {"$in": ["queued", "processing"]},
+            "_id": {"$lte": result.inserted_id},
+        })
+        if ahead > max_active:
+            db.generation_jobs.delete_one({"_id": result.inserted_id, "status": "queued"})
+            raise ActiveJobLimitError()
     return str(result.inserted_id)
 
 
@@ -460,6 +676,42 @@ def get_generation_job(job_id: str, *, requested_by_user_id=None) -> dict | None
     return _serialize_generation_job(doc)
 
 
+WORKER_SHUTDOWN_JOB_MESSAGE = "Worker dừng; job được xếp hàng và sẽ tiếp tục từ các câu đã lưu"
+
+
+def requeue_generation_job_for_shutdown(job_id: str, worker_id: str) -> bool:
+    """Requeue a job interrupted by worker shutdown; the interrupted attempt is not counted."""
+    store = _postgres_store()
+    if store is not None:
+        return store.requeue_for_shutdown(job_id, worker_id, WORKER_SHUTDOWN_JOB_MESSAGE)
+    try:
+        job_oid = ObjectId(job_id)
+    except (InvalidId, TypeError):
+        return False
+    db = get_database()
+    job = db.generation_jobs.find_one(
+        {"_id": job_oid, "status": "processing", "locked_by": worker_id}, {"attempt_count": 1},
+    )
+    if not job:
+        return False
+    now = utc_now()
+    result = db.generation_jobs.update_one(
+        {"_id": job_oid, "status": "processing", "locked_by": worker_id},
+        {
+            "$set": {
+                "status": "queued",
+                "error_message": WORKER_SHUTDOWN_JOB_MESSAGE,
+                "next_attempt_at": now,
+                "updated_at": now,
+                "attempt_count": max(0, int(job.get("attempt_count") or 0) - 1),
+                "progress": {"stage": "retry_wait", "completed": 0, "total": 1},
+            },
+            "$unset": {"locked_by": "", "lease_expires_at": "", "heartbeat_at": ""},
+        },
+    )
+    return result.modified_count == 1
+
+
 def cancel_generation_job(job_id: str, *, requested_by_user_id=None) -> bool:
     store = _postgres_store()
     if store is not None:
@@ -477,6 +729,8 @@ def cancel_generation_job(job_id: str, *, requested_by_user_id=None) -> bool:
             "$set": {
                 "status": "failed",
                 "error_message": "Đã dừng theo yêu cầu của người dùng",
+                "cancelled_at": now,
+                "cancel_reason": CANCEL_REASON_USER,
                 "updated_at": now,
                 "expires_at": now + timedelta(days=settings.job_retention_days),
                 "progress": {"stage": "cancelled", "completed": 0, "total": 1},
@@ -485,6 +739,36 @@ def cancel_generation_job(job_id: str, *, requested_by_user_id=None) -> bool:
         },
     )
     return result.modified_count == 1
+
+
+USER_DEACTIVATED_JOB_MESSAGE = "Đã dừng vì tài khoản người yêu cầu bị vô hiệu hóa"
+
+
+def cancel_generation_jobs_for_user(requested_by_user_id, *, message: str = USER_DEACTIVATED_JOB_MESSAGE) -> int:
+    """Stop every queued/processing generation job of one user; already saved drafts are kept."""
+    store = _postgres_store()
+    if store is not None:
+        return sum(
+            store.cancel(job_id, message=message, reason=CANCEL_REASON_USER_DEACTIVATED) is not None
+            for job_id in store.active_job_ids(requested_by_user_id)
+        )
+    now = utc_now()
+    result = get_database().generation_jobs.update_many(
+        {"requested_by_user_id": requested_by_user_id, "status": {"$in": ["queued", "processing"]}},
+        {
+            "$set": {
+                "status": "failed",
+                "error_message": message,
+                "cancelled_at": now,
+                "cancel_reason": CANCEL_REASON_USER_DEACTIVATED,
+                "updated_at": now,
+                "expires_at": now + timedelta(days=settings.job_retention_days),
+                "progress": {"stage": "cancelled", "completed": 0, "total": 1},
+            },
+            "$unset": {"locked_by": "", "lease_expires_at": "", "heartbeat_at": "", "next_attempt_at": ""},
+        },
+    )
+    return result.modified_count
 
 
 def claim_generation_job(job_id: str, worker_id: str) -> dict | None:
